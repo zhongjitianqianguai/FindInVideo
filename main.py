@@ -1,6 +1,7 @@
 from ultralytics import YOLO
 import cv2
 import numpy as np
+import os
 
 
 def detect_objects_in_video(video_path, target_class,
@@ -68,12 +69,14 @@ def detect_objects_in_video(video_path, target_class,
         cv2.destroyAllWindows()
 
     # 保存时间戳
-    with open(video_path+".txt", 'w') as f:
+    txt_save_path = video_path + ".txt"
+    with open(txt_save_path, 'w') as f:
         f.write("检测到目标的时间位置（秒）:\n")
         for t in detections:
             f.write(f"{t:.2f}\n")
+    print(f"已保存检测时间戳至: {txt_save_path}")
 
-    # 拼接并显示截图
+    # 拼接并显示或保存截图
     if save_crops and crops:
         rows = []
         row = []
@@ -83,28 +86,45 @@ def detect_objects_in_video(video_path, target_class,
                 rows.append(np.hstack(row))
                 row = []
         if row:  # 处理最后一行
-            # 填充空白图像填充不足的列
             missing = max_cols - len(row)
             blank = np.zeros_like(row[0])
             row.extend([blank] * missing)
             rows.append(np.hstack(row))
         final_mosaic = np.vstack(rows)
-        
-        cv2.imshow('All Detected Faces', final_mosaic)
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
+
+        if show_window:
+            cv2.imshow('All Detected Faces', final_mosaic)
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+        else:
+            # 保存图片到视频文件所在的目录
+            dir_name = os.path.dirname(video_path)
+            base_name = os.path.splitext(os.path.basename(video_path))[0]
+            mosaic_path = os.path.join(dir_name, base_name + "_mosaic.jpg")
+            cv2.imwrite(mosaic_path, final_mosaic)
+            print(f"已保存拼接图片至: {mosaic_path}")
 
     return detections
 
 
-# 使用示例
-if __name__ == "__main__": 
-    video_path = "C:\\Users\\f1094\\Desktop\\1.mp4"
+if __name__ == "__main__":
+    video_path = r"C:\Users\f1094\Desktop\python\images\新建文件夹"  # 可设置为视频文件或目录
     target_item = "face"
 
-    # 参数说明：
-    # show_window=True 显示实时检测窗口
-    # save_crops=True 保存所有脸部截图
-    detect_objects_in_video(video_path, target_item,
-                            show_window=True,
-                            save_crops=True)
+    # 如果video_path是目录，则递归遍历所有视频文件
+    if os.path.isdir(video_path):
+        video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv']
+        for root, dirs, files in os.walk(video_path):
+            for file in files:
+                ext = os.path.splitext(file)[1].lower()
+                if ext in video_extensions:
+                    file_path = os.path.join(root, file)
+                    print(f"开始处理视频文件: {file_path}")
+                    detect_objects_in_video(file_path, target_item,
+                                            show_window=False,
+                                            save_crops=True)
+    else:
+        # 单个视频文件处理（实时显示窗口）
+        detect_objects_in_video(video_path, target_item,
+                                show_window=True,
+                                save_crops=True)
