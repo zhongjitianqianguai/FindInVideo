@@ -106,10 +106,17 @@ def detect_objects_in_video(video_path, target_class,
 
     return detections
 
-
+def should_process(file_path):
+    dir_name = os.path.dirname(file_path)
+    base_name = os.path.splitext(os.path.basename(file_path))[0]
+    mosaic_path = os.path.join(dir_name, base_name + "_mosaic.jpg")
+    return not os.path.exists(mosaic_path)
+    
 if __name__ == "__main__":
     video_path = r"C:\Users\f1094\Desktop\python\images\新建文件夹"  # 可设置为视频文件或目录
     target_item = "face"
+
+
 
     # 如果video_path是目录，则递归遍历所有视频文件
     if os.path.isdir(video_path):
@@ -119,12 +126,18 @@ if __name__ == "__main__":
                 ext = os.path.splitext(file)[1].lower()
                 if ext in video_extensions:
                     file_path = os.path.join(root, file)
-                    print(f"开始处理视频文件: {file_path}")
-                    detect_objects_in_video(file_path, target_item,
-                                            show_window=False,
-                                            save_crops=True)
+                    if should_process(file_path):
+                        print(f"开始处理视频文件: {file_path}")
+                        detect_objects_in_video(file_path, target_item,
+                                                show_window=False,
+                                                save_crops=True)
+                    else:
+                        print(f"已存在拼接图片，跳过处理: {file_path}")
     else:
-        # 单个视频文件处理（实时显示窗口）
-        detect_objects_in_video(video_path, target_item,
-                                show_window=True,
-                                save_crops=True)
+        # 单个视频文件处理（实时显示窗口），也检查是否已处理
+        if should_process(video_path):
+            detect_objects_in_video(video_path, target_item,
+                                    show_window=True,
+                                    save_crops=True)
+        else:
+            print(f"已存在拼接图片，跳过处理: {video_path}")
