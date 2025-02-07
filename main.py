@@ -39,7 +39,7 @@ def detect_objects_in_video(video_path, target_class,
                     if current_time - last_detected >= 0.1:
                         detections.append(current_time)
                         last_detected = current_time
-                        print(f"检测到 {target_class} @ {current_time:.2f}秒")
+                        print(f"{video_path}: 检测到 {target_class} @ {current_time:.2f}秒")
                         detected = True
 
                     # 截图处理
