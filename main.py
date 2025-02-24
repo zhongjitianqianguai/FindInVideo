@@ -15,6 +15,11 @@ def detect_objects_in_video(video_path, target_class,
     if save_training_data:
         training_folder = os.path.join(os.path.dirname(video_path), "training_data")
         os.makedirs(training_folder, exist_ok=True)
+        # 在训练数据文件夹下生成classes.txt文件（如果不存在），写入目标类别
+        classes_txt = os.path.join(training_folder, "classes.txt")
+        if not os.path.exists(classes_txt):
+            with open(classes_txt, "w") as f:
+                f.write(target_class + "\n")
 
     # 视频处理初始化
     cap = cv2.VideoCapture(video_path)
@@ -201,7 +206,7 @@ if __name__ == "__main__":
         else:
             if should_process(video_path):
                 detect_objects_in_video(video_path, target_item,
-                                        show_window=True,
+                                        show_window=False,
                                         save_crops=True,
                                         save_training_data=True)
             else:
