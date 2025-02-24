@@ -2,6 +2,7 @@ from ultralytics import YOLO
 import cv2
 import numpy as np
 import os
+from tqdm import tqdm  # 新增导入tqdm库用于进度条显示
 
 
 def detect_objects_in_video(video_path, target_class,
@@ -18,6 +19,10 @@ def detect_objects_in_video(video_path, target_class,
     # 视频处理初始化
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    # 初始化进度条
+    pbar = tqdm(total=total_frames, desc=f"处理视频: {os.path.basename(video_path)}")
+
     frame_count = 0
     last_detected = -5
     detections = []
@@ -31,6 +36,9 @@ def detect_objects_in_video(video_path, target_class,
         success, frame = cap.read()
         if not success:
             break
+
+        # 更新进度条
+        pbar.update(1)
 
         # 如果需要保存训练数据，每帧初始化该帧的标注列表
         if save_training_data:
@@ -49,7 +57,8 @@ def detect_objects_in_video(video_path, target_class,
                     if current_time - last_detected >= 0.1:
                         detections.append(current_time)
                         last_detected = current_time
-                        print(f"{video_path}: 检测到 {target_class} @ {current_time:.2f}秒")
+                        # 注释掉秒数打印输出
+                        # print(f"{video_path}: 检测到 {target_class} @ {current_time:.2f}秒")
                         detected = True
 
                     # 截图处理（用于拼接大图）
@@ -70,14 +79,12 @@ def detect_objects_in_video(video_path, target_class,
                     # 生成训练数据标注（YOLO格式：class center_x center_y width height，均归一化）
                     if save_training_data:
                         h, w, _ = frame.shape
-                        # 使用相同的坐标，注意防止多次保存同一检测框（可根据实际情况调整，这里每个检测均保存）
                         xyxy = box.xyxy[0].cpu().numpy()
                         x1, y1, x2, y2 = map(int, xyxy)
                         cx = ((x1 + x2) / 2) / w
                         cy = ((y1 + y2) / 2) / h
                         bw = (x2 - x1) / w
                         bh = (y2 - y1) / h
-                        # 假设目标类别在训练时的 id 为 0
                         annotation_line = f"0 {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}"
                         frame_annotations.append(annotation_line)
 
@@ -87,7 +94,7 @@ def detect_objects_in_video(video_path, target_class,
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
-        # 如果需要保存训练数据且当前帧检测到目标，则保存当前帧以及该帧的标注文件
+        # 如果需要保存训练数据且当前帧检测到目标，则保存当前帧及标注文件
         if save_training_data and frame_annotations:
             video_base = os.path.splitext(os.path.basename(video_path))[0]
             training_image_path = os.path.join(training_folder, f"{video_base}_{frame_count}.jpg")
@@ -96,12 +103,13 @@ def detect_objects_in_video(video_path, target_class,
             with open(training_annotation_path, 'w') as f:
                 for line in frame_annotations:
                     f.write(line + "\n")
-            print(f"保存训练图片及标注: {training_image_path} 和 {training_annotation_path}")
+            # print(f"保存训练图片及标注: {training_image_path} 和 {training_annotation_path}")
 
         frame_count += 1
 
-    # 释放资源
+    # 释放资源和关闭进度条
     cap.release()
+    pbar.close()
     if show_window:
         cv2.destroyAllWindows()
 
@@ -152,7 +160,7 @@ def should_process(file_path):
 
 
 if __name__ == "__main__":
-    video_path = r"C:\Users\f1094\Desktop\python\images\新建文件夹"  # 可设置为视频文件或目录
+    video_path = r"C:\Users\f1094\Desktop\20250220_092932.fix_p003.mp4"  # 可设置为视频文件或目录
     target_item = "face"
 
     # 如果video_path是目录，则递归遍历所有视频文件
