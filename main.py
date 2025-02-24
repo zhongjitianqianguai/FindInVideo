@@ -5,9 +5,15 @@ import os
 
 
 def detect_objects_in_video(video_path, target_class,
-                            show_window=False, save_crops=False):
+                            show_window=False, save_crops=False,
+                            save_training_data=False):
     # 加载模型
     model = YOLO('models/yolov11l-face.pt')
+
+    # 若需要生成训练数据，则构造保存目录
+    if save_training_data:
+        training_folder = os.path.join(os.path.dirname(video_path), "training_data")
+        os.makedirs(training_folder, exist_ok=True)
 
     # 视频处理初始化
     cap = cv2.VideoCapture(video_path)
@@ -16,7 +22,7 @@ def detect_objects_in_video(video_path, target_class,
     last_detected = -5
     detections = []
 
-    # 截图存储配置
+    # 截图存储配置（用于拼接大图）
     crop_size = (160, 160)  # 统一缩放到的小图尺寸
     max_cols = 8  # 拼接大图每行最多显示数量
     crops = []  # 存储所有截取的目标区域
@@ -25,6 +31,10 @@ def detect_objects_in_video(video_path, target_class,
         success, frame = cap.read()
         if not success:
             break
+
+        # 如果需要保存训练数据，每帧初始化该帧的标注列表
+        if save_training_data:
+            frame_annotations = []
 
         current_time = frame_count / fps
         results = model.predict(frame, conf=0.5, verbose=False)
@@ -42,7 +52,7 @@ def detect_objects_in_video(video_path, target_class,
                         print(f"{video_path}: 检测到 {target_class} @ {current_time:.2f}秒")
                         detected = True
 
-                    # 截图处理
+                    # 截图处理（用于拼接大图）
                     if save_crops:
                         xyxy = box.xyxy[0].cpu().numpy()
                         x1, y1, x2, y2 = map(int, xyxy)
@@ -53,13 +63,40 @@ def detect_objects_in_video(video_path, target_class,
 
                     # 绘制检测框
                     if show_window:
+                        xyxy = box.xyxy[0].cpu().numpy()
+                        x1, y1, x2, y2 = map(int, xyxy)
                         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+                    # 生成训练数据标注（YOLO格式：class center_x center_y width height，均归一化）
+                    if save_training_data:
+                        h, w, _ = frame.shape
+                        # 使用相同的坐标，注意防止多次保存同一检测框（可根据实际情况调整，这里每个检测均保存）
+                        xyxy = box.xyxy[0].cpu().numpy()
+                        x1, y1, x2, y2 = map(int, xyxy)
+                        cx = ((x1 + x2) / 2) / w
+                        cy = ((y1 + y2) / 2) / h
+                        bw = (x2 - x1) / w
+                        bh = (y2 - y1) / h
+                        # 假设目标类别在训练时的 id 为 0
+                        annotation_line = f"0 {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}"
+                        frame_annotations.append(annotation_line)
 
         # 实时显示窗口
         if show_window and detected:
             cv2.imshow('Detection Preview', frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
+
+        # 如果需要保存训练数据且当前帧检测到目标，则保存当前帧以及该帧的标注文件
+        if save_training_data and frame_annotations:
+            video_base = os.path.splitext(os.path.basename(video_path))[0]
+            training_image_path = os.path.join(training_folder, f"{video_base}_{frame_count}.jpg")
+            training_annotation_path = os.path.splitext(training_image_path)[0] + ".txt"
+            cv2.imwrite(training_image_path, frame)
+            with open(training_annotation_path, 'w') as f:
+                for line in frame_annotations:
+                    f.write(line + "\n")
+            print(f"保存训练图片及标注: {training_image_path} 和 {training_annotation_path}")
 
         frame_count += 1
 
@@ -76,7 +113,7 @@ def detect_objects_in_video(video_path, target_class,
             f.write(f"{t:.2f}\n")
     print(f"已保存检测时间戳至: {txt_save_path}")
 
-    # 拼接并显示或保存截图
+    # 拼接并显示或保存截图（仅用于可视化）
     if save_crops and crops:
         rows = []
         row = []
@@ -106,17 +143,17 @@ def detect_objects_in_video(video_path, target_class,
 
     return detections
 
+
 def should_process(file_path):
     dir_name = os.path.dirname(file_path)
     base_name = os.path.splitext(os.path.basename(file_path))[0]
     mosaic_path = os.path.join(dir_name, base_name + "_mosaic.jpg")
     return not os.path.exists(mosaic_path)
-    
+
+
 if __name__ == "__main__":
     video_path = r"C:\Users\f1094\Desktop\python\images\新建文件夹"  # 可设置为视频文件或目录
     target_item = "face"
-
-
 
     # 如果video_path是目录，则递归遍历所有视频文件
     if os.path.isdir(video_path):
@@ -127,17 +164,37 @@ if __name__ == "__main__":
                 if ext in video_extensions:
                     file_path = os.path.join(root, file)
                     if should_process(file_path):
+                        # 获取视频时长
+                        cap = cv2.VideoCapture(file_path)
+                        fps = cap.get(cv2.CAP_PROP_FPS)
+                        frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                        cap.release()
+                        duration = frame_count / fps if fps > 0 else float('inf')
+                        if duration > 3600:
+                            print(f"视频时长 {duration:.2f}秒超过一小时，跳过处理: {file_path}")
+                            continue
+
                         print(f"开始处理视频文件: {file_path}")
                         detect_objects_in_video(file_path, target_item,
                                                 show_window=False,
-                                                save_crops=True)
+                                                save_crops=True,
+                                                save_training_data=True)
                     else:
                         print(f"已存在拼接图片，跳过处理: {file_path}")
     else:
-        # 单个视频文件处理（实时显示窗口），也检查是否已处理
-        if should_process(video_path):
-            detect_objects_in_video(video_path, target_item,
-                                    show_window=True,
-                                    save_crops=True)
+        # 处理单个视频文件（实时显示窗口）前检查视频时长
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        cap.release()
+        duration = frame_count / fps if fps > 0 else float('inf')
+        if duration > 3600:
+            print(f"视频时长 {duration:.2f}秒超过一小时，跳过处理: {video_path}")
         else:
-            print(f"已存在拼接图片，跳过处理: {video_path}")
+            if should_process(video_path):
+                detect_objects_in_video(video_path, target_item,
+                                        show_window=True,
+                                        save_crops=True,
+                                        save_training_data=True)
+            else:
+                print(f"已存在拼接图片，跳过处理: {video_path}")
