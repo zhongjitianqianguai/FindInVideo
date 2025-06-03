@@ -278,7 +278,7 @@ def process_directory_videos(dir_path, target_item, all_objects_switch=False):
         detect_objects_in_video(video_file, target_item,
                                 show_window=False,
                                 save_crops=True,
-                                save_training_data=True,
+                                save_training_data=False,
                                 all_objects=all_objects_switch)
 
 if __name__ == "__main__":
