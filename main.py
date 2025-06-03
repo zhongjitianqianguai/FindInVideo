@@ -4,10 +4,91 @@ import numpy as np
 import os
 from tqdm import tqdm  # 新增导入tqdm库用于进度条显示
 
+# 常见的视频文件扩展名
+VIDEO_EXTENSIONS = {
+    '.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.m4v', 
+    '.mpg', '.mpeg', '.3gp', '.f4v', '.ts', '.vob', '.rmvb', '.rm',
+    '.asf', '.divx', '.xvid', '.m2ts', '.mts'
+}
+
+# 需要排除的路径变量
+EXCLUDE_PATHS = [
+    os.path.abspath(r"D:\$RECYCLE.BIN"),
+    os.path.abspath(r"D:\System Volume Information"),
+    # 在这里添加其他需要排除的路径
+]
+
+def is_video_file(file_path):
+    """检查文件是否为视频文件"""
+    _, ext = os.path.splitext(file_path.lower())
+    return ext in VIDEO_EXTENSIONS
+
+def is_leaf_directory(dir_path):
+    """检查目录是否为叶子节点（不包含子目录）"""
+    try:
+        for item in os.listdir(dir_path):
+            item_path = os.path.join(dir_path, item)
+            if os.path.isdir(item_path):
+                return False
+        return True
+    except (PermissionError, FileNotFoundError):
+        return False
+
+def count_videos_in_directory(dir_path):
+    """统计目录中的视频文件数量"""
+    count = 0
+    try:
+        for file in os.listdir(dir_path):
+            file_path = os.path.join(dir_path, file)
+            if os.path.isfile(file_path) and is_video_file(file_path):
+                count += 1
+    except (PermissionError, FileNotFoundError):
+        pass
+    return count
+
+def find_leaf_directories_with_videos(root_path, exclusions=None):
+    """
+    递归查找所有包含视频文件的叶子节点目录
+    返回: [(目录路径, 视频数量), ...] 按视频数量降序排列
+    """
+    if exclusions is None:
+        exclusions = EXCLUDE_PATHS
+    
+    leaf_dirs = []
+    
+    # 检查根路径是否被排除
+    for ex_path in exclusions:
+        if root_path.startswith(ex_path):
+            return leaf_dirs
+    
+    try:
+        for root, dirs, files in os.walk(root_path):
+            # 检查当前目录是否被排除
+            is_excluded = any(root.startswith(ex_path) for ex_path in exclusions)
+            if is_excluded:
+                continue
+            
+            # 过滤掉被排除的子目录
+            dirs[:] = [d for d in dirs if not any(os.path.join(root, d).startswith(ex_path) for ex_path in exclusions)]
+            
+            # 检查是否为叶子节点
+            if is_leaf_directory(root):
+                video_count = count_videos_in_directory(root)
+                if video_count > 0:
+                    leaf_dirs.append((root, video_count))
+    
+    except (PermissionError, FileNotFoundError) as e:
+        print(f"警告: 无法访问目录 '{root_path}': {e}")
+    
+    # 按视频数量降序排列
+    leaf_dirs.sort(key=lambda x: x[1], reverse=True)
+    return leaf_dirs
+
 def detect_objects_in_video(video_path, target_class,
                             show_window=False, save_crops=False,
                             save_training_data=False,
                             all_objects=False):
+    # ...existing code...
     # 如果不开启全量检测，则保证 target_class 为列表
     if not all_objects and isinstance(target_class, str):
         target_class = [target_class]
@@ -159,22 +240,81 @@ def detect_objects_in_video(video_path, target_class,
     
     return detections
 
-
 def should_process(file_path):
     dir_name = os.path.dirname(file_path)
     base_name = os.path.splitext(os.path.basename(file_path))[0]
     mosaic_path = os.path.join(dir_name, base_name + "_mosaic.jpg")
     return not os.path.exists(mosaic_path)
 
+def process_directory_videos(dir_path, target_item, all_objects_switch=False):
+    """处理目录中的所有视频文件"""
+    video_files = []
+    
+    try:
+        for file in os.listdir(dir_path):
+            if is_video_file(file):
+                file_path = os.path.join(dir_path, file)
+                if should_process(file_path):
+                    # 检查视频时长
+                    cap = cv2.VideoCapture(file_path)
+                    fps = cap.get(cv2.CAP_PROP_FPS)
+                    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                    cap.release()
+                    duration = frame_count / fps if fps > 0 else float('inf')
+                    
+                    if duration <= 3600:  # 小于等于1小时的视频
+                        video_files.append(file_path)
+                    else:
+                        print(f"视频时长 {duration:.2f}秒超过一小时，跳过处理: {file_path}")
+                else:
+                    print(f"已存在拼接图片，跳过处理: {file_path}")
+    except (PermissionError, FileNotFoundError) as e:
+        print(f"警告: 无法访问目录 '{dir_path}': {e}")
+        return
+    
+    # 处理视频文件
+    for video_file in video_files:
+        print(f"开始处理视频文件: {video_file}")
+        detect_objects_in_video(video_file, target_item,
+                                show_window=False,
+                                save_crops=True,
+                                save_training_data=True,
+                                all_objects=all_objects_switch)
 
 if __name__ == "__main__":
-    video_path = r"C:\Users\f1094\Desktop\20250220_092932.fix_p003.mp4"  # 可设置为视频文件或目录
+    video_path = r"D:\z"  # 可设置为视频文件或目录
     # 如要检测所有模型内对象，则将 target_item 设置为任意值并启用全量检测开关
     target_item = "face"  # 当 all_objects 为 True 时，该值不再限制检测
     all_objects_switch = False  # 设置为 True 表示显示所有检测对象
     
-    # 如果 video_path 是目录，则递归遍历所有视频文件
-    if os.path.isdir(video_path):
+    # 新增功能：按叶子节点视频数量排序处理
+    use_leaf_node_processing = True  # 设置为 True 启用叶子节点处理模式
+    
+    if use_leaf_node_processing and os.path.isdir(video_path):
+        print(f"启用叶子节点处理模式，正在扫描目录: {video_path}")
+        print("正在查找包含视频文件的叶子节点目录...")
+        
+        # 查找所有叶子目录
+        leaf_dirs = find_leaf_directories_with_videos(video_path, EXCLUDE_PATHS)
+        
+        if not leaf_dirs:
+            print(f"未找到包含视频文件的叶子节点目录")
+        else:
+            print(f"\n找到 {len(leaf_dirs)} 个包含视频文件的叶子节点目录:")
+            for i, (dir_path, video_count) in enumerate(leaf_dirs, 1):
+                relative_path = os.path.relpath(dir_path, video_path)
+                print(f"{i:3d}. {relative_path} ({video_count} 个视频文件)")
+            
+            print(f"\n开始按视频数量从多到少的顺序处理叶子节点目录...")
+            
+            # 按顺序处理每个叶子目录
+            for i, (dir_path, video_count) in enumerate(leaf_dirs, 1):
+                relative_path = os.path.relpath(dir_path, video_path)
+                print(f"\n=== 处理第 {i}/{len(leaf_dirs)} 个目录: {relative_path} ({video_count} 个视频) ===")
+                process_directory_videos(dir_path, target_item, all_objects_switch)
+    
+    # 原有的处理逻辑（当 use_leaf_node_processing 为 False 时使用）
+    elif os.path.isdir(video_path):
         video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv']
         for root, dirs, files in os.walk(video_path):
             for file in files:
