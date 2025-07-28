@@ -616,17 +616,7 @@ def process_directory_videos(dir_path, target_item, all_objects_switch=False, mo
             if is_video_file(file):
                 file_path = os.path.join(dir_path, file)
                 if should_process(file_path):
-                    # 检查视频时长
-                    cap = cv2.VideoCapture(file_path)
-                    fps = cap.get(cv2.CAP_PROP_FPS)
-                    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-                    cap.release()
-                    duration = frame_count / fps if fps > 0 else float('inf')
-                    
-                    if duration <= 3600:  # 小于等于1小时的视频
-                        video_files.append(file_path)
-                    else:
-                        print(f"视频时长 {duration:.2f}秒超过一小时，跳过处理: {file_path}")
+                    video_files.append(file_path)
                 else:
                     print(f"已存在拼接图片，跳过处理: {file_path}")
     except (PermissionError, FileNotFoundError) as e:
@@ -653,10 +643,10 @@ def process_directory_videos(dir_path, target_item, all_objects_switch=False, mo
                                           model_path=model_path)
 
 if __name__ == "__main__":
-    video_path = r"D:\z"  # 可设置为视频文件或目录
+    video_path = r"C:\Users\f1094\Desktop\DouyinLiveRecorder\download\邹邹大王"  # 可设置为视频文件或目录
     # 如要检测所有模型内对象，则将 target_item 设置为任意值并启用全量检测开关
-    target_item = "person"  # 当 all_objects 为 True 时，该值不再限制检测
-    all_objects_switch = False  # 设置为 True 表示显示所有检测对象
+    target_item = "breast"  # 当 all_objects 为 True 时，该值不再限制检测
+    all_objects_switch = True  # 设置为 True 表示显示所有检测对象
     
     # YOLOv5模型路径 - 使用相对路径
     yolov5_model_path = "models/breast.pt"  # 您可以根据需要修改模型路径
@@ -699,16 +689,6 @@ if __name__ == "__main__":
                 if ext in video_extensions:
                     file_path = os.path.join(root, file)
                     if should_process(file_path):
-                        # 获取视频时长
-                        cap = cv2.VideoCapture(file_path)
-                        fps = cap.get(cv2.CAP_PROP_FPS)
-                        frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-                        cap.release()
-                        duration = frame_count / fps if fps > 0 else float('inf')
-                        if duration > 3600:
-                            print(f"视频时长 {duration:.2f}秒超过一小时，跳过处理: {file_path}")
-                            continue
-                        
                         print(f"开始处理视频文件: {file_path}")
                         detect_objects_in_video_yolov5(file_path, target_item,
                                                       show_window=False,
@@ -719,21 +699,13 @@ if __name__ == "__main__":
                     else:
                         print(f"已存在拼接图片，跳过处理: {file_path}")
     else:
-        # 处理单个视频文件前检查视频时长
-        cap = cv2.VideoCapture(video_path)
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-        cap.release()
-        duration = frame_count / fps if fps > 0 else float('inf')
-        if duration > 3600:
-            print(f"视频时长 {duration:.2f}秒超过一小时，跳过处理: {video_path}")
+        # 处理单个视频文件
+        if should_process(video_path):
+            detect_objects_in_video_yolov5(video_path, target_item,
+                                          show_window=False,
+                                          save_crops=True,
+                                          save_training_data=False,
+                                          all_objects=all_objects_switch,
+                                          model_path=yolov5_model_path)
         else:
-            if should_process(video_path):
-                detect_objects_in_video_yolov5(video_path, target_item,
-                                              show_window=False,
-                                              save_crops=True,
-                                              save_training_data=False,
-                                              all_objects=all_objects_switch,
-                                              model_path=yolov5_model_path)
-            else:
-                print(f"已存在拼接图片，跳过处理: {video_path}")
+            print(f"已存在拼接图片，跳过处理: {video_path}")
