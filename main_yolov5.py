@@ -1027,9 +1027,9 @@ def detect_objects_in_video_yolov5(video_path, target_class,
             cv2.destroyAllWindows()
         else:
                 mosaic_path = os.path.join(video_dir, artifact_base + "_mosaic.jpg")
-            cv2.imwrite(mosaic_path, final_mosaic)
-            print(f"已保存拼接图片至: {mosaic_path}")
-            write_done_marker(video_path)
+                cv2.imwrite(mosaic_path, final_mosaic)
+                print(f"已保存拼接图片至: {mosaic_path}")
+                write_done_marker(video_path)
     return detections
 
 def should_process(file_path):

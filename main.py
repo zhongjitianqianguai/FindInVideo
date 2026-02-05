@@ -19,6 +19,7 @@ import socket
 import ctypes
 from ctypes import wintypes
 import signal
+import threading
 
 _YOLOED_MD5_CACHE = None
 _YOLOED_MD5_CACHE_MTIME = None
@@ -34,6 +35,74 @@ class PauseRequested(Exception):
 
 
 _STOP_REQUESTED = False
+
+# 定时暂停相关全局变量
+_TIMED_PAUSE_UNTIL = None  # 暂停结束的时间戳
+_INPUT_BUFFER = ""  # 键盘输入缓冲区
+_KEYBOARD_LISTENER_STARTED = False  # 防止重复启动监听线程
+
+
+def _keyboard_listener_thread():
+    """后台线程监听键盘输入，检测'222'触发暂停2小时"""
+    global _TIMED_PAUSE_UNTIL, _INPUT_BUFFER
+    try:
+        import msvcrt  # Windows专用
+    except ImportError:
+        # 非Windows系统，尝试使用select
+        return
+    
+    while True:
+        try:
+            if msvcrt.kbhit():
+                char = msvcrt.getch().decode('utf-8', errors='ignore')
+                _INPUT_BUFFER += char
+                # 保留最后3个字符
+                if len(_INPUT_BUFFER) > 3:
+                    _INPUT_BUFFER = _INPUT_BUFFER[-3:]
+                # 检测222
+                if '222' in _INPUT_BUFFER:
+                    pause_hours = 2
+                    _TIMED_PAUSE_UNTIL = time.time() + pause_hours * 3600
+                    resume_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(_TIMED_PAUSE_UNTIL))
+                    print(f"\n检测到输入'222'，将暂停{pause_hours}小时，预计恢复时间: {resume_time}")
+                    _INPUT_BUFFER = ""
+            time.sleep(0.1)
+        except Exception:
+            time.sleep(1)
+
+
+def _start_keyboard_listener():
+    """启动键盘监听线程"""
+    global _KEYBOARD_LISTENER_STARTED
+    if _KEYBOARD_LISTENER_STARTED:
+        return
+    _KEYBOARD_LISTENER_STARTED = True
+    t = threading.Thread(target=_keyboard_listener_thread, daemon=True)
+    t.start()
+    print("键盘监听已启动：输入'222'可暂停2小时")
+
+
+def _check_timed_pause():
+    """检查是否处于定时暂停状态，如果是则等待直到暂停结束"""
+    global _TIMED_PAUSE_UNTIL
+    if _TIMED_PAUSE_UNTIL is None:
+        return
+    
+    now = time.time()
+    if now < _TIMED_PAUSE_UNTIL:
+        remaining = _TIMED_PAUSE_UNTIL - now
+        resume_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(_TIMED_PAUSE_UNTIL))
+        print(f"\n定时暂停中，剩余时间: {remaining/3600:.2f}小时，预计恢复时间: {resume_time}")
+        
+        # 每分钟检查一次，同时允许用户在暂停期间再次输入222来累加时间
+        while time.time() < _TIMED_PAUSE_UNTIL:
+            time.sleep(60)
+            remaining = _TIMED_PAUSE_UNTIL - time.time()
+            if remaining > 0:
+                print(f"暂停中... 剩余时间: {remaining/60:.1f}分钟")
+        
+        print("定时暂停结束，继续处理...")
+        _TIMED_PAUSE_UNTIL = None
 
 
 def _truthy_env(name, default=False):
@@ -1067,6 +1136,9 @@ def detect_objects_in_video(video_path, target_class,
 
     try:
         while cap.isOpened():
+            # 检查是否需要定时暂停（输入222触发）
+            _check_timed_pause()
+            
             if _pause_requested(pause_file):
                 _save_checkpoint(video_path, next_frame=frame_index, detections=detections, last_detected=last_detected, part_index=part_index + (1 if use_parts else 0))
                 raise PauseRequested()
@@ -1752,6 +1824,7 @@ def get_file_md5(file_path):
 if __name__ == "__main__":
     _setup_diagnostics()
     _install_pause_signal_handler()
+    _start_keyboard_listener()  # 启动键盘监听，输入222可暂停2小时
     video_path = r"""D:\z"""  # 可设置为视频文件或目录
     original_video_path = video_path
     if os.name == 'posix' and is_windows_style_path(video_path):
