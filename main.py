@@ -2,6 +2,7 @@ from ultralytics import YOLO
 import cv2
 import numpy as np
 import os
+import hashlib
 from tqdm import tqdm
 import gc  # 导入垃圾回收模块
 import time
@@ -350,6 +351,57 @@ class DirectoryIndex:
 DIRECTORY_INDEX = DirectoryIndex()
 atexit.register(DIRECTORY_INDEX.close)
 
+
+# ---------------------------------------------------------------------------
+# 衍生文件（artifact）命名策略
+# ---------------------------------------------------------------------------
+# 新策略:  直接使用原始文件名基础名（不含扩展名），不做任何字符替换或 hash
+# 后缀，确保在 Windows 资源管理器按名称排序时衍生文件紧跟在原视频旁边。
+# 例: 原视频 "1 (44).mp4" → "1 (44)_frames.mp4", "1 (44)_mosaic.jpg" 等。
+# ---------------------------------------------------------------------------
+
+def safe_artifact_basename(video_path):
+    """返回用于创建衍生文件的基础名（= 原视频文件名去掉扩展名）。
+
+    相比旧版（sanitized + hash），这种方式保持了和原文件完全相同的前缀，
+    使得 Windows 资源管理器 StrCmpLogicalW 排序时衍生文件紧贴原视频。
+    """
+    return os.path.splitext(os.path.basename(video_path))[0]
+
+
+def _sanitize_basename(video_path):
+    """将文件名中的非 alnum / - / _ 字符替换为 _（旧格式辅助函数）。"""
+    base_name = os.path.basename(os.path.splitext(video_path)[0])
+    sanitized = ''.join(c if c.isalnum() or c in ('-', '_') else '_' for c in base_name)
+    return sanitized or 'video'
+
+
+def legacy_artifact_basename(video_path, max_length=80):
+    """旧格式 v2: sanitized_name + stat-based hash — 仅用于检测已有衍生文件。"""
+    sanitized = _sanitize_basename(video_path)
+    try:
+        st = os.stat(video_path)
+        size = int(getattr(st, 'st_size', 0) or 0)
+        mtime = float(getattr(st, 'st_mtime', 0.0) or 0.0)
+        digest = hashlib.md5(f"{size}|{mtime}".encode('utf-8', 'ignore')).hexdigest()[:8]
+    except Exception:
+        digest = hashlib.md5(sanitized.encode('utf-8', 'ignore')).hexdigest()[:8]
+    limit = max(8, max_length - len(digest) - 1)
+    if len(sanitized) > limit:
+        sanitized = sanitized[:limit]
+    return f"{sanitized}_{digest}"
+
+
+def _legacy_artifact_basename_v1(video_path, max_length=80):
+    """旧格式 v1: sanitized_name + path-based hash — 仅用于检测已有衍生文件。"""
+    sanitized = _sanitize_basename(video_path)
+    digest = hashlib.md5(str(video_path).encode('utf-8', 'ignore')).hexdigest()[:8]
+    limit = max(8, max_length - len(digest) - 1)
+    if len(sanitized) > limit:
+        sanitized = sanitized[:limit]
+    return f"{sanitized}_{digest}"
+
+
 def is_video_file(file_path):
     """检查文件是否为视频文件"""
     # 直接用原始文件名，避免特殊字符被截断
@@ -372,7 +424,9 @@ def has_existing_artifacts(video_path):
     except Exception:
         pass
     video_dir = os.path.dirname(video_path) or '.'
-    bases = [safe_artifact_basename(video_path), legacy_artifact_basename(video_path)]
+    bases = [safe_artifact_basename(video_path),
+             legacy_artifact_basename(video_path),
+             _legacy_artifact_basename_v1(video_path)]
     for base in bases:
         # Fast marker first
         done_path = os.path.join(video_dir, base + DONE_SUFFIX)

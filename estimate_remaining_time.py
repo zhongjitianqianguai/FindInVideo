@@ -36,11 +36,20 @@ def is_video_file(file_path):
     return ext in VIDEO_EXTENSIONS
 
 
-def safe_artifact_basename(video_path, max_length=80):
+def safe_artifact_basename(video_path):
+    """当前格式: 直接使用原始文件名基础名, 在资源管理器中紧跟原视频排序。"""
+    return os.path.splitext(os.path.basename(video_path))[0]
+
+
+def _sanitize_basename(video_path):
     base_name = os.path.basename(os.path.splitext(video_path)[0])
     sanitized = ''.join(c if c.isalnum() or c in ('-', '_') else '_' for c in base_name)
-    if not sanitized:
-        sanitized = 'video'
+    return sanitized or 'video'
+
+
+def legacy_artifact_basename(video_path, max_length=80):
+    """旧格式 v2: sanitized + stat-hash."""
+    sanitized = _sanitize_basename(video_path)
     try:
         st = os.stat(video_path)
         size = int(getattr(st, 'st_size', 0) or 0)
@@ -54,11 +63,9 @@ def safe_artifact_basename(video_path, max_length=80):
     return f"{sanitized}_{digest}"
 
 
-def legacy_artifact_basename(video_path, max_length=80):
-    base_name = os.path.basename(os.path.splitext(video_path)[0])
-    sanitized = ''.join(c if c.isalnum() or c in ('-', '_') else '_' for c in base_name)
-    if not sanitized:
-        sanitized = 'video'
+def _legacy_artifact_basename_v1(video_path, max_length=80):
+    """旧格式 v1: sanitized + path-hash."""
+    sanitized = _sanitize_basename(video_path)
     digest = hashlib.md5(str(video_path).encode('utf-8', 'ignore')).hexdigest()[:8]
     limit = max(8, max_length - len(digest) - 1)
     if len(sanitized) > limit:
@@ -109,7 +116,9 @@ def load_yoloed_paths():
 def has_existing_artifacts(video_path):
     try:
         video_dir = os.path.dirname(video_path) or '.'
-        bases = [safe_artifact_basename(video_path), legacy_artifact_basename(video_path)]
+        bases = [safe_artifact_basename(video_path),
+                 legacy_artifact_basename(video_path),
+                 _legacy_artifact_basename_v1(video_path)]
         for base in bases:
             done_path = os.path.join(video_dir, base + DONE_SUFFIX)
             if os.path.exists(done_path):
