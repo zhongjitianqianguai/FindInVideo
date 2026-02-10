@@ -3,6 +3,9 @@ import cv2
 import numpy as np
 import os
 import hashlib
+import json
+import sqlite3
+import atexit
 from tqdm import tqdm
 import gc  # 导入垃圾回收模块
 import time
@@ -352,6 +355,40 @@ DIRECTORY_INDEX = DirectoryIndex()
 atexit.register(DIRECTORY_INDEX.close)
 
 
+class PauseRequested(Exception):
+    """Raised to request a graceful stop with checkpoint saved."""
+
+
+CHECKPOINT_SUFFIX = '.checkpoint.json'
+
+
+def _truthy_env(name, default=False):
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return str(val).strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+
+
+def _get_pause_file_path():
+    """Return the pause flag path (best-effort)."""
+    explicit = os.environ.get('FINDINVIDEO_PAUSE_FILE')
+    if explicit:
+        return explicit
+    try:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+    except Exception:
+        base_dir = os.getcwd()
+    return os.path.join(base_dir, 'pause.flag')
+
+
+def _pause_requested(pause_file_path=None):
+    path = pause_file_path or _get_pause_file_path()
+    try:
+        return bool(path) and os.path.exists(path)
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # 衍生文件（artifact）命名策略
 # ---------------------------------------------------------------------------
@@ -400,6 +437,65 @@ def _legacy_artifact_basename_v1(video_path, max_length=80):
     if len(sanitized) > limit:
         sanitized = sanitized[:limit]
     return f"{sanitized}_{digest}"
+
+
+def _checkpoint_path(video_path):
+    video_dir = os.path.dirname(video_path) or '.'
+    base = safe_artifact_basename(video_path)
+    return os.path.join(video_dir, base + CHECKPOINT_SUFFIX)
+
+
+def _load_checkpoint(video_path):
+    path = _checkpoint_path(video_path)
+    try:
+        if not os.path.exists(path):
+            return None
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            data = json.load(f)
+        try:
+            st = os.stat(video_path)
+            if data.get('size') not in (None, st.st_size):
+                return None
+            if data.get('mtime') is not None and abs(float(data.get('mtime')) - float(st.st_mtime)) > 2.0:
+                return None
+        except Exception:
+            pass
+        return data
+    except Exception:
+        return None
+
+
+def _save_checkpoint(video_path, next_frame, detections, last_detected):
+    path = _checkpoint_path(video_path)
+    payload = {
+        'version': 1,
+        'next_frame': int(max(0, next_frame or 0)),
+        'detections': detections or [],
+        'last_detected': float(last_detected) if last_detected is not None else -5.0,
+        'saved_at': time.time(),
+    }
+    try:
+        st = os.stat(video_path)
+        payload['size'] = st.st_size
+        payload['mtime'] = st.st_mtime
+    except Exception:
+        pass
+    try:
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8', errors='ignore') as f:
+            json.dump(payload, f)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _clear_checkpoint(video_path):
+    path = _checkpoint_path(video_path)
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
 
 
 def is_video_file(file_path):
@@ -580,10 +676,6 @@ def detect_objects_in_video(video_path, target_class,
     start_frame = int(ckpt.get('next_frame', 0)) if ckpt else 0
     detections = list(ckpt.get('detections', [])) if ckpt else []
     last_detected = float(ckpt.get('last_detected', detections[-1] if detections else -5.0)) if ckpt else -5
-    part_index = int(ckpt.get('part_index', 0)) if ckpt else 0
-    # When resume is enabled, always write to part files to avoid "append" problems.
-    use_parts = bool(resume_enabled and save_video)
-    part_video_path = os.path.join(video_dir, f"{artifact_base}_frames.part{part_index:03d}.mp4")
 
     # 视频处理初始化
     cap = cv2.VideoCapture(video_path)
@@ -603,7 +695,7 @@ def detect_objects_in_video(video_path, target_class,
     # 初始化进度条
     pbar = tqdm(total=total_frames, initial=min(start_frame, total_frames), desc=f"处理视频: {os.path.basename(video_path)}")
 
-    frame_index = start_frame
+    frame_count = start_frame
     
     # 截图存储配置（用于拼接大图）
     crop_size = (160, 160)  # 统一缩放到的小图尺寸
@@ -612,8 +704,13 @@ def detect_objects_in_video(video_path, target_class,
     batch_size = 200  # 每批处理的目标数量
     batch_idx = 1  # 批次计数器
     
+    paused = False
     try:
         while cap.isOpened():
+            if _pause_requested(pause_file):
+                _save_checkpoint(video_path, next_frame=frame_count, detections=detections, last_detected=last_detected)
+                paused = True
+                raise PauseRequested()
             success, frame = cap.read()
             if not success:
                 break
@@ -624,7 +721,7 @@ def detect_objects_in_video(video_path, target_class,
             if save_training_data:
                 frame_annotations = []
             
-            current_time = frame_count / fps
+            current_time = frame_count / fps_safe
             results = model.predict(frame, conf=0.5, verbose=False)
             detected = False
             
@@ -713,6 +810,11 @@ def detect_objects_in_video(video_path, target_class,
             # 释放当前帧
             del frame
     
+    except KeyboardInterrupt:
+        _save_checkpoint(video_path, next_frame=frame_count, detections=detections, last_detected=last_detected)
+        paused = True
+    except PauseRequested:
+        paused = True
     except Exception as e:
         print(f"处理视频时发生错误: {e}")
     
@@ -722,6 +824,9 @@ def detect_objects_in_video(video_path, target_class,
         pbar.close()
         if show_window:
             cv2.destroyAllWindows()
+
+    if not paused and (frame_count >= total_frames or total_frames == 0):
+        _clear_checkpoint(video_path)
     
     # 处理剩余的裁剪图像
     if save_crops and crops_batch:
