@@ -6,9 +6,202 @@ import hashlib
 import json
 import sqlite3
 import atexit
+import subprocess
+import errno
+import socket
+import ntpath
+import ctypes
+from ctypes import wintypes
 from tqdm import tqdm
 import gc  # 导入垃圾回收模块
 import time
+
+_PROCESSING_ROOT_DIR = None
+_YOLOED_MD5_CACHE = None
+_YOLOED_MD5_CACHE_MTIME = None
+_YOLOED_PATH_CACHE = None
+_FILE_MD5_CACHE = {}
+
+
+def is_windows_style_path(path):
+    if not path or not isinstance(path, str):
+        return False
+    if len(path) < 2:
+        return False
+    drive, sep = path[0], path[1]
+    return drive.isalpha() and sep == ':'
+
+
+def windows_path_to_wsl(path):
+    if not path:
+        return None
+    try:
+        result = subprocess.run(['wslpath', '-a', path], check=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, encoding='utf-8', errors='ignore')
+        converted = result.stdout.strip()
+        return converted or None
+    except Exception:
+        if is_windows_style_path(path):
+            drive = path[0].lower()
+            remainder = path[2:].replace('\\', '/').lstrip('/')
+            return f"/mnt/{drive}/{remainder}" if remainder else f"/mnt/{drive}"
+        return None
+
+
+def wsl_path_to_windows(path):
+    if not path:
+        return None
+    try:
+        result = subprocess.run(['wslpath', '-w', path], check=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, encoding='utf-8', errors='ignore')
+        converted = result.stdout.strip()
+        return converted or None
+    except Exception:
+        prefix = '/mnt/'
+        if path.startswith(prefix) and len(path) > len(prefix):
+            drive = path[len(prefix)]
+            if drive.isalpha():
+                remainder = path[len(prefix) + 1:].lstrip('/')
+                return f"{drive.upper()}:\\{remainder.replace('/', '\\')}" if remainder else f"{drive.upper()}:\\"
+        return None
+
+
+def normalize_posix_path_with_fs(path):
+    if not path:
+        return None
+    try:
+        resolved = os.path.realpath(path)
+        return resolved
+    except OSError:
+        return os.path.normpath(path)
+
+
+def windows_path_to_unc(path):
+    if os.name != 'nt' or not path:
+        return None
+    try:
+        drive, tail = ntpath.splitdrive(str(path))
+        if not drive or len(drive) < 2 or drive[1] != ':':
+            return None
+        drive_root = drive[0].upper() + ':'
+
+        mpr = ctypes.WinDLL('mpr')
+        WNetGetConnectionW = mpr.WNetGetConnectionW
+        WNetGetConnectionW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+        WNetGetConnectionW.restype = wintypes.DWORD
+
+        buf_len = wintypes.DWORD(1024)
+        buf = ctypes.create_unicode_buffer(buf_len.value)
+        rc = WNetGetConnectionW(drive_root, buf, ctypes.byref(buf_len))
+        if rc != 0:
+            return None
+        unc_root = buf.value
+        remainder = tail.lstrip('\\/')
+        return unc_root.rstrip('\\/') + ('\\' + remainder if remainder else '')
+    except Exception:
+        return None
+
+
+def canonical_video_path(path):
+    if not path:
+        return None
+    p = str(path)
+    if os.name == 'nt':
+        p_norm = ntpath.normpath(p)
+        unc = windows_path_to_unc(p_norm)
+        if unc:
+            return ntpath.normpath(unc)
+        return p_norm
+    return normalize_posix_path_with_fs(p)
+
+
+def _get_env_path(name):
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    value = str(value).strip()
+    return value or None
+
+
+def get_shared_state_dir():
+    shared = _get_env_path('FINDINVIDEO_SHARED_STATE_DIR')
+    if not shared:
+        return None
+    if os.name == 'posix' and is_windows_style_path(shared):
+        converted = windows_path_to_wsl(shared)
+        if converted:
+            shared = normalize_posix_path_with_fs(converted)
+    return shared
+
+
+def ensure_shared_state_dir():
+    shared = get_shared_state_dir()
+    if not shared:
+        return None
+    try:
+        os.makedirs(shared, exist_ok=True)
+        return shared
+    except Exception as e:
+        print(f"共享状态目录不可用: {shared}, 错误: {e}")
+        return None
+
+
+def _atomic_create_file(path, content):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    try:
+        fd = os.open(path, flags)
+    except FileExistsError:
+        return False
+    except OSError as e:
+        if getattr(e, 'errno', None) == errno.EEXIST:
+            return False
+        raise
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8', errors='ignore') as f:
+            f.write(content)
+        return True
+    except Exception:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
+        raise
+
+
+def _with_lockfile(lock_path, timeout_seconds=30, stale_seconds=3600):
+    start = time.time()
+    payload = f"host={socket.gethostname()} pid={os.getpid()} start={start}\n"
+    while True:
+        try:
+            created = _atomic_create_file(lock_path, payload)
+            if created:
+                def _release():
+                    try:
+                        os.unlink(lock_path)
+                    except Exception:
+                        pass
+                return _release
+        except Exception:
+            pass
+        try:
+            st = os.stat(lock_path)
+            age = time.time() - float(getattr(st, 'st_mtime', time.time()) or time.time())
+            if stale_seconds > 0 and age > stale_seconds:
+                try:
+                    os.unlink(lock_path)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        if time.time() - start >= timeout_seconds:
+            raise TimeoutError(f"等待锁超时: {lock_path}")
+        time.sleep(0.2)
 
 # 常见的视频文件扩展名
 VIDEO_EXTENSIONS = {
@@ -548,6 +741,17 @@ def write_done_marker(video_path):
     except Exception:
         pass
 
+
+def directory_has_artifact_outputs(dir_path):
+    try:
+        for name in os.listdir(dir_path):
+            lower = name.lower()
+            if lower.endswith(DIR_ARTIFACT_SKIP_SUFFIXES):
+                return True
+    except (PermissionError, FileNotFoundError, OSError):
+        return False
+    return False
+
 def is_leaf_directory(dir_path):
     """检查目录是否为叶子节点（不包含子目录）"""
     try:
@@ -908,6 +1112,111 @@ def get_yoloed_md5_path():
     return yoloed_path
 
 
+def get_file_md5(file_path):
+    """计算文件的MD5哈希值，兼容极长的 Windows 路径。"""
+    if not file_path:
+        return None
+
+    def candidate_paths(original_path):
+        seen = set()
+        original = str(original_path)
+        for variant in (original,):
+            if variant and variant not in seen:
+                seen.add(variant)
+                yield variant
+        if os.name == 'posix':
+            win = wsl_path_to_windows(original)
+            if win and win not in seen:
+                seen.add(win)
+                yield win
+
+    short_dir = '/tmp/findinvideo_md5'
+
+    def open_stream(path):
+        hash_md5 = hashlib.md5()
+        with open(path, 'rb') as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b''):
+                hash_md5.update(chunk)
+        return hash_md5.hexdigest()
+
+    def attempt_symlink(path):
+        os.makedirs(short_dir, exist_ok=True)
+        ext = os.path.splitext(path)[1] or ''
+        hashed = hashlib.md5(path.encode('utf-8', 'ignore')).hexdigest()
+        link_path = os.path.join(short_dir, hashed + ext)
+        try:
+            if os.path.exists(link_path):
+                return link_path
+            os.symlink(path, link_path)
+            return link_path
+        except Exception:
+            return None
+
+    def windows_copy(path):
+        win_src = path if is_windows_style_path(path) else wsl_path_to_windows(path)
+        if not win_src:
+            return None
+        win_src = win_src.replace('/', '\\')
+        ext = os.path.splitext(win_src)[1] or '.bin'
+        hashed = hashlib.md5(win_src.encode('utf-8', 'ignore')).hexdigest()
+        base = os.environ.get('FINDINVIDEO_WIN_TEMP', r'C:\Temp\findinvideo_md5') or r'C:\Temp\findinvideo_md5'
+        base = base.replace('/', '\\').rstrip('\\') or r'C:\Temp\findinvideo_md5'
+        drive, tail = ntpath.splitdrive(base)
+        base = ntpath.join('C:\\', base.lstrip('\\')) if not drive else ntpath.normpath(drive + tail)
+        dest_win = ntpath.normpath(ntpath.join(base, hashed + ext))
+        dest_dir = ntpath.dirname(dest_win)
+
+        sanitized_dest_dir = dest_dir.replace("'", "''")
+        sanitized_src = win_src.replace("'", "''")
+        sanitized_dst = dest_win.replace("'", "''")
+        ensure_script = (
+            "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
+            f"$dir='\\\\?\\{sanitized_dest_dir}';"
+            "if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }"
+        )
+        copy_script = (
+            "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
+            f"$src='\\\\?\\{sanitized_src}';"
+            f"$dst='\\\\?\\{sanitized_dst}';"
+            "Copy-Item -LiteralPath $src -Destination $dst -Force"
+        )
+        try:
+            subprocess.run(["powershell", "-NoProfile", "-Command", ensure_script], check=True, capture_output=True, text=True)
+            subprocess.run(["powershell", "-NoProfile", "-Command", copy_script], check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as exc:
+            print(f"复制文件用于MD5失败: {exc}")
+            return None
+        dest_wsl = windows_path_to_wsl(dest_win)
+        return dest_wsl
+
+    last_error = None
+    for candidate in candidate_paths(file_path):
+        try:
+            return open_stream(candidate)
+        except (FileNotFoundError, NotADirectoryError) as e:
+            last_error = e
+        except OSError as e:
+            last_error = e
+            if os.name == 'posix':
+                link = attempt_symlink(candidate)
+                if link:
+                    try:
+                        return open_stream(link)
+                    except Exception as e2:
+                        last_error = e2
+                copied = windows_copy(candidate)
+                if copied:
+                    try:
+                        return open_stream(copied)
+                    except Exception as e3:
+                        last_error = e3
+        except Exception as e:
+            last_error = e
+
+    print(f"计算MD5错误: {file_path}, 错误: {last_error or '未找到可访问路径'}")
+    return None
+
+
 def get_file_md5_cached(file_path):
     """Cached wrapper around get_file_md5 to avoid recompute in one run."""
     if not file_path:
@@ -1049,6 +1358,20 @@ def append_yoloed_md5(md5, file_path=None):
         print(f"写入已识别MD5失败: {e}")
 
 
+def should_process(file_path):
+    if has_existing_artifacts(file_path):
+        return False
+    if is_path_already_yoloed(file_path):
+        return False
+    md5 = get_file_md5_cached(file_path)
+    if not md5:
+        return False
+    yoloed_md5 = load_yoloed_md5(reload=False)
+    if md5 in yoloed_md5:
+        return False
+    return True
+
+
 def is_path_already_yoloed(file_path):
     """Fast check using yoloed.txt stored paths (no hashing)."""
     load_yoloed_md5(reload=False)
@@ -1091,7 +1414,7 @@ def process_directory_videos(dir_path, target_item, all_objects_switch=False, sk
                     duration = frame_count / fps if fps > 0 else float('inf')
                     
                     if duration <= 3600:  # 小于等于1小时的视频
-                        video_files.append(file_path)
+                        video_files.append((file_path, duration))
                     else:
                         print(f"视频时长 {duration:.2f}秒超过一小时，跳过处理: {file_path}")
                 else:
@@ -1101,7 +1424,7 @@ def process_directory_videos(dir_path, target_item, all_objects_switch=False, sk
         return
     
     # 处理视频文件
-    for video_file, duration, claim_path, md5 in video_files:
+    for video_file, duration in video_files:
         if duration == float('inf'):
             print(f"提示: 无法获取视频时长，仍尝试处理: {video_file}")
         print(f"开始处理视频文件: {video_file}")
