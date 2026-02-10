@@ -1451,12 +1451,12 @@ if __name__ == "__main__":
         print(f"启用叶子节点处理模式，正在扫描目录: {video_path}")
         print("正在查找包含视频文件的叶子节点目录...")
 
-        root_video_count = count_videos_in_directory(root_path)
+        root_video_count = count_videos_in_directory(video_path)
         if root_video_count > 0:
-            print(f"\n=== 处理根目录: {root_path} ({root_video_count} 个视频) ===")
-            process_directory_videos(root_path, target_item, all_objects_switch, skip_long_videos)
+            print(f"\n=== 处理根目录: {video_path} ({root_video_count} 个视频) ===")
+            process_directory_videos(video_path, target_item, all_objects_switch)
 
-        leaf_dirs = find_leaf_directories_with_videos(root_path, EXCLUDE_PATHS, refresh_index=False)
+        leaf_dirs = find_leaf_directories_with_videos(video_path, EXCLUDE_PATHS, refresh_index=False)
 
         if not leaf_dirs:
             print(f"未找到包含视频文件的叶子节点目录")
@@ -1482,7 +1482,7 @@ if __name__ == "__main__":
     # 原有的处理逻辑（当 use_leaf_node_processing 为 False 时使用）
     elif os.path.isdir(video_path):
         video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv']
-        for root, dirs, files in os.walk(root_path):
+        for root, dirs, files in os.walk(video_path):
             for file in files:
                 ext = os.path.splitext(file)[1].lower()
                 if ext in video_extensions:
