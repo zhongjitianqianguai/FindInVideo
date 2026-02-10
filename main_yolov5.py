@@ -1,5 +1,6 @@
 import sys
 import os
+import shutil
 # 添加yolov5文件夹到Python路径
 sys.path.append(os.path.join(os.path.dirname(__file__), 'yolov5'))
 
@@ -10,14 +11,12 @@ from tqdm import tqdm
 import subprocess
 import json
 import re
-from pathlib import Path
 import time
 import hashlib
 import logging
-import sqlite3
-import atexit
 import signal
 import socket
+import threading
 import ctypes
 import errno
 import traceback
@@ -49,6 +48,30 @@ class PauseRequested(Exception):
 
 _STOP_REQUESTED = False
 
+# ---------- cap.read() 超时包装 ----------
+_READ_TIMEOUT_SEC = 30
+
+
+def _read_frame_with_timeout(cap, timeout=_READ_TIMEOUT_SEC):
+    """在子线程中调用 cap.read()，超时后返回 (False, None, True)。
+
+    返回 (success, frame, timed_out)。
+    """
+    result = [False, None]
+
+    def _reader():
+        try:
+            result[0], result[1] = cap.read()
+        except Exception:
+            result[0], result[1] = False, None
+
+    t = threading.Thread(target=_reader, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    if t.is_alive():
+        return False, None, True
+    return result[0], result[1], False
+
 
 def _truthy_env(name, default=False):
     val = os.environ.get(name)
@@ -62,7 +85,7 @@ def _get_pause_file_path():
     explicit = os.environ.get('FINDINVIDEO_PAUSE_FILE')
     if explicit:
         return explicit
-    shared = get_shared_state_dir() if 'get_shared_state_dir' in globals() else None
+    shared = get_shared_state_dir()
     if shared:
         return os.path.join(shared, 'pause.flag')
     try:
@@ -670,15 +693,19 @@ def is_video_file(file_path):
     _, ext = os.path.splitext(file_path.lower())
     return ext in VIDEO_EXTENSIONS
 
+_IGNORED_SUBDIRS = {'yolov5_output', '__pycache__', '.git', '$RECYCLE.BIN', 'System Volume Information'}
+
 def is_leaf_directory(dir_path):
-    """检查目录是否为叶子节点（不包含子目录）"""
+    """检查目录是否为叶子节点（不包含子目录，忽略工具生成的输出目录）"""
     try:
         for item in os.listdir(dir_path):
+            if item in _IGNORED_SUBDIRS:
+                continue
             item_path = os.path.join(dir_path, item)
             if os.path.isdir(item_path):
                 return False
         return True
-    except (PermissionError, FileNotFoundError):
+    except (PermissionError, FileNotFoundError, OSError):
         return False
 
 def count_videos_in_directory(dir_path):
@@ -689,7 +716,7 @@ def count_videos_in_directory(dir_path):
             file_path = os.path.join(dir_path, file)
             if os.path.isfile(file_path) and is_video_file(file_path):
                 count += 1
-    except (PermissionError, FileNotFoundError):
+    except (PermissionError, FileNotFoundError, OSError):
         pass
     return count
 
@@ -724,7 +751,7 @@ def find_leaf_directories_with_videos(root_path, exclusions=None):
                 if video_count > 0:
                     leaf_dirs.append((root, video_count))
     
-    except (PermissionError, FileNotFoundError) as e:
+    except (PermissionError, FileNotFoundError, OSError) as e:
         print(f"警告: 无法访问目录 '{root_path}': {e}")
     
     # 按视频数量降序排列
@@ -865,9 +892,18 @@ def detect_objects_in_video_yolov5(video_path, target_class,
         if _pause_requested(pause_file):
             _save_checkpoint(video_path, next_frame=frame_count, detections=detections, last_detected=last_detected)
             raise PauseRequested()
-        success, frame = cap.read()
+        success, frame, timed_out = _read_frame_with_timeout(cap)
         if not success:
-            break
+            if timed_out:
+                _LOGGER.warning("读帧超时(>%ds)，尝试跳过: %s (frame=%d)", _READ_TIMEOUT_SEC, video_path, frame_count)
+                try:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_count + 1)
+                except Exception:
+                    break
+                pbar.update(1)
+                frame_count += 1
+                continue
+            break  # 正常 EOF
         if frame is None:
             print(f"读取到空帧，已跳过: {video_path} (frame={frame_count})")
             pbar.update(1)
@@ -1044,120 +1080,6 @@ def should_process(file_path):
     return True, None
 
 
-def should_process_with_md5(file_path):
-    if has_existing_artifacts(file_path):
-        return
-    md5 = get_file_md5_cached(file_path)
-    if not md5:
-        return
-    yoloed_md5 = load_yoloed_md5(reload=False)
-    if md5 in yoloed_md5:
-        return
-    return True, None, md5
-
-def detect_objects_with_detectpy(video_path, target_class,
-                                 show_window=False, save_crops=False,
-                                 save_training_data=False,
-                                 all_objects=False,
-                                 model_path='models/breast.pt'):
-    """使用YOLOv5的detect.py进行视频目标检测"""
-    
-    # 如果不开启全量检测，则保证 target_class 为列表
-    if not all_objects and isinstance(target_class, str):
-        target_class = [target_class]
-
-    # 构建detect.py命令
-    detect_script = os.path.join(os.path.dirname(__file__), 'yolov5', 'detect.py')
-    output_dir = os.path.join(os.path.dirname(video_path), "yolov5_output")
-    
-    # 获取当前Python解释器路径（虚拟环境中的Python）
-    python_exe = sys.executable
-    
-    cmd = [
-        python_exe, detect_script,  # 使用当前Python解释器
-        '--weights', model_path,
-        '--source', video_path,
-        '--project', output_dir,
-        '--name', 'exp',
-        '--exist-ok',
-        '--conf-thres', '0.5',
-        '--save-txt',  # 保存检测结果为txt文件
-        '--save-conf'  # 保存置信度
-    ]
-    
-    if save_crops:
-        cmd.append('--save-crop')
-    
-    print(f"运行YOLOv5 detect.py: {' '.join(cmd)}")
-    
-    try:
-        # 运行detect.py
-        result = subprocess.run(cmd, capture_output=True, text=True, cwd=os.path.dirname(__file__))
-        
-        if result.returncode != 0:
-            print(f"detect.py运行失败: {result.stderr}")
-            return []
-        
-        print("detect.py运行成功")
-        
-        # 解析检测结果
-        detections = []
-        results_dir = os.path.join(output_dir, 'exp')
-        labels_dir = os.path.join(results_dir, 'labels')
-        
-        if os.path.exists(labels_dir):
-            # 读取视频帧率用于计算时间戳
-            cap = cv2.VideoCapture(video_path)
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            cap.release()
-            
-            # 解析标签文件
-            for label_file in os.listdir(labels_dir):
-                if label_file.endswith('.txt'):
-                    # 从文件名提取帧号
-                    frame_match = re.search(r'frame_(\d+)', label_file)
-                    if frame_match:
-                        frame_num = int(frame_match.group(1))
-                        timestamp = frame_num / fps if fps > 0 else 0
-                        
-                        # 读取检测结果
-                        label_path = os.path.join(labels_dir, label_file)
-                        with open(label_path, 'r') as f:
-                            lines = f.readlines()
-                            
-                        for line in lines:
-                            parts = line.strip().split()
-                            if len(parts) >= 5:
-                                cls_id = int(parts[0])
-                                confidence = float(parts[5]) if len(parts) > 5 else 0.5
-                                
-                                # 这里需要根据模型的类别映射来判断
-                                # 简化处理：假设检测到任何对象都记录时间戳
-                                if timestamp not in detections:
-                                    detections.append(timestamp)
-        
-        # 保存时间戳到txt文件
-        video_dir = os.path.dirname(video_path) or '.'
-        artifact_base = safe_artifact_basename(video_path)
-        txt_save_path = os.path.join(video_dir, artifact_base + ".txt")
-        with open(txt_save_path, 'w') as f:
-            f.write("检测到目标的时间位置（秒）:\n")
-            for t in sorted(detections):
-                f.write(f"{t:.2f}\n")
-        print(f"已保存检测时间戳至: {txt_save_path}")
-        
-        # 处理拼接图片
-        if save_crops:
-            crops_dir = os.path.join(results_dir, 'crops')
-            if os.path.exists(crops_dir):
-                create_mosaic_from_crops(crops_dir, video_path)
-        write_done_marker(video_path)
-        return detections
-        
-    except Exception as e:
-        print(f"使用detect.py检测失败: {e}")
-        return []
-
 def create_mosaic_from_crops(crops_dir, video_path):
     """从裁剪图片创建拼接图"""
     crops = []
@@ -1220,8 +1142,7 @@ def detect_objects_with_frame_analysis(video_path, target_class,
         '--name', 'exp',
         '--exist-ok',
         '--conf-thres', '0.5',
-        '--save-txt',
-        '--save-conf'
+        '--save-txt',  # 临时保存标签用于解析时间戳，解析后自动清理
     ]
     
     if save_crops:
@@ -1269,9 +1190,18 @@ def detect_objects_with_frame_analysis(video_path, target_class,
             if _pause_requested(pause_file):
                 _save_checkpoint(video_path, next_frame=frame_count, detections=detections, last_detected=last_detected)
                 raise PauseRequested()
-            success, frame = cap.read()
+            success, frame, timed_out = _read_frame_with_timeout(cap)
             if not success:
-                break
+                if timed_out:
+                    _LOGGER.warning("读帧超时(>%ds)，尝试跳过: %s (frame=%d)", _READ_TIMEOUT_SEC, video_path, frame_count)
+                    try:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_count + 1)
+                    except Exception:
+                        break
+                    pbar.update(1)
+                    frame_count += 1
+                    continue
+                break  # 正常 EOF
             if frame is None:
                 print(f"读取到空帧，已跳过: {video_path} (frame={frame_count})")
                 pbar.update(1)
@@ -1316,6 +1246,13 @@ def detect_objects_with_frame_analysis(video_path, target_class,
                 f.write(f"{t:.2f}\n")
         print(f"已保存检测时间戳至: {txt_save_path}")
         
+        # 清理临时 labels 目录（仅用于解析时间戳，不需要保留）
+        if os.path.exists(labels_dir):
+            try:
+                shutil.rmtree(labels_dir)
+            except Exception:
+                pass
+
         # 处理拼接图片
         if save_crops:
             crops_dir = os.path.join(results_dir, 'crops')
@@ -1518,7 +1455,7 @@ def get_file_md5(file_path):
 if __name__ == "__main__":
     _setup_diagnostics()
     _install_pause_signal_handler()
-    video_path = r"C:\Users\f1094\Desktop\DouyinLiveRecorder\download\邹邹大王"  # 可设置为视频文件或目录
+    video_path = r"C:\Users\f1094\Downloads\果汁晗"  # 可设置为视频文件或目录
     # 如要检测所有模型内对象，则将 target_item 设置为任意值并启用全量检测开关
     target_item = "breast"  # 当 all_objects 为 True 时，该值不再限制检测
     all_objects_switch = True  # 设置为 True 表示显示所有检测对象

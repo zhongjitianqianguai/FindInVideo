@@ -25,6 +25,33 @@ _YOLOED_MD5_CACHE = None
 _YOLOED_MD5_CACHE_MTIME = None
 _YOLOED_PATH_CACHE = None
 _FILE_MD5_CACHE = {}
+_PROCESSING_ROOT_DIR = None  # 当前处理的根目录，用于定位 md5_list/yoloed.txt
+
+# ---------- cap.read() 超时包装 ----------
+_READ_TIMEOUT_SEC = 30  # 单帧读取超时秒数
+
+
+def _read_frame_with_timeout(cap, timeout=_READ_TIMEOUT_SEC):
+    """在子线程中调用 cap.read()，超时后返回 (False, None, True)。
+
+    某些视频容器（FLV/RMVB 等）会在损坏段上导致 FFmpeg 无限阻塞。
+    返回 (success, frame, timed_out)。
+    """
+    result = [False, None]
+
+    def _reader():
+        try:
+            result[0], result[1] = cap.read()
+        except Exception:
+            result[0], result[1] = False, None
+
+    t = threading.Thread(target=_reader, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    if t.is_alive():
+        # 读帧线程卡住了——无法强杀线程，但可以标记失败
+        return False, None, True
+    return result[0], result[1], False
 
 _LOGGER = logging.getLogger("findinvideo")
 _CRASH_LOG_FH = None
@@ -117,18 +144,11 @@ def _get_pause_file_path():
 
     If this file exists, the process will pause at a safe point.
     """
-    explicit = _get_env_path('FINDINVIDEO_PAUSE_FILE') if '_get_env_path' in globals() else os.environ.get('FINDINVIDEO_PAUSE_FILE')
+    explicit = _get_env_path('FINDINVIDEO_PAUSE_FILE')
     if explicit:
         return explicit
-    shared = get_shared_state_dir() if 'get_shared_state_dir' in globals() else None
-    if shared:
-        return os.path.join(shared, 'pause.flag')
-    # fallback to workspace directory
-    try:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-    except Exception:
-        base_dir = os.getcwd()
-    return os.path.join(base_dir, 'pause.flag')
+    shared = get_shared_state_dir()
+    return os.path.join(shared, 'pause.flag')
 
 
 def _pause_requested(pause_file_path=None):
@@ -441,9 +461,14 @@ def get_shared_state_dir():
     """
     shared = _get_env_path('FINDINVIDEO_SHARED_STATE_DIR')
     if not shared:
-        shared = r"\\192.168.31.9\\d\\md5_list"
-    if not shared:
-        return None
+        # 优先使用处理目标目录下的 md5_list（与 yoloed.txt 同级）
+        base_dir = _PROCESSING_ROOT_DIR
+        if not base_dir:
+            try:
+                base_dir = os.path.dirname(os.path.abspath(__file__))
+            except Exception:
+                base_dir = os.getcwd()
+        shared = os.path.join(base_dir, 'md5_list')
     if os.name == 'posix' and is_windows_style_path(shared):
         converted = windows_path_to_wsl(shared)
         if converted:
@@ -453,8 +478,6 @@ def get_shared_state_dir():
 
 def ensure_shared_state_dir():
     shared = get_shared_state_dir()
-    if not shared:
-        return None
     try:
         os.makedirs(shared, exist_ok=True)
         return shared
@@ -646,11 +669,18 @@ DIR_ARTIFACT_SKIP_SUFFIXES = (
 )
 
 # 需要排除的路径变量
-EXCLUDE_PATHS = [
+_EXCLUDE_PATHS_RAW = [
     os.path.abspath(r"D:\$RECYCLE.BIN"),
     os.path.abspath(r"D:\System Volume Information"),
     # 在这里添加其他需要排除的路径
+    os.path.abspath(r"D:\z\gtll 10yue"),
 ]
+# 自动生成 UNC 变体，确保排除路径在 UNC 格式扫描时也能匹配
+EXCLUDE_PATHS = list(_EXCLUDE_PATHS_RAW)
+for _ep in _EXCLUDE_PATHS_RAW:
+    _unc = windows_path_to_unc(_ep)
+    if _unc and _unc not in EXCLUDE_PATHS:
+        EXCLUDE_PATHS.append(_unc)
 
 DIRECTORY_INDEX_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'directory_index.db')
 
@@ -659,7 +689,7 @@ class DirectoryIndex:
     """SQLite-backed cache for directory metadata and video listings."""
 
     def __init__(self, db_path=None):
-        self.db_path = db_path or DIRECTORY_INDEX_DB_PATH
+        self.db_path = db_path or ':memory:'
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
         with self.conn:
@@ -713,6 +743,20 @@ class DirectoryIndex:
         except sqlite3.Error:
             pass
 
+    def reopen(self, new_db_path):
+        """关闭当前连接并在新路径重新打开数据库。"""
+        self.close()
+        self.db_path = new_db_path
+        folder = os.path.dirname(new_db_path)
+        if folder and not os.path.exists(folder):
+            os.makedirs(folder, exist_ok=True)
+        self.conn = sqlite3.connect(self.db_path)
+        self.conn.row_factory = sqlite3.Row
+        with self.conn:
+            self.conn.execute('PRAGMA foreign_keys = ON;')
+            self.conn.execute('PRAGMA journal_mode = WAL;')
+        self._ensure_schema()
+
     def _normalize_path(self, path):
         if not path:
             return None
@@ -730,6 +774,12 @@ class DirectoryIndex:
                 continue
             normalized.add(entry)
             normalized.add(os.path.normpath(entry))
+            # 盘符 → UNC，确保排除路径能匹配 UNC 格式的扫描路径
+            if os.name == 'nt':
+                unc = windows_path_to_unc(entry)
+                if unc:
+                    normalized.add(unc)
+                    normalized.add(os.path.normpath(unc))
             if os.name == 'posix':
                 converted = windows_path_to_wsl(entry)
                 if converted:
@@ -1143,9 +1193,19 @@ def detect_objects_in_video(video_path, target_class,
                 _save_checkpoint(video_path, next_frame=frame_index, detections=detections, last_detected=last_detected, part_index=part_index + (1 if use_parts else 0))
                 raise PauseRequested()
 
-            success, frame = cap.read()
+            success, frame, timed_out = _read_frame_with_timeout(cap)
             if not success:
-                break
+                if timed_out:
+                    # 真正的超时卡死，尝试 seek 跳过当前帧继续
+                    _LOGGER.warning("读帧超时(>%ds)，尝试跳过: %s (frame=%d)", _READ_TIMEOUT_SEC, video_path, frame_index)
+                    try:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index + 1)
+                    except Exception:
+                        break  # seek 也不行就放弃
+                    pbar.update(1)
+                    frame_index += 1
+                    continue
+                break  # 正常 EOF
             if frame is None:
                 _LOGGER.warning("读取到空帧，已跳过: %s (frame=%s)", video_path, frame_index)
                 pbar.update(1)
@@ -1311,14 +1371,16 @@ def detect_objects_in_video(video_path, target_class,
     return detections
 
 def get_yoloed_md5_path():
-    # 支持路径转换
+    # 支持路径转换；默认使用处理目标目录下的 md5_list/yoloed.txt
     yoloed_path = _get_env_path('FINDINVIDEO_YOLOED_PATH')
     if not yoloed_path:
-        shared = get_shared_state_dir()
-        if shared:
-            yoloed_path = os.path.join(shared, 'yoloed.txt')
-        else:
-            yoloed_path = r"D:\md5_list\yoloed.txt"
+        base_dir = _PROCESSING_ROOT_DIR
+        if not base_dir:
+            try:
+                base_dir = os.path.dirname(os.path.abspath(__file__))
+            except Exception:
+                base_dir = os.getcwd()
+        yoloed_path = os.path.join(base_dir, 'md5_list', 'yoloed.txt')
     if os.name == 'posix':
         yoloed_path = windows_path_to_wsl(yoloed_path)
         if yoloed_path:
@@ -1408,6 +1470,17 @@ def load_yoloed_md5(reload=False):
                         canon = canonical_video_path(raw_path)
                         if canon:
                             path_set.add(canon)
+                        # 跨平台: 若为 WSL 路径 (/mnt/<drive>/...), 同时生成 Windows 盘符 + UNC 变体
+                        if raw_path.startswith('/mnt/') and len(raw_path) > 5 and raw_path[5].isalpha():
+                            _drv = raw_path[5]
+                            _rest = raw_path[6:].lstrip('/').replace('/', '\\')
+                            _win = f"{_drv.upper()}:\\{_rest}" if _rest else f"{_drv.upper()}:\\"
+                            path_set.add(_win)
+                            _win_norm = os.path.normpath(_win)
+                            path_set.add(_win_norm)
+                            _unc = canonical_video_path(_win)
+                            if _unc:
+                                path_set.add(_unc)
     except Exception as e:
         print(f"读取已识别MD5列表失败: {e}")
     _YOLOED_MD5_CACHE = md5_set
@@ -1436,11 +1509,22 @@ def append_yoloed_md5(md5, file_path=None):
         if _YOLOED_MD5_CACHE is not None:
             _YOLOED_MD5_CACHE.add(md5)
         if file_path and _YOLOED_PATH_CACHE is not None:
-            _YOLOED_PATH_CACHE.add(str(file_path))
-            _YOLOED_PATH_CACHE.add(os.path.normpath(str(file_path)))
+            _fp = str(file_path)
+            _YOLOED_PATH_CACHE.add(_fp)
+            _YOLOED_PATH_CACHE.add(os.path.normpath(_fp))
             canon = canonical_video_path(file_path)
             if canon:
                 _YOLOED_PATH_CACHE.add(canon)
+            # 跨平台: WSL 路径同时添加 Windows 变体
+            if _fp.startswith('/mnt/') and len(_fp) > 5 and _fp[5].isalpha():
+                _drv = _fp[5]
+                _rest = _fp[6:].lstrip('/').replace('/', '\\')
+                _win = f"{_drv.upper()}:\\{_rest}" if _rest else f"{_drv.upper()}:\\"
+                _YOLOED_PATH_CACHE.add(_win)
+                _YOLOED_PATH_CACHE.add(os.path.normpath(_win))
+                _unc = canonical_video_path(_win)
+                if _unc:
+                    _YOLOED_PATH_CACHE.add(_unc)
     except Exception as e:
         print(f"写入已识别MD5失败: {e}")
 
@@ -1458,32 +1542,6 @@ def is_path_already_yoloed(file_path):
     if canon:
         candidates.append(canon)
     return any(c in _YOLOED_PATH_CACHE for c in candidates)
-
-def should_process(file_path):
-    """返回(是否处理, 跳过原因)。"""
-    if has_existing_artifacts(file_path):
-        return False, 'artifact'
-    md5 = get_file_md5_cached(file_path)
-    if not md5:
-        return True, 'md5-unavailable'
-    # 多机情况下：根据 yoloed.txt 的 mtime 自动刷新缓存
-    yoloed_md5 = load_yoloed_md5(reload=False)
-    if md5 in yoloed_md5:
-        return False, 'md5'
-    return True, None
-
-
-def should_process_with_md5(file_path):
-    """返回(是否处理, 跳过原因, md5或None)。"""
-    if has_existing_artifacts(file_path):
-        return False, 'artifact', None
-    md5 = get_file_md5_cached(file_path)
-    if not md5:
-        return True, 'md5-unavailable', None
-    yoloed_md5 = load_yoloed_md5(reload=False)
-    if md5 in yoloed_md5:
-        return False, 'md5', md5
-    return True, None, md5
 
 def process_directory_videos(dir_path, target_item, all_objects_switch=False, skip_long_videos=True):
     """处理目录中的所有视频文件"""
@@ -1506,25 +1564,47 @@ def process_directory_videos(dir_path, target_item, all_objects_switch=False, sk
             print(f"警告: 无法访问目录 '{dir_path}': {e}")
             return
 
-    for file in candidate_names:
+    # ====== 目录级批量预检：纯内存操作，零网络 I/O ======
+    # 先加载 yoloed 缓存（仅在 mtime 变化时才重新读文件）
+    load_yoloed_md5(reload=False)
+    if candidate_names:
+        need_process = []          # 需要逐个详细检查的文件名
+        skipped_path_count = 0     # 路径缓存命中数
+        skipped_artifact_count = 0 # artifact/.done 命中数
+
+        for file in candidate_names:
+            file_path = os.path.join(dir_path, file)
+            # 最廉价检查 1: 路径缓存（纯内存 set 查找）
+            if is_path_already_yoloed(file_path):
+                skipped_path_count += 1
+                continue
+            # 最廉价检查 2: artifact/.done 标记（本地/网络 stat，但比 MD5 便宜几个量级）
+            if has_existing_artifacts(file_path):
+                skipped_artifact_count += 1
+                continue
+            need_process.append(file)
+
+        total_skipped = skipped_path_count + skipped_artifact_count
+        if total_skipped > 0 and not need_process:
+            # 整个目录全部命中缓存，一行汇总即可
+            print(f"目录内全部 {total_skipped} 个视频均已处理，整体跳过: {dir_path}")
+            return
+        if total_skipped > 0:
+            print(f"目录预检: {total_skipped} 个已处理(路径{skipped_path_count}/标记{skipped_artifact_count})，"
+                  f"剩余 {len(need_process)} 个待检查")
+    else:
+        need_process = []
+
+    # ====== 逐文件详细检查（仅对预检未命中的文件） ======
+    for file in need_process:
         file_path = os.path.join(dir_path, file)
         if not os.path.isfile(file_path):
             continue
-        # 先用 artifact/.done 做快速跳过，避免网络盘上大量计算 MD5
-        if has_existing_artifacts(file_path):
-            print(f"检测到同名衍生文件/完成标记，跳过处理: {file_path}")
-            continue
 
-        # 先抢占（不用 md5），避免多机重复做后续的 hash/推理
+        # 抢占（不用 md5），避免多机重复做后续的 hash/推理
         claim_path = try_acquire_video_claim(file_path, md5_hint=None)
         if ensure_shared_state_dir() and not claim_path:
             print(f"已被其他机器抢占(处理中)，跳过: {file_path}")
-            continue
-
-        # 快速路径：如果 yoloed.txt 里记录了相同路径（或映射到 UNC 后相同），直接跳过
-        if is_path_already_yoloed(file_path):
-            release_video_claim(claim_path)
-            print(f"已在路径记录中，跳过处理: {file_path}")
             continue
 
         md5 = get_file_md5_cached(file_path)
@@ -1532,7 +1612,11 @@ def process_directory_videos(dir_path, target_item, all_objects_switch=False, sk
             if md5 in load_yoloed_md5(reload=False):
                 # 已处理：释放 claim 并跳过
                 release_video_claim(claim_path)
-                print(f"已在MD5记录中，跳过处理: {file_path}")
+                # 路径预检未命中但 MD5 命中，说明 yoloed.txt 中缺少当前路径格式；
+                # 补写一条，下次可直接路径命中，避免再算 MD5
+                append_yoloed_md5(md5, file_path)
+                write_done_marker(file_path)
+                print(f"已在MD5记录中，跳过处理(已补录路径): {file_path}")
                 continue
         else:
             # md5 拿不到也允许继续（但可能会重复）；保留行为
@@ -1585,12 +1669,20 @@ def process_directory_videos(dir_path, target_item, all_objects_switch=False, sk
 
 def process_root_directory(root_path, target_item, all_objects_switch, skip_long_videos, use_leaf_node_processing):
     """根据配置处理根目录下的所有视频目录/文件"""
+    global _PROCESSING_ROOT_DIR
+    _PROCESSING_ROOT_DIR = root_path
     if os.name == 'posix' and is_windows_style_path(root_path):
         converted_root = windows_path_to_wsl(root_path)
         if converted_root:
             root_path = normalize_posix_path_with_fs(converted_root)
     if not os.path.isdir(root_path):
         print(f"警告: 目录 '{root_path}' 无法通过常规方式访问，尝试继续处理。")
+    # 将数据库文件迁移到处理目标目录的 md5_list/ 下
+    new_db_path = os.path.join(_PROCESSING_ROOT_DIR, 'md5_list', 'directory_index.db')
+    try:
+        DIRECTORY_INDEX.reopen(new_db_path)
+    except Exception as exc:
+        print(f"数据库迁移到 {new_db_path} 失败: {exc}，使用原路径")
     try:
         DIRECTORY_INDEX.refresh(root_path, EXCLUDE_PATHS)
     except Exception as exc:
@@ -1647,7 +1739,9 @@ def process_root_directory(root_path, target_item, all_objects_switch, skip_long
                     md5 = get_file_md5_cached(file_path)
                     if md5 and md5 in load_yoloed_md5(reload=False):
                         release_video_claim(claim_path)
-                        print(f"已在MD5记录中，跳过处理: {file_path}")
+                        append_yoloed_md5(md5, file_path)
+                        write_done_marker(file_path)
+                        print(f"已在MD5记录中，跳过处理(已补录路径): {file_path}")
                         continue
 
                     cap = cv2.VideoCapture(file_path)
@@ -1826,6 +1920,13 @@ if __name__ == "__main__":
     _install_pause_signal_handler()
     _start_keyboard_listener()  # 启动键盘监听，输入222可暂停2小时
     video_path = r"""D:\z"""  # 可设置为视频文件或目录
+    _PROCESSING_ROOT_DIR = video_path  # 设置处理根目录，yoloed.txt / claims / DB 均存放在此目录下的 md5_list/
+    # 将数据库迁移到处理目标目录
+    _new_db = os.path.join(_PROCESSING_ROOT_DIR, 'md5_list', 'directory_index.db')
+    try:
+        DIRECTORY_INDEX.reopen(_new_db)
+    except Exception as _e:
+        print(f"数据库迁移到 {_new_db} 失败: {_e}，使用原路径")
     original_video_path = video_path
     if os.name == 'posix' and is_windows_style_path(video_path):
         converted = windows_path_to_wsl(video_path)
@@ -1873,7 +1974,9 @@ if __name__ == "__main__":
                             else:
                                 md5 = get_file_md5_cached(video_path)
                                 if md5 and md5 in load_yoloed_md5(reload=False):
-                                    print(f"已在MD5记录中，跳过处理: {video_path}")
+                                    append_yoloed_md5(md5, video_path)
+                                    write_done_marker(video_path)
+                                    print(f"已在MD5记录中，跳过处理(已补录路径): {video_path}")
                                 else:
                                     detect_objects_in_video(video_path, target_item,
                                                             show_window=False,
