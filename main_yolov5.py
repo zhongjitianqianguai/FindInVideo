@@ -1271,49 +1271,12 @@ def process_directory_videos(dir_path, target_item, all_objects_switch=False, mo
 
     try:
         for file in os.listdir(dir_path):
-            if not is_video_file(file):
-                continue
-            file_path = os.path.join(dir_path, file)
-            if not os.path.isfile(file_path):
-                continue
-
-            if has_existing_artifacts(file_path):
-                print(f"检测到已有输出，跳过: {file_path}")
-                continue
-
-            claim_path = try_acquire_video_claim(file_path, md5_hint=None)
-            if ensure_shared_state_dir() and not claim_path:
-                print(f"已被其它机器处理，跳过: {file_path}")
-                continue
-
-            if is_path_already_yoloed(file_path):
-                print(f"路径已存在于yoloed.txt，跳过: {file_path}")
-                release_video_claim(claim_path)
-                continue
-
-            md5 = get_file_md5_cached(file_path)
-            if md5:
-                yoloed_md5 = load_yoloed_md5(reload=False)
-                if md5 in yoloed_md5:
-                    print(f"MD5已处理，跳过: {file_path}")
-                    release_video_claim(claim_path)
-                    continue
-            else:
-                print(f"无法计算MD5，跳过: {file_path}")
-                release_video_claim(claim_path)
-                continue
-
-            cap = cv2.VideoCapture(file_path)
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-            cap.release()
-            duration = frame_count / fps if fps > 0 else float('inf')
-            if skip_long_videos and duration > 3600:
-                print(f"视频过长(>1h)，跳过: {file_path}")
-                release_video_claim(claim_path)
-                continue
-
-            video_files.append((file_path, duration, claim_path, md5))
+            if is_video_file(file):
+                file_path = os.path.join(dir_path, file)
+                if should_process(file_path):
+                    video_files.append(file_path)
+                else:
+                    print(f"已存在拼接图片，跳过处理: {file_path}")
     except (PermissionError, FileNotFoundError) as e:
         print(f"警告: 无法访问目录 '{dir_path}': {e}")
         return
@@ -1453,9 +1416,7 @@ def get_file_md5(file_path):
     return None
 
 if __name__ == "__main__":
-    _setup_diagnostics()
-    _install_pause_signal_handler()
-    video_path = r"C:\Users\f1094\Downloads\果汁晗"  # 可设置为视频文件或目录
+    video_path = r"C:\Users\f1094\Desktop\DouyinLiveRecorder\download\邹邹大王"  # 可设置为视频文件或目录
     # 如要检测所有模型内对象，则将 target_item 设置为任意值并启用全量检测开关
     target_item = "breast"  # 当 all_objects 为 True 时，该值不再限制检测
     all_objects_switch = True  # 设置为 True 表示显示所有检测对象
@@ -1468,69 +1429,56 @@ if __name__ == "__main__":
     
     # 新增功能：按叶子节点视频数量排序处理
     use_leaf_node_processing = True  # 设置为 True 启用叶子节点处理模式
-    skip_long_videos = False  # 设置为 True 时跳过超过一小时的视频
-    try:
-        if use_leaf_node_processing and os.path.isdir(video_path):
-            print(f"启用叶子节点处理模式，正在扫描目录: {video_path}")
-            print("正在查找包含视频文件的叶子节点目录...")
-
-            # 查找所有叶子目录
-            leaf_dirs = find_leaf_directories_with_videos(video_path, EXCLUDE_PATHS)
-
-            if not leaf_dirs:
-                print(f"未找到包含视频文件的叶子节点目录")
-            else:
-                print(f"\n找到 {len(leaf_dirs)} 个包含视频文件的叶子节点目录:")
-                for i, (dir_path, video_count) in enumerate(leaf_dirs, 1):
-                    relative_path = os.path.relpath(dir_path, video_path)
-                    print(f"{i:3d}. {relative_path} ({video_count} 个视频文件)")
-
-                print(f"\n开始按视频数量从多到少的顺序处理叶子节点目录...")
-
-                # 按顺序处理每个叶子目录
-                for i, (dir_path, video_count) in enumerate(leaf_dirs, 1):
-                    relative_path = os.path.relpath(dir_path, video_path)
-                    print(f"\n=== 处理第 {i}/{len(leaf_dirs)} 个目录: {relative_path} ({video_count} 个视频) ===")
-                    process_directory_videos(dir_path, target_item, all_objects_switch, yolov5_model_path, use_detectpy, skip_long_videos)
-
-        # 原有的处理逻辑（当 use_leaf_node_processing 为 False 时使用）
-        elif os.path.isdir(video_path):
-            video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv']
-            for root, dirs, files in os.walk(video_path):
-                for file in files:
-                    ext = os.path.splitext(file)[1].lower()
-                    if ext in video_extensions:
-                        file_path = os.path.join(root, file)
-                        if should_process(file_path):
-                            print(f"开始处理视频文件: {file_path}")
-                            detect_objects_in_video_yolov5(file_path, target_item,
-                                                          show_window=False,
-                                                          save_crops=True,
-                                                          save_training_data=False,
-                                                          all_objects=all_objects_switch,
-                                                          model_path=yolov5_model_path)
-                            md5 = get_file_md5_cached(file_path)
-                            if md5:
-                                append_yoloed_md5(md5, file_path=file_path)
-                        else:
-                            print(f"已存在拼接图片，跳过处理: {file_path}")
+    
+    if use_leaf_node_processing and os.path.isdir(video_path):
+        print(f"启用叶子节点处理模式，正在扫描目录: {video_path}")
+        print("正在查找包含视频文件的叶子节点目录...")
+        
+        # 查找所有叶子目录
+        leaf_dirs = find_leaf_directories_with_videos(video_path, EXCLUDE_PATHS)
+        
+        if not leaf_dirs:
+            print(f"未找到包含视频文件的叶子节点目录")
         else:
-            # 处理单个视频文件
-            if should_process(video_path):
-                detect_objects_in_video_yolov5(video_path, target_item,
-                                              show_window=False,
-                                              save_crops=True,
-                                              save_training_data=False,
-                                              all_objects=all_objects_switch,
-                                              model_path=yolov5_model_path)
-                md5 = get_file_md5_cached(video_path)
-                if md5:
-                    append_yoloed_md5(md5, file_path=video_path)
-            else:
-                print(f"已存在拼接图片，跳过处理: {video_path}")
-    except PauseRequested:
-        print("已暂停：已保存进度（checkpoint）。删除 pause.flag 或再次运行即可续跑。")
-        sys.exit(0)
-    except Exception as exc:
-        _LOGGER.error("Fatal error:\n%s", traceback.format_exc())
-        raise
+            print(f"\n找到 {len(leaf_dirs)} 个包含视频文件的叶子节点目录:")
+            for i, (dir_path, video_count) in enumerate(leaf_dirs, 1):
+                relative_path = os.path.relpath(dir_path, video_path)
+                print(f"{i:3d}. {relative_path} ({video_count} 个视频文件)")
+            
+            print(f"\n开始按视频数量从多到少的顺序处理叶子节点目录...")
+            
+            # 按顺序处理每个叶子目录
+            for i, (dir_path, video_count) in enumerate(leaf_dirs, 1):
+                relative_path = os.path.relpath(dir_path, video_path)
+                print(f"\n=== 处理第 {i}/{len(leaf_dirs)} 个目录: {relative_path} ({video_count} 个视频) ===")
+                process_directory_videos(dir_path, target_item, all_objects_switch, yolov5_model_path, use_detectpy)
+    
+    # 原有的处理逻辑（当 use_leaf_node_processing 为 False 时使用）
+    elif os.path.isdir(video_path):
+        video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv']
+        for root, dirs, files in os.walk(video_path):
+            for file in files:
+                ext = os.path.splitext(file)[1].lower()
+                if ext in video_extensions:
+                    file_path = os.path.join(root, file)
+                    if should_process(file_path):
+                        print(f"开始处理视频文件: {file_path}")
+                        detect_objects_in_video_yolov5(file_path, target_item,
+                                                      show_window=False,
+                                                      save_crops=True,
+                                                      save_training_data=False,
+                                                      all_objects=all_objects_switch,
+                                                      model_path=yolov5_model_path)
+                    else:
+                        print(f"已存在拼接图片，跳过处理: {file_path}")
+    else:
+        # 处理单个视频文件
+        if should_process(video_path):
+            detect_objects_in_video_yolov5(video_path, target_item,
+                                          show_window=False,
+                                          save_crops=True,
+                                          save_training_data=False,
+                                          all_objects=all_objects_switch,
+                                          model_path=yolov5_model_path)
+        else:
+            print(f"已存在拼接图片，跳过处理: {video_path}")
