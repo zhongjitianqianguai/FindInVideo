@@ -839,7 +839,9 @@ def save_mosaic_batch(crops_batch, batch_idx, dir_name, base_name, max_cols=8):
 def detect_objects_in_video(video_path, target_class,
                           show_window=False, save_crops=False,
                           save_training_data=False,
-                          all_objects=False):
+                          all_objects=False,
+                          save_mosaic=False,
+                          save_timestamps=False):
     # 如果不开启全量检测，则保证 target_class 为列表
     if not all_objects and isinstance(target_class, str):
         target_class = [target_class]
@@ -907,6 +909,10 @@ def detect_objects_in_video(video_path, target_class,
     crops_batch = []  # 存储当前批次的目标区域
     batch_size = 200  # 每批处理的目标数量
     batch_idx = 1  # 批次计数器
+
+    # ---- 检测帧视频写入器（懒初始化，首次检测到目标时创建）----
+    video_writer = None
+    frame_w, frame_h = 0, 0
     
     paused = False
     try:
@@ -965,10 +971,13 @@ def detect_objects_in_video(video_path, target_class,
                                 except Exception as e:
                                     print(f"处理裁剪图像时出错: {e}")
                         
-                        if show_window:
-                            xyxy = box.xyxy[0].cpu().numpy()
-                            x1, y1, x2, y2 = map(int, xyxy)
-                            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        # 在帧上绘制检测框（供视频写入和窗口预览共用）
+                        xyxy_draw = box.xyxy[0].cpu().numpy()
+                        dx1, dy1, dx2, dy2 = map(int, xyxy_draw)
+                        cv2.rectangle(frame, (dx1, dy1), (dx2, dy2), (0, 255, 0), 2)
+                        label = model.names[cls_id]
+                        cv2.putText(frame, label, (dx1, max(dy1 - 6, 0)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
                         
                         if save_training_data:
                             h, w, _ = frame.shape
@@ -986,6 +995,14 @@ def detect_objects_in_video(video_path, target_class,
                             annotation_line = f"{class_index} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}"
                             frame_annotations.append(annotation_line)
             
+            # 若本帧有检测结果，写入输出视频
+            if detected:
+                if video_writer is None:
+                    frame_h, frame_w = frame.shape[:2]
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    video_writer = cv2.VideoWriter(video_save_path, fourcc, fps_safe, (frame_w, frame_h))
+                video_writer.write(frame)
+
             if show_window and detected:
                 cv2.imshow('Detection Preview', frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -1024,6 +1041,8 @@ def detect_objects_in_video(video_path, target_class,
     
     finally:
         # 确保资源释放
+        if video_writer is not None:
+            video_writer.release()
         cap.release()
         pbar.close()
         if show_window:
@@ -1033,25 +1052,31 @@ def detect_objects_in_video(video_path, target_class,
         _clear_checkpoint(video_path)
     
     # 处理剩余的裁剪图像
-    if save_crops and crops_batch:
+    if save_mosaic and save_crops and crops_batch:
         dir_name = os.path.dirname(video_path)
         base_name = os.path.splitext(os.path.basename(video_path))[0]
         save_mosaic_batch(crops_batch, batch_idx, dir_name, base_name, max_cols)
+
+    # 输出视频结果提示
+    if video_writer is not None:
+        print(f"已保存检测帧视频至: {video_save_path}")
+    else:
+        print(f"未检测到目标，未生成帧视频: {os.path.basename(video_path)}")
     
     # 保存检测结果
-    txt_save_path = video_path + ".txt"
-    with open(txt_save_path, 'w') as f:
-        f.write("检测到目标的时间位置（秒）:\n")
-        for t in detections:
-            f.write(f"{t:.2f}\n")
-    print(f"已保存检测时间戳至: {txt_save_path}")
+    if save_timestamps:
+        txt_save_path = video_path + ".txt"
+        with open(txt_save_path, 'w') as f:
+            f.write("检测到目标的时间位置（秒）:\n")
+            for t in detections:
+                f.write(f"{t:.2f}\n")
+        print(f"已保存检测时间戳至: {txt_save_path}")
     
     # 创建总拼接图
-    if save_crops and batch_idx > 1:
+    if save_mosaic and save_crops and batch_idx > 1:
         try:
             dir_name = os.path.dirname(video_path)
             base_name = os.path.splitext(os.path.basename(video_path))[0]
-            # 合并所有批次图片
             mosaic_images = []
             for i in range(1, batch_idx + 1):
                 mosaic_path = os.path.join(dir_name, f"{base_name}_mosaic_{i}.jpg")
@@ -1059,34 +1084,22 @@ def detect_objects_in_video(video_path, target_class,
                     img = cv2.imread(mosaic_path)
                     if img is not None:
                         mosaic_images.append(img)
-            
-            # 如果有多个批次图片，创建最终拼接图
             if len(mosaic_images) > 0:
-                # 计算总拼接图的高度
                 final_height = sum(img.shape[0] for img in mosaic_images)
                 final_width = max(img.shape[1] for img in mosaic_images)
-                
-                # 创建大小合适的画布
                 final_mosaic = np.zeros((final_height, final_width, 3), dtype=np.uint8)
-                
-                # 填充图像
                 y_offset = 0
                 for img in mosaic_images:
                     h, w = img.shape[:2]
                     final_mosaic[y_offset:y_offset+h, 0:w] = img
                     y_offset += h
-                
-                # 保存最终拼接图
                 final_mosaic_path = os.path.join(dir_name, f"{base_name}_mosaic.jpg")
                 cv2.imwrite(final_mosaic_path, final_mosaic)
                 print(f"已保存最终拼接图片至: {final_mosaic_path}")
-                
-                # 删除临时批次图片
                 for i in range(1, batch_idx + 1):
                     temp_path = os.path.join(dir_name, f"{base_name}_mosaic_{i}.jpg")
                     if os.path.exists(temp_path):
                         os.remove(temp_path)
-        
         except Exception as e:
             print(f"创建最终拼接图时出错: {e}")
     
@@ -1432,7 +1445,9 @@ def process_directory_videos(dir_path, target_item, all_objects_switch=False, sk
                                 show_window=False,
                                 save_crops=True,
                                 save_training_data=False,
-                                all_objects=all_objects_switch)
+                                all_objects=all_objects_switch,
+                                save_mosaic=save_mosaic_switch,
+                                save_timestamps=save_timestamps_switch)
         # 视频处理完成后强制垃圾回收
         gc.collect()
         # 短暂休眠，让系统有时间释放资源
@@ -1443,6 +1458,8 @@ if __name__ == "__main__":
     # 如要检测所有模型内对象，则将 target_item 设置为任意值并启用全量检测开关
     target_item = "face"  # 当 all_objects 为 True 时，该值不再限制检测
     all_objects_switch = False  # 设置为 True 表示显示所有检测对象
+    save_mosaic_switch = False  # 设置为 True 启用拼接图片保存
+    save_timestamps_switch = False  # 设置为 True 启用检测时间戳txt保存
     
     # 新增功能：按叶子节点视频数量排序处理
     use_leaf_node_processing = True  # 设置为 True 启用叶子节点处理模式
@@ -1507,7 +1524,9 @@ if __name__ == "__main__":
                                                 show_window=False,
                                                 save_crops=True,
                                                 save_training_data=True,
-                                                all_objects=all_objects_switch)
+                                                all_objects=all_objects_switch,
+                                                save_mosaic=save_mosaic_switch,
+                                                save_timestamps=save_timestamps_switch)
                         
                         # 强制垃圾回收
                         gc.collect()
@@ -1532,6 +1551,8 @@ if __name__ == "__main__":
                                            show_window=False,
                                            save_crops=True,
                                            save_training_data=True,
-                                           all_objects=all_objects_switch)
+                                           all_objects=all_objects_switch,
+                                           save_mosaic=save_mosaic_switch,
+                                           save_timestamps=save_timestamps_switch)
                 else:
                     print(f"已存在拼接图片，跳过处理: {video_path}")
