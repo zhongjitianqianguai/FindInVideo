@@ -513,7 +513,7 @@ class DirectoryIndex:
             """,
             (normalized_root, like_pattern)
         ).fetchall()
-        return [(row['path'], row['video_count']) for row in rows if not row['has_artifact']]
+        return [(row['path'], row['video_count']) for row in rows]
 
     def get_video_count(self, dir_path):
         normalized = self._normalize_path(dir_path)
@@ -1406,9 +1406,6 @@ def process_directory_videos(dir_path, target_item, all_objects_switch=False, sk
         converted = windows_path_to_wsl(dir_path)
         if converted:
             dir_path = normalize_posix_path_with_fs(converted)
-    if directory_has_artifact_outputs(dir_path):
-        print(f"检测到目录内已存在_mosaic/_detection文件，跳过目录: {dir_path}")
-        return
     video_files = []
     
     try:
