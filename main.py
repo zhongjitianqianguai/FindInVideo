@@ -961,10 +961,11 @@ def detect_objects_in_video(video_path, target_class,
                                     
                                     # 批处理，避免占用过多内存
                                     if len(crops_batch) >= batch_size:
-                                        dir_name = os.path.dirname(video_path)
-                                        base_name = os.path.splitext(os.path.basename(video_path))[0]
-                                        save_mosaic_batch(crops_batch, batch_idx, dir_name, base_name, max_cols)
-                                        batch_idx += 1
+                                        if save_mosaic:
+                                            dir_name = os.path.dirname(video_path)
+                                            base_name = os.path.splitext(os.path.basename(video_path))[0]
+                                            save_mosaic_batch(crops_batch, batch_idx, dir_name, base_name, max_cols)
+                                            batch_idx += 1
                                         crops_batch = []
                                         # 强制垃圾回收
                                         gc.collect()
