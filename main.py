@@ -104,6 +104,54 @@ def windows_path_to_unc(path):
         return None
 
 
+def unc_to_drive_letter(path):
+    """将UNC路径（如 \\\\192.168.6.100\\d\\...）转换回本机映射的盘符路径（如 D:\\...）。
+    遍历所有已映射的网络驱动器，找到匹配的UNC前缀并替换为盘符。"""
+    if os.name != 'nt' or not path:
+        return None
+    p = str(path)
+    if not p.startswith('\\\\'):
+        return None
+    try:
+        mpr = ctypes.WinDLL('mpr')
+        WNetGetConnectionW = mpr.WNetGetConnectionW
+        WNetGetConnectionW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+        WNetGetConnectionW.restype = wintypes.DWORD
+
+        p_norm = os.path.normpath(p).lower()
+        for letter in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
+            drive = f'{letter}:'
+            buf_len = wintypes.DWORD(1024)
+            buf = ctypes.create_unicode_buffer(buf_len.value)
+            rc = WNetGetConnectionW(drive, buf, ctypes.byref(buf_len))
+            if rc != 0:
+                continue
+            unc_root = os.path.normpath(buf.value).lower()
+            if p_norm == unc_root or p_norm.startswith(unc_root + '\\'):
+                remainder = os.path.normpath(p)[len(unc_root):]
+                return drive + remainder
+        return None
+    except Exception:
+        return None
+
+
+def _safe_relpath(path, start):
+    """安全计算相对路径，处理UNC路径与盘符路径不在同一挂载点的情况。"""
+    try:
+        return os.path.relpath(path, start)
+    except ValueError:
+        # 尝试将UNC路径转换为盘符路径后重试
+        converted_path = unc_to_drive_letter(path) if path.startswith('\\\\') else path
+        converted_start = unc_to_drive_letter(start) if start.startswith('\\\\') else start
+        p = converted_path or path
+        s = converted_start or start
+        try:
+            return os.path.relpath(p, s)
+        except ValueError:
+            # 仍然无法计算相对路径，返回原始路径
+            return path
+
+
 def canonical_video_path(path):
     if not path:
         return None
@@ -1568,14 +1616,14 @@ if __name__ == "__main__":
         else:
             print(f"\n找到 {len(leaf_dirs)} 个包含视频文件的叶子节点目录:")
             for i, (dir_path, video_count) in enumerate(leaf_dirs, 1):
-                relative_path = os.path.relpath(dir_path, video_path)
+                relative_path = _safe_relpath(dir_path, video_path)
                 print(f"{i:3d}. {relative_path} ({video_count} 个视频文件)")
             
             print(f"\n开始按视频数量从多到少的顺序处理叶子节点目录...")
             
             # 按顺序处理每个叶子目录
             for i, (dir_path, video_count) in enumerate(leaf_dirs, 1):
-                relative_path = os.path.relpath(dir_path, video_path)
+                relative_path = _safe_relpath(dir_path, video_path)
                 print(f"\n=== 处理第 {i}/{len(leaf_dirs)} 个目录: {relative_path} ({video_count} 个视频) ===")
                 process_directory_videos(dir_path, target_item, all_objects_switch)
                 
