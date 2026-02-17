@@ -241,7 +241,6 @@ for _ep in _EXCLUDE_PATHS_RAW:
     if _unc and _unc not in EXCLUDE_PATHS:
         EXCLUDE_PATHS.append(_unc)
 
-DIRECTORY_INDEX_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'directory_index.db')
 
 
 class DirectoryIndex:
@@ -293,6 +292,23 @@ class DirectoryIndex:
             self.conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_videos_dir ON videos(dir_path)
+                """
+            )
+            # 已处理视频记录表（基于文件MD5，跨机器通用）
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS processed_videos (
+                    file_md5 TEXT PRIMARY KEY,
+                    video_path TEXT,
+                    processed_at REAL,
+                    detection_count INTEGER,
+                    model_name TEXT
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_processed_videos_path ON processed_videos(video_path)
                 """
             )
 
@@ -543,9 +559,57 @@ class DirectoryIndex:
         ).fetchall()
         return [row['file_name'] for row in rows]
 
+    def mark_video_processed(self, file_md5, video_path, detection_count=0, model_name=None):
+        """将视频标记为已处理（基于文件MD5，跨机器通用）。"""
+        if not file_md5:
+            return
+        now = time.time()
+        try:
+            with self.conn:
+                self.conn.execute(
+                    """
+                    INSERT INTO processed_videos (file_md5, video_path, processed_at, detection_count, model_name)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(file_md5) DO UPDATE SET
+                        video_path=excluded.video_path,
+                        processed_at=excluded.processed_at,
+                        detection_count=excluded.detection_count,
+                        model_name=excluded.model_name
+                    """,
+                    (file_md5, str(video_path) if video_path else None, now, detection_count, model_name)
+                )
+        except Exception as e:
+            print(f'标记视频已处理失败: {e}')
+
+    def is_video_processed_by_md5(self, file_md5):
+        """根据文件MD5查询视频是否已处理过。"""
+        if not file_md5:
+            return False
+        try:
+            row = self.conn.execute(
+                'SELECT 1 FROM processed_videos WHERE file_md5=?',
+                (file_md5,)
+            ).fetchone()
+            return row is not None
+        except Exception:
+            return False
+
 
 DIRECTORY_INDEX = DirectoryIndex()
 atexit.register(DIRECTORY_INDEX.close)
+
+
+def _init_processing_root(root_dir):
+    """设置处理根目录，并将数据库迁移到 <root_dir>/md5_list/directory_index.db。"""
+    global _PROCESSING_ROOT_DIR
+    if not root_dir or not os.path.isdir(root_dir):
+        return
+    _PROCESSING_ROOT_DIR = root_dir
+    db_dir = os.path.join(root_dir, 'md5_list')
+    os.makedirs(db_dir, exist_ok=True)
+    db_path = os.path.join(db_dir, 'directory_index.db')
+    DIRECTORY_INDEX.reopen(db_path)
+    print(f'数据库已打开: {db_path}')
 
 
 class PauseRequested(Exception):
@@ -1380,6 +1444,9 @@ def should_process(file_path):
     md5 = get_file_md5_cached(file_path)
     if not md5:
         return False
+    # 数据库查询：基于MD5判断是否已处理（跨机器通用）
+    if DIRECTORY_INDEX.is_video_processed_by_md5(md5):
+        return False
     yoloed_md5 = load_yoloed_md5(reload=False)
     if md5 in yoloed_md5:
         return False
@@ -1399,6 +1466,24 @@ def is_path_already_yoloed(file_path):
     if canon:
         candidates.append(canon)
     return any(c in _YOLOED_PATH_CACHE for c in candidates)
+
+def _record_video_processed(video_path, detections):
+    """将已处理的视频记录到数据库和yoloed.txt中（确保零检测视频也不会被重复处理）。"""
+    try:
+        md5 = get_file_md5_cached(video_path)
+        if md5:
+            detection_count = len(detections) if detections else 0
+            DIRECTORY_INDEX.mark_video_processed(
+                file_md5=md5,
+                video_path=str(video_path),
+                detection_count=detection_count,
+                model_name='yolov11l-face'
+            )
+            # 同时写入yoloed.txt以保持向后兼容
+            append_yoloed_md5(md5, file_path=video_path)
+            print(f'已记录视频处理完成（检测数={detection_count}）: {os.path.basename(video_path)}')
+    except Exception as e:
+        print(f'记录视频处理状态失败: {e}')
 
 def process_directory_videos(dir_path, target_item, all_objects_switch=False, skip_long_videos=True):
     """处理目录中的所有视频文件"""
@@ -1439,13 +1524,14 @@ def process_directory_videos(dir_path, target_item, all_objects_switch=False, sk
         if duration == float('inf'):
             print(f"提示: 无法获取视频时长，仍尝试处理: {video_file}")
         print(f"开始处理视频文件: {video_file}")
-        detect_objects_in_video(video_file, target_item,
+        detections = detect_objects_in_video(video_file, target_item,
                                 show_window=False,
                                 save_crops=True,
                                 save_training_data=False,
                                 all_objects=all_objects_switch,
                                 save_mosaic=save_mosaic_switch,
                                 save_timestamps=save_timestamps_switch)
+        _record_video_processed(video_file, detections)
         # 视频处理完成后强制垃圾回收
         gc.collect()
         # 短暂休眠，让系统有时间释放资源
@@ -1458,6 +1544,10 @@ if __name__ == "__main__":
     all_objects_switch = False  # 设置为 True 表示显示所有检测对象
     save_mosaic_switch = False  # 设置为 True 启用拼接图片保存
     save_timestamps_switch = False  # 设置为 True 启用检测时间戳txt保存
+    
+    # 初始化处理根目录，数据库和yoloed.txt都放在 <video_path>/md5_list/ 下
+    _root = video_path if os.path.isdir(video_path) else os.path.dirname(video_path)
+    _init_processing_root(_root)
     
     # 新增功能：按叶子节点视频数量排序处理
     use_leaf_node_processing = True  # 设置为 True 启用叶子节点处理模式
@@ -1518,13 +1608,14 @@ if __name__ == "__main__":
                             continue
                         
                         print(f"开始处理视频文件: {file_path}")
-                        detect_objects_in_video(file_path, target_item,
+                        detections = detect_objects_in_video(file_path, target_item,
                                                 show_window=False,
                                                 save_crops=True,
                                                 save_training_data=True,
                                                 all_objects=all_objects_switch,
                                                 save_mosaic=save_mosaic_switch,
                                                 save_timestamps=save_timestamps_switch)
+                        _record_video_processed(file_path, detections)
                         
                         # 强制垃圾回收
                         gc.collect()
@@ -1545,12 +1636,13 @@ if __name__ == "__main__":
                 print(f"视频时长 {duration:.2f}秒超过一小时，跳过处理: {video_path}")
             else:
                 if should_process(video_path):
-                    detect_objects_in_video(video_path, target_item,
+                    detections = detect_objects_in_video(video_path, target_item,
                                            show_window=False,
                                            save_crops=True,
                                            save_training_data=True,
                                            all_objects=all_objects_switch,
                                            save_mosaic=save_mosaic_switch,
                                            save_timestamps=save_timestamps_switch)
+                    _record_video_processed(video_path, detections)
                 else:
                     print(f"已存在拼接图片，跳过处理: {video_path}")
