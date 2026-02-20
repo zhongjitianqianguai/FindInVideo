@@ -607,6 +607,37 @@ class DirectoryIndex:
             return bool(row['has_artifact'])
         return None
 
+    def get_directory_info(self, dir_path):
+        """获取目录的 has_artifact 和 dir_mtime 信息，返回 (has_artifact, dir_mtime) 或 None。"""
+        normalized = self._normalize_path(dir_path)
+        if not normalized:
+            return None
+        row = self._get_directory(normalized)
+        if row and not row['excluded']:
+            return (bool(row['has_artifact']), row['dir_mtime'])
+        return None
+
+    def mark_directory_processed(self, dir_path):
+        """将目录标记为已全部处理（has_artifact=1），同时更新 dir_mtime 为当前文件系统的值。"""
+        normalized = self._normalize_path(dir_path)
+        if not normalized:
+            return
+        try:
+            current_mtime = os.stat(normalized).st_mtime
+        except (PermissionError, FileNotFoundError, OSError):
+            current_mtime = None
+        try:
+            with self.conn:
+                self.conn.execute(
+                    """
+                    UPDATE directories SET has_artifact=1, dir_mtime=?
+                    WHERE path=?
+                    """,
+                    (current_mtime, normalized)
+                )
+        except Exception as e:
+            print(f'标记目录已处理失败: {e}')
+
     def get_videos(self, dir_path):
         normalized = self._normalize_path(dir_path)
         if not normalized:
@@ -1543,6 +1574,29 @@ def _record_video_processed(video_path, detections):
     except Exception as e:
         print(f'记录视频处理状态失败: {e}')
 
+def _mark_directory_done(dir_path, video_file_names):
+    """将目录标记为已全部处理，并将MD5缓存中已有的视频批量写入processed_videos表。"""
+    try:
+        DIRECTORY_INDEX.mark_directory_processed(dir_path)
+        # 批量记录MD5已缓存的视频（这些视频在 should_process() 中已计算过MD5，无额外I/O）
+        batch_count = 0
+        for vf in video_file_names:
+            vf_path = os.path.join(dir_path, vf)
+            cached_md5 = _FILE_MD5_CACHE.get(vf_path)
+            if cached_md5:
+                DIRECTORY_INDEX.mark_video_processed(
+                    file_md5=cached_md5,
+                    video_path=vf_path,
+                    detection_count=-1,  # -1 表示"通过衍生文件/跳过逻辑确认已处理，非本次检测"
+                    model_name=None
+                )
+                batch_count += 1
+        if batch_count > 0:
+            print(f'已将 {batch_count} 个视频的处理记录写入数据库')
+    except Exception as e:
+        print(f'标记目录完成状态失败: {e}')
+
+
 def process_directory_videos(dir_path, target_item, all_objects_switch=False, skip_long_videos=True):
     """处理目录中的所有视频文件"""
     if os.name == 'posix' and is_windows_style_path(dir_path):
@@ -1573,6 +1627,7 @@ def process_directory_videos(dir_path, target_item, all_objects_switch=False, sk
 
     if not unprocessed_videos:
         print(f"目录中所有 {len(video_file_names)} 个视频已有衍生文件，跳过整个目录")
+        _mark_directory_done(dir_path, video_file_names)
         return
 
     skipped_count = len(video_file_names) - len(unprocessed_videos)
@@ -1603,6 +1658,7 @@ def process_directory_videos(dir_path, target_item, all_objects_switch=False, sk
     if not video_files:
         if unprocessed_videos:
             print(f"目录中剩余 {len(unprocessed_videos)} 个视频经精确检查后均无需处理")
+        _mark_directory_done(dir_path, video_file_names)
         return
     
     # 处理视频文件
@@ -1622,6 +1678,9 @@ def process_directory_videos(dir_path, target_item, all_objects_switch=False, sk
         gc.collect()
         # 短暂休眠，让系统有时间释放资源
         time.sleep(1)
+
+    # 所有视频处理完成后，标记目录为已全部处理
+    _mark_directory_done(dir_path, video_file_names)
 
 if __name__ == "__main__":
     video_path = r"D:\z"  # 可设置为视频文件或目录
@@ -1660,9 +1719,24 @@ if __name__ == "__main__":
             
             print(f"\n开始按视频数量从多到少的顺序处理叶子节点目录...")
             
-            # 按顺序处理每个叶子目录（process_directory_videos 内部会快速跳过已全部处理的目录）
+            # 按顺序处理每个叶子目录
+            db_skipped = 0
             for i, (dir_path, video_count, _) in enumerate(leaf_dirs, 1):
                 relative_path = _safe_relpath(dir_path, video_path)
+
+                # 数据库快速跳过：has_artifact=True 且目录 mtime 未变 → 无需任何I/O
+                dir_info = DIRECTORY_INDEX.get_directory_info(dir_path)
+                if dir_info:
+                    db_has_artifact, db_mtime = dir_info
+                    if db_has_artifact and db_mtime is not None:
+                        try:
+                            current_mtime = os.stat(dir_path).st_mtime
+                            if current_mtime == db_mtime:
+                                db_skipped += 1
+                                continue  # 目录未变且已全部处理，完全跳过
+                        except (PermissionError, FileNotFoundError, OSError):
+                            pass  # 无法获取mtime，退回到正常处理流程
+
                 print(f"\n=== [{i}/{len(leaf_dirs)}] {relative_path} ({video_count} 个视频) ===")
                 process_directory_videos(dir_path, target_item, all_objects_switch)
                 
@@ -1670,6 +1744,9 @@ if __name__ == "__main__":
                 gc.collect()
                 # 让系统有时间释放资源
                 time.sleep(2)
+
+            if db_skipped > 0:
+                print(f"\n数据库快速跳过了 {db_skipped}/{len(leaf_dirs)} 个已确认处理完成的目录")
     
     # 原有的处理逻辑（当 use_leaf_node_processing 为 False 时使用）
     elif os.path.isdir(video_path):
