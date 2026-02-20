@@ -456,7 +456,7 @@ class DirectoryIndex:
         stored_children = set(self._get_child_paths(normalized))
         child_dirs = []
         video_records = []
-        has_artifact = False
+        all_file_names_lower = set()  # 收集目录内所有文件名（小写），用于判断衍生文件
         try:
             with os.scandir(normalized) as iterator:
                 for entry in iterator:
@@ -467,9 +467,7 @@ class DirectoryIndex:
                         if entry.is_dir(follow_symlinks=False):
                             child_dirs.append(entry_path)
                         elif entry.is_file(follow_symlinks=False):
-                            lower_name = entry.name.lower()
-                            if lower_name.endswith(DIR_ARTIFACT_SKIP_SUFFIXES):
-                                has_artifact = True
+                            all_file_names_lower.add(entry.name.lower())
                             if is_video_file(entry.name) or is_video_file(entry_path):
                                 try:
                                     stat_info = entry.stat(follow_symlinks=False)
@@ -483,6 +481,18 @@ class DirectoryIndex:
         except (PermissionError, FileNotFoundError, OSError):
             self._remove_directory_recursive(normalized)
             return
+
+        # 精确判断：所有视频是否都已有衍生文件（纯内存比对，无额外I/O）
+        if video_records:
+            processed_count = 0
+            for v_name, _, _ in video_records:
+                v_base = os.path.splitext(v_name)[0].lower()
+                # 检查当前命名格式的衍生文件（base + artifact suffix）
+                if any((v_base + s.lower()) in all_file_names_lower for s in ARTIFACT_SUFFIXES):
+                    processed_count += 1
+            has_artifact = (processed_count == len(video_records))
+        else:
+            has_artifact = False
 
         child_dirs = [c for c in child_dirs if c]
         child_dir_set = set(child_dirs)
@@ -577,7 +587,7 @@ class DirectoryIndex:
             """,
             (normalized_root, like_pattern)
         ).fetchall()
-        return [(row['path'], row['video_count']) for row in rows]
+        return [(row['path'], row['video_count'], bool(row['has_artifact'])) for row in rows]
 
     def get_video_count(self, dir_path):
         normalized = self._normalize_path(dir_path)
@@ -912,7 +922,7 @@ def find_leaf_directories_with_videos(root_path, exclusions=None, refresh_index=
                 if is_leaf_directory(root):
                     video_count = count_videos_in_directory(root)
                     if video_count > 0:
-                        leaf_dirs.append((root, video_count))
+                        leaf_dirs.append((root, video_count, False))
         except (PermissionError, FileNotFoundError) as e:
             print(f"警告: 无法访问目录 '{root_path}': {e}")
     leaf_dirs.sort(key=lambda x: x[1], reverse=True)
@@ -1539,32 +1549,60 @@ def process_directory_videos(dir_path, target_item, all_objects_switch=False, sk
         converted = windows_path_to_wsl(dir_path)
         if converted:
             dir_path = normalize_posix_path_with_fs(converted)
-    video_files = []
-    
+
+    # 一次 listdir 获取所有文件，后续判断全部在内存中完成
     try:
-        for file in os.listdir(dir_path):
-            if is_video_file(file):
-                file_path = os.path.join(dir_path, file)
-                if should_process(file_path):
-                    # 检查视频时长
-                    cap = cv2.VideoCapture(file_path)
-                    if not cap.isOpened():
-                        print(f"无法打开视频: {file_path}")
-                        continue
-                        
-                    fps = cap.get(cv2.CAP_PROP_FPS)
-                    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-                    cap.release()
-                    duration = frame_count / fps if fps > 0 else float('inf')
-                    
-                    if duration <= 3600:  # 小于等于1小时的视频
-                        video_files.append((file_path, duration))
-                    else:
-                        print(f"视频时长 {duration:.2f}秒超过一小时，跳过处理: {file_path}")
-                else:
-                    print(f"已存在拼接图片，跳过处理: {file_path}")
+        all_files = os.listdir(dir_path)
     except (PermissionError, FileNotFoundError) as e:
         print(f"警告: 无法访问目录 '{dir_path}': {e}")
+        return
+
+    all_names_lower = set(f.lower() for f in all_files)
+    video_file_names = [f for f in all_files if is_video_file(f)]
+
+    if not video_file_names:
+        return
+
+    # 快速目录级预检查：纯内存比对，判断所有视频是否都已有衍生文件（零额外I/O）
+    unprocessed_videos = []
+    for vf in video_file_names:
+        v_base = os.path.splitext(vf)[0].lower()
+        if any((v_base + s.lower()) in all_names_lower for s in ARTIFACT_SUFFIXES):
+            continue  # 该视频已有衍生文件
+        unprocessed_videos.append(vf)
+
+    if not unprocessed_videos:
+        print(f"目录中所有 {len(video_file_names)} 个视频已有衍生文件，跳过整个目录")
+        return
+
+    skipped_count = len(video_file_names) - len(unprocessed_videos)
+    if skipped_count > 0:
+        print(f"跳过 {skipped_count}/{len(video_file_names)} 个已有衍生文件的视频")
+
+    # 对未处理的视频逐一检查（should_process 包含MD5/数据库等更精确的判断）
+    video_files = []
+    for file in unprocessed_videos:
+        file_path = os.path.join(dir_path, file)
+        if should_process(file_path):
+            # 检查视频时长
+            cap = cv2.VideoCapture(file_path)
+            if not cap.isOpened():
+                print(f"无法打开视频: {file_path}")
+                continue
+
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            cap.release()
+            duration = frame_count / fps if fps > 0 else float('inf')
+
+            if duration <= 3600:  # 小于等于1小时的视频
+                video_files.append((file_path, duration))
+            else:
+                print(f"视频时长 {duration:.2f}秒超过一小时，跳过处理: {file_path}")
+    
+    if not video_files:
+        if unprocessed_videos:
+            print(f"目录中剩余 {len(unprocessed_videos)} 个视频经精确检查后均无需处理")
         return
     
     # 处理视频文件
@@ -1615,16 +1653,17 @@ if __name__ == "__main__":
             print(f"未找到包含视频文件的叶子节点目录")
         else:
             print(f"\n找到 {len(leaf_dirs)} 个包含视频文件的叶子节点目录:")
-            for i, (dir_path, video_count) in enumerate(leaf_dirs, 1):
+            for i, (dir_path, video_count, all_processed) in enumerate(leaf_dirs, 1):
                 relative_path = _safe_relpath(dir_path, video_path)
-                print(f"{i:3d}. {relative_path} ({video_count} 个视频文件)")
+                status = ' [已处理]' if all_processed else ''
+                print(f"{i:3d}. {relative_path} ({video_count} 个视频文件){status}")
             
             print(f"\n开始按视频数量从多到少的顺序处理叶子节点目录...")
             
-            # 按顺序处理每个叶子目录
-            for i, (dir_path, video_count) in enumerate(leaf_dirs, 1):
+            # 按顺序处理每个叶子目录（process_directory_videos 内部会快速跳过已全部处理的目录）
+            for i, (dir_path, video_count, _) in enumerate(leaf_dirs, 1):
                 relative_path = _safe_relpath(dir_path, video_path)
-                print(f"\n=== 处理第 {i}/{len(leaf_dirs)} 个目录: {relative_path} ({video_count} 个视频) ===")
+                print(f"\n=== [{i}/{len(leaf_dirs)}] {relative_path} ({video_count} 个视频) ===")
                 process_directory_videos(dir_path, target_item, all_objects_switch)
                 
                 # 每处理完一个目录后强制垃圾回收
