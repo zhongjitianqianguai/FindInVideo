@@ -1,5 +1,11 @@
 # AGENTS.md - Agentic Coding Guidelines for FindInVideo
 
+## 语言要求
+- **必须使用中文回答所有问题**
+- 代码注释和 print/log 消息使用中文
+- Docstring 内容使用中文（如 `"""检查文件是否为视频文件"""`）
+- AGENTS.md 本身使用中文
+
 ## Project Overview
 FindInVideo is a Python tool that uses YOLO (v11 and v5) to detect objects in videos and record their time positions. It processes directories of video files, runs object detection frame-by-frame, and writes timestamp artifacts alongside each video. The codebase runs on Windows with some WSL/UNC path compatibility.
 
