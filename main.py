@@ -1579,10 +1579,18 @@ def _mark_directory_done(dir_path, video_file_names):
     try:
         DIRECTORY_INDEX.mark_directory_processed(dir_path)
         # 批量记录MD5已缓存的视频（这些视频在 should_process() 中已计算过MD5，无额外I/O）
+        # 注意: _FILE_MD5_CACHE 的键是 (path_str, size, mtime) 元组，需要按此格式查找
         batch_count = 0
         for vf in video_file_names:
             vf_path = os.path.join(dir_path, vf)
-            cached_md5 = _FILE_MD5_CACHE.get(vf_path)
+            # 构造与 get_file_md5_cached 相同格式的缓存键
+            try:
+                st = os.stat(vf_path)
+                cache_key = (str(vf_path), int(getattr(st, 'st_size', 0) or 0),
+                             float(getattr(st, 'st_mtime', 0.0) or 0.0))
+            except (OSError, PermissionError):
+                cache_key = (str(vf_path), None, None)
+            cached_md5 = _FILE_MD5_CACHE.get(cache_key)
             if cached_md5:
                 DIRECTORY_INDEX.mark_video_processed(
                     file_md5=cached_md5,
