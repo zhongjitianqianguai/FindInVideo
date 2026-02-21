@@ -1789,7 +1789,7 @@ if __name__ == "__main__":
                         detections = detect_objects_in_video(file_path, target_item,
                                                 show_window=False,
                                                 save_crops=True,
-                                                save_training_data=True,
+                                                save_training_data=False,
                                                 all_objects=all_objects_switch,
                                                 save_mosaic=save_mosaic_switch,
                                                 save_timestamps=save_timestamps_switch)
@@ -1817,7 +1817,7 @@ if __name__ == "__main__":
                     detections = detect_objects_in_video(video_path, target_item,
                                            show_window=False,
                                            save_crops=True,
-                                           save_training_data=True,
+                                            save_training_data=False,
                                            all_objects=all_objects_switch,
                                            save_mosaic=save_mosaic_switch,
                                            save_timestamps=save_timestamps_switch)

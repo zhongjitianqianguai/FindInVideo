@@ -70,9 +70,10 @@ def _safe_relpath(path, start):
 def _letterbox(img, new_shape=(640, 640), color=(114, 114, 114)):
     """对图片进行 letterbox 缩放：等比缩放 + 灰色填充，保持宽高比不变形。
 
-    返回: (letterboxed_img, ratio, (dw, dh))
-        ratio  — 缩放比例（用于坐标反映射）
-        dw, dh — 水平/垂直方向的填充像素数（各一半）
+    返回: (letterboxed_img, ratio, (left_pad, top_pad))
+        ratio    — 缩放比例（用于坐标反映射）
+        left_pad — 左侧实际填充像素数（整数）
+        top_pad  — 顶部实际填充像素数（整数）
     """
     h, w = img.shape[:2]
     r = min(new_shape[0] / h, new_shape[1] / w)
@@ -87,7 +88,8 @@ def _letterbox(img, new_shape=(640, 640), color=(114, 114, 114)):
     left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
     img = cv2.copyMakeBorder(img, top, bottom, left, right,
                              cv2.BORDER_CONSTANT, value=color)
-    return img, r, (dw, dh)
+    # 返回实际整数填充值（left, top），确保与 copyMakeBorder 完全一致
+    return img, r, (left, top)
 
 
 # ---------------------------------------------------------------------------
@@ -198,19 +200,32 @@ def detect_and_annotate(image_path, model, nms_func, scale_coords_func,
                 pred = pred.clone()
 
                 # 将检测坐标从 letterbox 空间映射回原始图像空间
-                # letterbox 先缩放 ratio 倍，再各方向填充 pad 像素
-                # 反向：减去 pad → 除以 ratio
-                pred[:, 0] = (pred[:, 0] - pad_w) / ratio  # x1
-                pred[:, 1] = (pred[:, 1] - pad_h) / ratio  # y1
-                pred[:, 2] = (pred[:, 2] - pad_w) / ratio  # x2
-                pred[:, 3] = (pred[:, 3] - pad_h) / ratio  # y2
-
-                # 裁剪到原始图像边界，防止越界
-                h_orig, w_orig = frame.shape[:2]
-                pred[:, 0].clamp_(0, w_orig)
-                pred[:, 1].clamp_(0, h_orig)
-                pred[:, 2].clamp_(0, w_orig)
-                pred[:, 3].clamp_(0, h_orig)
+                # 使用 yolov5 自带的 scale_boxes/scale_coords 函数，
+                # 传入实际的 ratio_pad 以确保与 letterbox 预处理完全一致
+                if scale_coords_func is not None:
+                    ratio_pad_arg = ((ratio, ratio), (pad_w, pad_h))
+                    try:
+                        pred[:, :4] = scale_coords_func(
+                            img_tensor.shape[2:], pred[:, :4], frame.shape,
+                            ratio_pad=ratio_pad_arg
+                        ).round()
+                    except Exception:
+                        # 兼容不同版本的参数顺序
+                        pred[:, :4] = scale_coords_func(
+                            pred[:, :4], frame.shape, img_tensor.shape[2:],
+                            ratio_pad=ratio_pad_arg
+                        ).round()
+                else:
+                    # 手动坐标映射（fallback）
+                    pred[:, 0] = (pred[:, 0] - pad_w) / ratio  # x1
+                    pred[:, 1] = (pred[:, 1] - pad_h) / ratio  # y1
+                    pred[:, 2] = (pred[:, 2] - pad_w) / ratio  # x2
+                    pred[:, 3] = (pred[:, 3] - pad_h) / ratio  # y2
+                    h_orig, w_orig = frame.shape[:2]
+                    pred[:, 0].clamp_(0, w_orig)
+                    pred[:, 1].clamp_(0, h_orig)
+                    pred[:, 2].clamp_(0, w_orig)
+                    pred[:, 3].clamp_(0, h_orig)
 
                 for det in pred:
                     x1, y1, x2, y2, det_conf, cls_id = det[:6]
