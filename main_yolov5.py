@@ -702,7 +702,7 @@ def is_video_file(file_path):
     _, ext = os.path.splitext(file_path.lower())
     return ext in VIDEO_EXTENSIONS
 
-_IGNORED_SUBDIRS = {'yolov5_output', '__pycache__', '.git', '$RECYCLE.BIN', 'System Volume Information'}
+_IGNORED_SUBDIRS = {'_detected', 'yolov5_output', '__pycache__', '.git', '$RECYCLE.BIN', 'System Volume Information'}
 
 def is_leaf_directory(dir_path):
     """检查目录是否为叶子节点（不包含子目录，忽略工具生成的输出目录）"""

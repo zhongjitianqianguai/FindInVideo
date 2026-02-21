@@ -275,6 +275,9 @@ DIR_ARTIFACT_SKIP_SUFFIXES = (
     '_detections.mp4',
 )
 
+# 在判断叶子目录时忽略这些子目录名（工具生成的输出目录，不影响目录结构判断）
+_IGNORED_SUBDIRS = {'_detected', 'yolov5_output', '__pycache__', '.git', '$RECYCLE.BIN', 'System Volume Information'}
+
 # 需要排除的路径变量
 _EXCLUDE_PATHS_RAW = [
     os.path.abspath(r"D:\$RECYCLE.BIN"),
@@ -465,7 +468,8 @@ class DirectoryIndex:
                         if entry_path is None:
                             continue
                         if entry.is_dir(follow_symlinks=False):
-                            child_dirs.append(entry_path)
+                            if entry.name not in _IGNORED_SUBDIRS:
+                                child_dirs.append(entry_path)
                         elif entry.is_file(follow_symlinks=False):
                             all_file_names_lower.add(entry.name.lower())
                             if is_video_file(entry.name) or is_video_file(entry_path):
@@ -906,9 +910,11 @@ def directory_has_artifact_outputs(dir_path):
     return False
 
 def is_leaf_directory(dir_path):
-    """检查目录是否为叶子节点（不包含子目录）"""
+    """检查目录是否为叶子节点（不包含子目录，忽略工具生成的输出目录）"""
     try:
         for item in os.listdir(dir_path):
+            if item in _IGNORED_SUBDIRS:
+                continue
             item_path = os.path.join(dir_path, item)
             if os.path.isdir(item_path):
                 return False
