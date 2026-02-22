@@ -18,6 +18,18 @@ def clean_path(raw_path):
     return p.strip()
 
 
+def looks_like_path(text):
+    """判断输入是否像一个文件路径（拖入的视频）"""
+    cleaned = clean_path(text)
+    if os.path.isfile(cleaned):
+        return True
+    if ('\\' in cleaned or '/' in cleaned) and '.' in cleaned:
+        return True
+    if len(cleaned) >= 2 and cleaned[1] == ':':
+        return True
+    return False
+
+
 def parse_position(user_input):
     """
     解析用户输入的时间定位，返回秒数。
@@ -178,6 +190,7 @@ def main():
         print('请输入开始时间（支持格式如下）：')
         print('  时间格式: 01:30:11.467')
         print('  帧格式:   110632,20.444')
+        print('  拖入视频: 切换到新视频')
         print('  输入 q 退出')
         print()
         start_input = input('开始> ').strip()
@@ -185,6 +198,19 @@ def main():
         if start_input.lower() == 'q':
             print('退出')
             break
+
+        # 检测是否拖入了新视频
+        if start_input and looks_like_path(start_input):
+            new_path = clean_path(start_input)
+            if os.path.isfile(new_path):
+                video_path = new_path
+                print(f'切换视频：{video_path}')
+                print()
+                continue
+            else:
+                print(f'文件不存在：{new_path}')
+                print()
+                continue
 
         if not start_input:
             print('错误：请输入开始时间')

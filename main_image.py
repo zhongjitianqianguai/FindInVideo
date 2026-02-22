@@ -234,10 +234,10 @@ def find_directories_with_images(root_path, exclusions=None):
 if __name__ == '__main__':
     # ---- 配置 ----
     image_root = r'E:\ShareMedia原档'           # 图片根目录
-    target_item = 'face'           # 检测目标（all_objects=True 时忽略）
+    target_item = 'nipple'           # 检测目标（all_objects=True 时忽略）
     all_objects_switch = False      # True = 检测所有类别
     confidence = 0.5                # 置信度阈值
-    model_path = 'models/nipples_yolov8s-seg.pt'  # 模型路径
+    model_path = 'models/model.pt'  # 模型路径
 
     # ---- 加载模型（全局一次，所有目录共用）----
     print(f'加载模型: {model_path}')

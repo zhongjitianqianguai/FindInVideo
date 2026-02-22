@@ -3,21 +3,17 @@
 给定文件夹，递归扫描所有图片，将含有检测目标的图片生成带框副本
 放在每个目录的 _detected 子目录下供查看。
 
+使用 torch.hub.load 加载本地 yolov5 子模块，由 YOLOv5 官方的
+AutoShape + Detections.render() 完成预处理、推理、坐标还原和画框，
+确保标注结果与 results.show() 展示的一致。
+
 用法:
     python main_image_yolov5.py
-
-替代 main_yolov5.py 中拼接生成新视频的逻辑，直接对图片进行检测并保存带框结果。
 """
 
-import sys
 import os
-
-# 添加 yolov5 文件夹到 Python 路径
-sys.path.append(os.path.join(os.path.dirname(__file__), 'yolov5'))
-
-import cv2
 import gc
-import time
+import cv2
 import torch
 import numpy as np
 from tqdm import tqdm
@@ -67,195 +63,103 @@ def _safe_relpath(path, start):
         return path
 
 
-def _letterbox(img, new_shape=(640, 640), color=(114, 114, 114)):
-    """对图片进行 letterbox 缩放：等比缩放 + 灰色填充，保持宽高比不变形。
-
-    返回: (letterboxed_img, ratio, (left_pad, top_pad))
-        ratio    — 缩放比例（用于坐标反映射）
-        left_pad — 左侧实际填充像素数（整数）
-        top_pad  — 顶部实际填充像素数（整数）
-    """
-    h, w = img.shape[:2]
-    r = min(new_shape[0] / h, new_shape[1] / w)
-    new_unpad_w, new_unpad_h = int(round(w * r)), int(round(h * r))
-    dw = (new_shape[1] - new_unpad_w) / 2
-    dh = (new_shape[0] - new_unpad_h) / 2
-
-    if (w, h) != (new_unpad_w, new_unpad_h):
-        img = cv2.resize(img, (new_unpad_w, new_unpad_h), interpolation=cv2.INTER_LINEAR)
-
-    top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
-    left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
-    img = cv2.copyMakeBorder(img, top, bottom, left, right,
-                             cv2.BORDER_CONSTANT, value=color)
-    # 返回实际整数填充值（left, top），确保与 copyMakeBorder 完全一致
-    return img, r, (left, top)
-
-
 # ---------------------------------------------------------------------------
-# YOLOv5 模型加载
+# YOLOv5 模型加载（官方 hub 接口）
 # ---------------------------------------------------------------------------
 
-def load_yolov5_model(model_path, device='cpu'):
-    """加载 YOLOv5 模型（使用本地 yolov5 子模块）。
+def load_yolov5_model(model_path, conf=0.5, iou=0.45, device=None):
+    """通过 torch.hub.load 加载本地 YOLOv5 模型（自带 AutoShape）。
 
-    返回: (model, nms_func, scale_coords_func, device, class_names)
+    返回的 model 可以直接传入图片路径/numpy数组，自动完成
+    预处理（letterbox）、推理、NMS、坐标还原。
+
+    返回: model
     """
+    yolov5_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yolov5')
+
+    # PyTorch >= 2.6 默认 weights_only=True，与旧 YOLOv5 权重不兼容
+    # 临时覆盖 torch.load 默认参数以允许加载
+    _original_load = torch.load
+    def _patched_load(*args, **kwargs):
+        kwargs.setdefault('weights_only', False)
+        return _original_load(*args, **kwargs)
+    torch.load = _patched_load
+
     try:
-        from yolov5.models.experimental import attempt_load
-        from yolov5.utils.general import non_max_suppression
-        from yolov5.utils.torch_utils import select_device
-
-        # 尝试导入新版本的 scale_boxes，如果失败则尝试 scale_coords
-        try:
-            from yolov5.utils.general import scale_boxes as scale_coords_func
-        except ImportError:
-            try:
-                from yolov5.utils.general import scale_coords as scale_coords_func
-            except ImportError:
-                print('警告: 无法导入坐标缩放函数，将使用手动缩放')
-                scale_coords_func = None
-
-        print(f'成功导入本地 YOLOv5 模块')
-        device = select_device(device)
-
-        # 尝试不同的参数组合来加载模型（兼容新旧版本）
-        try:
-            model = attempt_load(weights=model_path, device=device)
-        except TypeError:
-            try:
-                model = attempt_load(model_path, map_location=device)
-            except TypeError:
-                try:
-                    model = attempt_load(model_path)
-                    model = model.to(device)
-                except Exception as e:
-                    print(f'所有加载方式都失败: {e}')
-                    raise
-
-        model.eval()
-
-        # 获取类别名称
-        if hasattr(model, 'names'):
-            class_names = model.names
-        elif hasattr(model, 'module') and hasattr(model.module, 'names'):
-            class_names = model.module.names
-        else:
-            # 默认 COCO 前几个类别
-            class_names = {0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle',
-                           4: 'airplane', 5: 'bus', 6: 'train', 7: 'truck'}
-
-        return model, non_max_suppression, scale_coords_func, device, class_names
-
-    except ImportError as e:
-        print(f'导入 YOLOv5 模块失败: {e}')
-        print('请确保 yolov5 文件夹在项目目录下，并包含必要的模块文件')
-        raise
-    except Exception as e:
-        print(f'加载 YOLOv5 模型失败: {e}')
-        raise
+        model = torch.hub.load(
+            yolov5_dir, 'custom', path=model_path,
+            source='local', device=device or ''
+        )
+    finally:
+        torch.load = _original_load
+    model.conf = conf   # NMS 置信度阈值
+    model.iou = iou     # NMS IoU 阈值
+    print(f'模型加载成功，类别: {model.names}')
+    return model
 
 
 # ---------------------------------------------------------------------------
 # 核心检测函数
 # ---------------------------------------------------------------------------
 
-def detect_and_annotate(image_path, model, nms_func, scale_coords_func,
-                        device, class_names, target_class=None,
-                        all_objects=False, conf=0.5, iou=0.45,
-                        img_size=640):
+def detect_and_annotate(image_path, model, target_class=None,
+                        all_objects=False, img_size=640):
     """对单张图片进行 YOLOv5 对象检测。
 
+    使用 YOLOv5 官方 AutoShape 推理 + Detections.render() 画框，
+    坐标还原和标注由 YOLOv5 内部完成，确保结果正确。
+
     返回:
-        (annotated_image, detection_count)
-        若无检测结果，annotated_image 为 None。
+        (annotated_image_bgr, detection_count)
+        若无检测结果，annotated_image_bgr 为 None。
     """
+    # 读取图片（BGR）
     frame = cv2.imread(image_path)
     if frame is None:
         print(f'无法读取图片: {image_path}')
         return None, 0
 
-    # 预处理：BGR → RGB → letterbox（等比缩放+填充）→ tensor
-    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    img_letterboxed, ratio, (pad_w, pad_h) = _letterbox(img_rgb, (img_size, img_size))
-    img_tensor = (
-        torch.from_numpy(img_letterboxed)
-        .float()
-        .permute(2, 0, 1)
-        .unsqueeze(0)
-        / 255.0
-    )
+    # AutoShape 要求 numpy 数组为 RGB 格式（见 yolov5/models/common.py:866 注释）
+    # cv2.imread 返回 BGR，必须先转换
+    frame_rgb = frame[:, :, ::-1]  # BGR → RGB
+    results = model(frame_rgb, size=img_size)
 
-    detection_count = 0
+    # 过滤类别
+    pred = results.pred[0]  # tensor (N, 6): x1, y1, x2, y2, conf, cls
+    if pred is None or len(pred) == 0:
+        return None, 0
 
-    try:
-        if device is not None:
-            img_tensor = img_tensor.to(device)
+    if not all_objects and target_class:
+        # 只保留目标类别
+        names = model.names
+        keep_cls = set()
+        for cls_id, cls_name in names.items():
+            if cls_name in target_class:
+                keep_cls.add(cls_id)
+        mask = torch.tensor([int(det[5]) in keep_cls for det in pred], dtype=torch.bool)
+        if not mask.any():
+            return None, 0
+        # 就地修改 results.pred 以便 render() 只画保留的框
+        results.pred[0] = pred[mask]
 
-        with torch.no_grad():
-            pred = model(img_tensor)[0]
-            pred = nms_func(pred, conf_thres=conf, iou_thres=iou)[0]
+    detection_count = len(results.pred[0])
+    if detection_count == 0:
+        return None, 0
 
-            if pred is not None and len(pred):
-                pred = pred.clone()
+    # 使用 YOLOv5 官方 render() 画框（内部用 Annotator，坐标已正确还原）
+    rendered = results.render()[0]  # numpy RGB
 
-                # 将检测坐标从 letterbox 空间映射回原始图像空间
-                # 使用 yolov5 自带的 scale_boxes/scale_coords 函数，
-                # 传入实际的 ratio_pad 以确保与 letterbox 预处理完全一致
-                if scale_coords_func is not None:
-                    ratio_pad_arg = ((ratio, ratio), (pad_w, pad_h))
-                    try:
-                        pred[:, :4] = scale_coords_func(
-                            img_tensor.shape[2:], pred[:, :4], frame.shape,
-                            ratio_pad=ratio_pad_arg
-                        ).round()
-                    except Exception:
-                        # 兼容不同版本的参数顺序
-                        pred[:, :4] = scale_coords_func(
-                            pred[:, :4], frame.shape, img_tensor.shape[2:],
-                            ratio_pad=ratio_pad_arg
-                        ).round()
-                else:
-                    # 手动坐标映射（fallback）
-                    pred[:, 0] = (pred[:, 0] - pad_w) / ratio  # x1
-                    pred[:, 1] = (pred[:, 1] - pad_h) / ratio  # y1
-                    pred[:, 2] = (pred[:, 2] - pad_w) / ratio  # x2
-                    pred[:, 3] = (pred[:, 3] - pad_h) / ratio  # y2
-                    h_orig, w_orig = frame.shape[:2]
-                    pred[:, 0].clamp_(0, w_orig)
-                    pred[:, 1].clamp_(0, h_orig)
-                    pred[:, 2].clamp_(0, w_orig)
-                    pred[:, 3].clamp_(0, h_orig)
-
-                for det in pred:
-                    x1, y1, x2, y2, det_conf, cls_id = det[:6]
-                    cls_id = int(cls_id)
-                    x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
-                    class_name = class_names.get(cls_id, f'class_{cls_id}')
-
-                    if all_objects or (target_class and class_name in target_class):
-                        detection_count += 1
-                        # 绘制检测框
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                        label = f'{class_name} {float(det_conf):.2f}'
-                        cv2.putText(frame, label, (x1, max(y1 - 6, 0)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-
-    except Exception as e:
-        print(f'检测图片时出错: {e}')
-
-    if detection_count > 0:
-        return frame, detection_count
-    return None, 0
+    # 转回 BGR 供 cv2.imwrite 保存
+    annotated_bgr = cv2.cvtColor(rendered, cv2.COLOR_RGB2BGR)
+    return annotated_bgr, detection_count
 
 
 # ---------------------------------------------------------------------------
 # 目录级处理
 # ---------------------------------------------------------------------------
 
-def process_directory_images(dir_path, model, nms_func, scale_coords_func,
-                             device, class_names, target_class=None,
-                             all_objects=False, conf=0.5, iou=0.45):
+def process_directory_images(dir_path, model, target_class=None,
+                             all_objects=False, img_size=640):
     """处理一个目录中的所有图片文件。
 
     对每张图片执行检测:
@@ -314,8 +218,7 @@ def process_directory_images(dir_path, model, nms_func, scale_coords_func,
     for f in tqdm(to_process, desc='检测图片', unit='张'):
         image_path = os.path.join(dir_path, f)
         annotated, count = detect_and_annotate(
-            image_path, model, nms_func, scale_coords_func,
-            device, class_names, target_class, all_objects, conf, iou
+            image_path, model, target_class, all_objects, img_size
         )
 
         if annotated is not None:
@@ -380,17 +283,17 @@ def find_directories_with_images(root_path, exclusions=None):
 
 if __name__ == '__main__':
     # ---- 配置 ----
-    image_root = r'E:\ShareMedia原档'            # 图片根目录
-    target_item = 'breast'          # 检测目标（all_objects=True 时忽略）
-    all_objects_switch = True        # True = 检测所有类别
-    confidence = 0.5                 # 置信度阈值
-    iou_threshold = 0.45            # NMS IoU 阈值
-    model_path = 'models/breast.pt'  # YOLOv5 模型路径
+    image_root = r'E:\ShareMedia原档'   # 图片根目录
+    target_item = 'breast'               # 检测目标（all_objects=True 时忽略）
+    all_objects_switch = True             # True = 检测所有类别
+    confidence = 0.5                      # 置信度阈值
+    iou_threshold = 0.45                  # NMS IoU 阈值
+    model_path = 'models/breast.pt'       # YOLOv5 模型路径
+    img_size = 640                        # 推理分辨率
 
     # ---- 加载模型（全局一次，所有目录共用）----
     print(f'加载 YOLOv5 模型: {model_path}')
-    model, nms_func, scale_coords_func, device, class_names = load_yolov5_model(model_path)
-    print(f'模型加载成功，类别数: {len(class_names)}')
+    model = load_yolov5_model(model_path, conf=confidence, iou=iou_threshold)
 
     target_class = [target_item] if isinstance(target_item, str) else target_item
 
@@ -414,9 +317,8 @@ if __name__ == '__main__':
                 rel = _safe_relpath(dp, image_root)
                 print(f'\n=== [{i}/{len(dirs)}] {rel} ({count} 张图片) ===')
                 processed, detected = process_directory_images(
-                    dp, model, nms_func, scale_coords_func,
-                    device, class_names, target_class,
-                    all_objects_switch, confidence, iou_threshold
+                    dp, model, target_class,
+                    all_objects_switch, img_size
                 )
                 total_processed += processed
                 total_detected += detected
@@ -429,9 +331,7 @@ if __name__ == '__main__':
         # 处理单张图片
         print(f'处理单张图片: {image_root}')
         annotated, count = detect_and_annotate(
-            image_root, model, nms_func, scale_coords_func,
-            device, class_names, target_class, all_objects_switch,
-            confidence, iou_threshold
+            image_root, model, target_class, all_objects_switch, img_size
         )
         if annotated is not None:
             dir_name = os.path.dirname(image_root) or '.'
