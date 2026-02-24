@@ -2029,6 +2029,11 @@ if __name__ == "__main__":
             db_skipped = 0
             fs_skipped = 0
             yoloed_skipped = 0
+            _diag_count = 0  # 诊断计数器：只对前几个未跳过的目录输出详细信息
+            _yoloed_path_count = len(_YOLOED_PATH_CACHE) if _YOLOED_PATH_CACHE else 0
+            _yoloed_basename_count = len(_YOLOED_BASENAME_CACHE) if _YOLOED_BASENAME_CACHE else 0
+            print(f'[诊断] yoloed.txt 缓存状态: {len(_YOLOED_MD5_CACHE or set())} 条MD5, '
+                  f'{_yoloed_path_count} 条路径, {_yoloed_basename_count} 个文件名索引')
             for i, (dir_path, video_count, all_processed) in enumerate(leaf_dirs, 1):
                 relative_path = _safe_relpath(dir_path, video_path)
 
@@ -2053,6 +2058,33 @@ if __name__ == "__main__":
                 if _check_all_videos_done(dir_path):
                     yoloed_skipped += 1
                     continue
+
+                # 诊断输出：前3个未跳过的目录打印详细原因
+                if _diag_count < 3:
+                    _diag_count += 1
+                    _diag_dir_info = f'dir_info={dir_info}, all_processed={all_processed}'
+                    print(f'[诊断 {_diag_count}/3] 未跳过: {relative_path}')
+                    print(f'  DB层: {_diag_dir_info}')
+                    try:
+                        _diag_files = os.listdir(dir_path)
+                        _diag_videos = [f for f in _diag_files if is_video_file(f)]
+                        _diag_dir_bn = os.path.basename(dir_path.rstrip(os.sep + '/')).lower()
+                        print(f'  目录basename: {_diag_dir_bn}, 视频数: {len(_diag_videos)}')
+                        for _dv in _diag_videos[:3]:  # 最多显示3个视频的匹配情况
+                            _dv_path = os.path.join(dir_path, _dv)
+                            _dv_lower = _dv.lower()
+                            _in_path_cache = (str(_dv_path) in (_YOLOED_PATH_CACHE or set())
+                                              or os.path.normpath(str(_dv_path)) in (_YOLOED_PATH_CACHE or set()))
+                            _bn_parents = (_YOLOED_BASENAME_CACHE or {}).get(_dv_lower)
+                            _bn_match = _bn_parents and _diag_dir_bn in _bn_parents
+                            print(f'  视频 {_dv}: 路径缓存={_in_path_cache}, '
+                                  f'basename索引={_bn_parents is not None}(父目录匹配={_bn_match})')
+                            if _bn_parents and not _bn_match:
+                                # 显示实际存储的父目录名与当前目录名的差异
+                                _sample_parents = list(_bn_parents)[:3]
+                                print(f'    yoloed中的父目录: {_sample_parents}, 当前目录: {_diag_dir_bn}')
+                    except Exception as _de:
+                        print(f'  诊断读取失败: {_de}')
 
                 print(f"\n=== [{i}/{len(leaf_dirs)}] {relative_path} ({video_count} 个视频) ===")
                 actually_processed = process_directory_videos(dir_path, target_item, all_objects_switch)
