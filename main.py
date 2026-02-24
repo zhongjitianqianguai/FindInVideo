@@ -20,6 +20,7 @@ _PROCESSING_ROOT_DIR = None
 _YOLOED_MD5_CACHE = None
 _YOLOED_MD5_CACHE_MTIME = None
 _YOLOED_PATH_CACHE = None
+_YOLOED_BASENAME_CACHE = {}  # basename.lower() → set of parent dir basenames (用于目录级快速跳过)
 _FILE_MD5_CACHE = {}
 
 
@@ -299,9 +300,10 @@ class DirectoryIndex:
 
     def __init__(self, db_path=None):
         self.db_path = db_path or ':memory:'
-        self.conn = sqlite3.connect(self.db_path)
+        self.conn = sqlite3.connect(self.db_path, timeout=60)
         self.conn.row_factory = sqlite3.Row
         with self.conn:
+            self.conn.execute('PRAGMA busy_timeout = 30000;')
             self.conn.execute('PRAGMA foreign_keys = ON;')
             self.conn.execute('PRAGMA journal_mode = WAL;')
         self._ensure_schema()
@@ -376,54 +378,114 @@ class DirectoryIndex:
         folder = os.path.dirname(new_db_path)
         if folder and not os.path.exists(folder):
             os.makedirs(folder, exist_ok=True)
-        self.conn = sqlite3.connect(self.db_path)
+        self.conn = sqlite3.connect(self.db_path, timeout=60)
         self.conn.row_factory = sqlite3.Row
-        # 检测数据库是否损坏
+        self.conn.execute('PRAGMA busy_timeout = 30000;')
+        # 检测数据库是否损坏（先设置 busy_timeout 防止锁冲突被误判为损坏）
         if not self._check_integrity():
-            print(f'数据库损坏，正在删除并重建: {self.db_path}')
-            self.conn.close()
-            self._remove_db_files(self.db_path)
-            self.conn = sqlite3.connect(self.db_path)
-            self.conn.row_factory = sqlite3.Row
+            lock_path = self.db_path + '.rebuild.lock'
+            try:
+                release = _with_lockfile(lock_path, timeout_seconds=60, stale_seconds=120)
+            except (TimeoutError, Exception) as e:
+                print(f'另一个实例正在重建数据库，等待后重连: {e}')
+                time.sleep(5)
+                self.conn.close()
+                self.conn = sqlite3.connect(self.db_path, timeout=60)
+                self.conn.row_factory = sqlite3.Row
+            else:
+                try:
+                    # 获取锁后再次检查
+                    if not self._check_integrity():
+                        print(f'数据库损坏，正在备份并重建: {self.db_path}')
+                        self.conn.close()
+                        self._remove_db_files(self.db_path)
+                        self.conn = sqlite3.connect(self.db_path, timeout=60)
+                        self.conn.row_factory = sqlite3.Row
+                finally:
+                    release()
         with self.conn:
+            self.conn.execute('PRAGMA busy_timeout = 30000;')
             self.conn.execute('PRAGMA foreign_keys = ON;')
             self.conn.execute('PRAGMA journal_mode = WAL;')
         self._ensure_schema()
 
     def _check_integrity(self):
-        """执行 PRAGMA integrity_check，返回数据库是否完好"""
+        """执行 PRAGMA integrity_check，返回数据库是否完好。
+        注意：如果数据库被锁导致无法执行检查，视为"完好"（不应误判为损坏）。"""
         try:
             result = self.conn.execute('PRAGMA integrity_check;').fetchone()
             return result and result[0] == 'ok'
-        except sqlite3.DatabaseError:
+        except sqlite3.DatabaseError as e:
+            if self._is_lock_error(e):
+                print(f'数据库被锁定，跳过完整性检查（视为完好）: {e}')
+                return True  # 锁冲突不等于损坏
             return False
 
     @staticmethod
+    def _is_lock_error(exc):
+        """判断异常是否为数据库锁冲突（而非真正的损坏）"""
+        msg = str(exc).lower()
+        return 'locked' in msg or 'busy' in msg
+
+    @staticmethod
     def _remove_db_files(db_path):
-        """删除数据库文件及其 WAL/SHM 附属文件"""
+        """将损坏的数据库文件备份为 .corrupt 后删除，保留一份以备手动恢复"""
+        import time as _time
+        timestamp = _time.strftime('%Y%m%d_%H%M%S')
         for suffix in ('', '-wal', '-shm'):
             p = db_path + suffix
             try:
                 if os.path.exists(p):
-                    os.remove(p)
+                    backup = f'{p}.corrupt.{timestamp}'
+                    try:
+                        os.rename(p, backup)
+                        print(f'已备份损坏文件: {p} -> {backup}')
+                    except OSError:
+                        # 重命名失败则直接删除
+                        os.remove(p)
+                        print(f'备份失败，已直接删除: {p}')
             except OSError as e:
-                print(f'删除 {p} 失败: {e}')
+                print(f'处理 {p} 失败: {e}')
 
     def _rebuild_if_corrupt(self):
-        """检测到数据库损坏时自动重建，返回是否进行了重建"""
+        """检测到数据库损坏时自动重建，返回是否进行了重建。
+        使用文件锁防止多个实例同时重建。"""
         if self.db_path == ':memory:':
             return False
         if self._check_integrity():
             return False
-        print(f'数据库损坏，正在重建: {self.db_path}')
-        self.conn.close()
-        self._remove_db_files(self.db_path)
-        self.conn = sqlite3.connect(self.db_path)
-        self.conn.row_factory = sqlite3.Row
-        with self.conn:
-            self.conn.execute('PRAGMA foreign_keys = ON;')
-            self.conn.execute('PRAGMA journal_mode = WAL;')
-        self._ensure_schema()
+        # 使用文件锁防止多实例同时重建
+        lock_path = self.db_path + '.rebuild.lock'
+        try:
+            release = _with_lockfile(lock_path, timeout_seconds=60, stale_seconds=120)
+        except (TimeoutError, Exception) as e:
+            # 另一个实例正在重建，等待后重新连接即可
+            print(f'另一个实例正在重建数据库，等待完成: {e}')
+            time.sleep(5)
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self.conn = sqlite3.connect(self.db_path, timeout=60)
+            self.conn.row_factory = sqlite3.Row
+            self.conn.execute('PRAGMA busy_timeout = 30000;')
+            return True
+        try:
+            # 获取锁后再次检查，可能已被另一个实例重建完毕
+            if self._check_integrity():
+                return False
+            print(f'数据库损坏，正在备份并重建: {self.db_path}')
+            self.conn.close()
+            self._remove_db_files(self.db_path)
+            self.conn = sqlite3.connect(self.db_path, timeout=60)
+            self.conn.row_factory = sqlite3.Row
+            with self.conn:
+                self.conn.execute('PRAGMA busy_timeout = 30000;')
+                self.conn.execute('PRAGMA foreign_keys = ON;')
+                self.conn.execute('PRAGMA journal_mode = WAL;')
+            self._ensure_schema()
+        finally:
+            release()
         return True
 
     def _normalize_path(self, path):
@@ -581,7 +643,10 @@ class DirectoryIndex:
     def _get_directory(self, path):
         try:
             return self.conn.execute('SELECT * FROM directories WHERE path=?', (path,)).fetchone()
-        except sqlite3.DatabaseError:
+        except sqlite3.DatabaseError as e:
+            if self._is_lock_error(e):
+                print(f'数据库被锁定，跳过查询: {e}')
+                return None
             if self._rebuild_if_corrupt():
                 return None
             raise
@@ -590,7 +655,10 @@ class DirectoryIndex:
         try:
             rows = self.conn.execute('SELECT path FROM directories WHERE parent_path=?', (path,)).fetchall()
             return [row['path'] for row in rows]
-        except sqlite3.DatabaseError:
+        except sqlite3.DatabaseError as e:
+            if self._is_lock_error(e):
+                print(f'数据库被锁定，跳过查询: {e}')
+                return []
             if self._rebuild_if_corrupt():
                 return []
             raise
@@ -601,7 +669,10 @@ class DirectoryIndex:
             return
         try:
             child_rows = self.conn.execute('SELECT path FROM directories WHERE parent_path=?', (normalized,)).fetchall()
-        except sqlite3.DatabaseError:
+        except sqlite3.DatabaseError as e:
+            if self._is_lock_error(e):
+                print(f'数据库被锁定，跳过删除: {e}')
+                return
             if self._rebuild_if_corrupt():
                 return
             raise
@@ -650,7 +721,10 @@ class DirectoryIndex:
                 """,
                 (normalized_root, like_pattern)
             ).fetchall()
-        except sqlite3.DatabaseError:
+        except sqlite3.DatabaseError as e:
+            if self._is_lock_error(e):
+                print(f'数据库被锁定，跳过查询叶子目录: {e}')
+                return []
             if self._rebuild_if_corrupt():
                 return []
             raise
@@ -714,7 +788,10 @@ class DirectoryIndex:
                 'SELECT file_name FROM videos WHERE dir_path=? ORDER BY file_name',
                 (normalized,)
             ).fetchall()
-        except sqlite3.DatabaseError:
+        except sqlite3.DatabaseError as e:
+            if self._is_lock_error(e):
+                print(f'数据库被锁定，跳过查询视频列表: {e}')
+                return []
             if self._rebuild_if_corrupt():
                 return []
             raise
@@ -1005,6 +1082,114 @@ def count_videos_in_directory(dir_path):
         pass
     return count
 
+def _check_all_videos_have_artifacts(dir_path, file_list=None):
+    """检查目录中所有视频是否都已有衍生文件（纯内存比对）。
+    file_list: 若已有 os.listdir/os.walk 的结果可直接传入，避免重复 I/O。
+    返回 True 表示所有视频都已处理完成。"""
+    if file_list is None:
+        try:
+            file_list = os.listdir(dir_path)
+        except (PermissionError, FileNotFoundError, OSError):
+            return False
+    all_names_lower = set(f.lower() for f in file_list)
+    video_names = [f for f in file_list if is_video_file(f)]
+    if not video_names:
+        return False  # 没有视频文件，不算"全部已处理"
+    for vf in video_names:
+        v_base = os.path.splitext(vf)[0].lower()
+        if not any((v_base + s.lower()) in all_names_lower for s in ARTIFACT_SUFFIXES):
+            return False  # 该视频没有任何衍生文件
+    return True
+
+
+def _check_all_videos_in_yoloed(dir_path, file_list=None):
+    """检查目录中所有视频是否都已在 yoloed.txt 中记录（通过路径或 basename+父目录匹配）。
+    纯内存比对，仅需一次 listdir I/O。返回 True 表示所有视频都已处理完成。"""
+    load_yoloed_md5(reload=False)
+    path_cache = _YOLOED_PATH_CACHE or set()
+    basename_cache = _YOLOED_BASENAME_CACHE or {}
+    if not path_cache and not basename_cache:
+        return False
+    if file_list is None:
+        try:
+            file_list = os.listdir(dir_path)
+        except (PermissionError, FileNotFoundError, OSError):
+            return False
+    video_names = [f for f in file_list if is_video_file(f)]
+    if not video_names:
+        return False  # 没有视频文件，不算"全部已处理"
+    # 获取当前目录的 basename（用于 basename 缓存匹配）
+    dir_basename = os.path.basename(dir_path.rstrip(os.sep + '/')).lower()
+    for vf in video_names:
+        file_path = os.path.join(dir_path, vf)
+        # 1. 快速路径匹配（与 is_path_already_yoloed 相同逻辑）
+        p = str(file_path)
+        if p in path_cache:
+            continue
+        p_norm = os.path.normpath(p)
+        if p_norm in path_cache:
+            continue
+        canon = canonical_video_path(p)
+        if canon and canon in path_cache:
+            continue
+        # 2. basename + 父目录名匹配（无需 MD5，覆盖跨机器场景）
+        vf_lower = vf.lower()
+        parent_dirs = basename_cache.get(vf_lower)
+        if parent_dirs and dir_basename in parent_dirs:
+            continue
+        # 该视频未在 yoloed.txt 中找到
+        return False
+    return True
+
+
+def _check_all_videos_done(dir_path, file_list=None):
+    """综合检查：逐个视频判断是否已通过衍生文件或 yoloed.txt 处理完成。
+    支持混合场景（部分视频有衍生文件，部分仅在 yoloed.txt 中记录）。
+    返回 True 表示目录中所有视频都已处理完成（可安全跳过）。"""
+    if file_list is None:
+        try:
+            file_list = os.listdir(dir_path)
+        except (PermissionError, FileNotFoundError, OSError):
+            return False
+    all_names_lower = set(f.lower() for f in file_list)
+    video_names = [f for f in file_list if is_video_file(f)]
+    if not video_names:
+        return False  # 没有视频文件，不算"全部已处理"
+
+    load_yoloed_md5(reload=False)
+    path_cache = _YOLOED_PATH_CACHE or set()
+    basename_cache = _YOLOED_BASENAME_CACHE or {}
+    dir_basename = os.path.basename(dir_path.rstrip(os.sep + '/')).lower()
+
+    for vf in video_names:
+        # 检查1：是否有衍生文件（纯内存比对）
+        v_base = os.path.splitext(vf)[0].lower()
+        if any((v_base + s.lower()) in all_names_lower for s in ARTIFACT_SUFFIXES):
+            continue  # 该视频已有衍生文件
+
+        # 检查2：是否在 yoloed.txt 路径缓存中
+        file_path = os.path.join(dir_path, vf)
+        p = str(file_path)
+        if p in path_cache:
+            continue
+        p_norm = os.path.normpath(p)
+        if p_norm in path_cache:
+            continue
+        canon = canonical_video_path(p)
+        if canon and canon in path_cache:
+            continue
+
+        # 检查3：basename + 父目录名匹配
+        vf_lower = vf.lower()
+        parent_dirs = basename_cache.get(vf_lower)
+        if parent_dirs and dir_basename in parent_dirs:
+            continue
+
+        # 该视频未被任何方式标记为已处理
+        return False
+    return True
+
+
 def find_leaf_directories_with_videos(root_path, exclusions=None, refresh_index=True):
     """使用目录索引查找包含视频文件的叶子节点目录。"""
     if exclusions is None:
@@ -1027,7 +1212,9 @@ def find_leaf_directories_with_videos(root_path, exclusions=None, refresh_index=
                 if is_leaf_directory(root):
                     video_count = count_videos_in_directory(root)
                     if video_count > 0:
-                        leaf_dirs.append((root, video_count, False))
+                        # 检查目录中所有视频是否都已有衍生文件（纯内存比对，零额外I/O）
+                        all_done = _check_all_videos_have_artifacts(root, files)
+                        leaf_dirs.append((root, video_count, all_done))
         except (PermissionError, FileNotFoundError) as e:
             print(f"警告: 无法访问目录 '{root_path}': {e}")
     leaf_dirs.sort(key=lambda x: x[1], reverse=True)
@@ -1497,12 +1684,13 @@ def ensure_yoloed_storage():
     return path
 
 def load_yoloed_md5(reload=False):
-    global _YOLOED_MD5_CACHE, _YOLOED_MD5_CACHE_MTIME, _YOLOED_PATH_CACHE
+    global _YOLOED_MD5_CACHE, _YOLOED_MD5_CACHE_MTIME, _YOLOED_PATH_CACHE, _YOLOED_BASENAME_CACHE
     path = ensure_yoloed_storage()
     if not path:
         _YOLOED_MD5_CACHE = set()
         _YOLOED_MD5_CACHE_MTIME = None
         _YOLOED_PATH_CACHE = set()
+        _YOLOED_BASENAME_CACHE = {}
         return _YOLOED_MD5_CACHE
 
     try:
@@ -1521,6 +1709,7 @@ def load_yoloed_md5(reload=False):
 
     md5_set = set()
     path_set = set()
+    basename_map = {}  # filename.lower() → set of (parent_dir_basename.lower(),)
     try:
         with open(path, 'r', encoding='utf-8', errors='ignore') as f:
             for line in f:
@@ -1540,6 +1729,15 @@ def load_yoloed_md5(reload=False):
                         canon = canonical_video_path(raw_path)
                         if canon:
                             path_set.add(canon)
+                        # 构建 basename 索引：文件名 → 所属父目录名集合
+                        # 使用 '/' 和 '\\' 通用分割，兼容 WSL/Windows 路径
+                        _normalized = raw_path.replace('\\', '/')
+                        _parts_list = _normalized.rsplit('/', 2)
+                        if len(_parts_list) >= 2:
+                            _fname = _parts_list[-1].lower()
+                            _parent = _parts_list[-2].lower()
+                            if _fname:
+                                basename_map.setdefault(_fname, set()).add(_parent)
                         # 跨平台: 若为 WSL 路径 (/mnt/<drive>/...), 同时生成 Windows 盘符 + UNC 变体
                         if raw_path.startswith('/mnt/') and len(raw_path) > 5 and raw_path[5].isalpha():
                             _drv = raw_path[5]
@@ -1555,11 +1753,12 @@ def load_yoloed_md5(reload=False):
         print(f"读取已识别MD5列表失败: {e}")
     _YOLOED_MD5_CACHE = md5_set
     _YOLOED_PATH_CACHE = path_set
+    _YOLOED_BASENAME_CACHE = basename_map
     _YOLOED_MD5_CACHE_MTIME = mtime
     return _YOLOED_MD5_CACHE
 
 def append_yoloed_md5(md5, file_path=None):
-    global _YOLOED_MD5_CACHE, _YOLOED_MD5_CACHE_MTIME, _YOLOED_PATH_CACHE
+    global _YOLOED_MD5_CACHE, _YOLOED_MD5_CACHE_MTIME, _YOLOED_PATH_CACHE, _YOLOED_BASENAME_CACHE
     path = ensure_yoloed_storage()
     try:
         lock_path = path + '.lock'
@@ -1585,6 +1784,14 @@ def append_yoloed_md5(md5, file_path=None):
             canon = canonical_video_path(file_path)
             if canon:
                 _YOLOED_PATH_CACHE.add(canon)
+            # 维护 basename 缓存
+            _normalized = _fp.replace('\\', '/')
+            _parts_list = _normalized.rsplit('/', 2)
+            if len(_parts_list) >= 2:
+                _fname = _parts_list[-1].lower()
+                _parent = _parts_list[-2].lower()
+                if _fname:
+                    _YOLOED_BASENAME_CACHE.setdefault(_fname, set()).add(_parent)
             # 跨平台: WSL 路径同时添加 Windows 变体
             if _fp.startswith('/mnt/') and len(_fp) > 5 and _fp[5].isalpha():
                 _drv = _fp[5]
@@ -1604,6 +1811,17 @@ def should_process(file_path):
         return False
     if is_path_already_yoloed(file_path):
         return False
+    # basename + 父目录名快速匹配（避免对已处理视频进行昂贵的 MD5 计算）
+    basename_cache = _YOLOED_BASENAME_CACHE or {}
+    if basename_cache:
+        _fp = str(file_path).replace('\\', '/')
+        _parts_list = _fp.rsplit('/', 2)
+        if len(_parts_list) >= 2:
+            _fname = _parts_list[-1].lower()
+            _parent = _parts_list[-2].lower()
+            parent_dirs = basename_cache.get(_fname)
+            if parent_dirs and _parent in parent_dirs:
+                return False
     md5 = get_file_md5_cached(file_path)
     if not md5:
         return False
@@ -1649,7 +1867,7 @@ def _record_video_processed(video_path, detections):
         print(f'记录视频处理状态失败: {e}')
 
 def _mark_directory_done(dir_path, video_file_names):
-    """将目录标记为已全部处理，并将MD5缓存中已有的视频批量写入processed_videos表。"""
+    """将目录标记为已全部处理，并将MD5缓存中已有的视频批量写入数据库和yoloed.txt（双重保险）。"""
     try:
         DIRECTORY_INDEX.mark_directory_processed(dir_path)
         # 批量记录MD5已缓存的视频（这些视频在 should_process() 中已计算过MD5，无额外I/O）
@@ -1666,21 +1884,23 @@ def _mark_directory_done(dir_path, video_file_names):
                 cache_key = (str(vf_path), None, None)
             cached_md5 = _FILE_MD5_CACHE.get(cache_key)
             if cached_md5:
+                # 双重写入：数据库 + yoloed.txt，防止任一损坏导致记录丢失
                 DIRECTORY_INDEX.mark_video_processed(
                     file_md5=cached_md5,
                     video_path=vf_path,
                     detection_count=-1,  # -1 表示"通过衍生文件/跳过逻辑确认已处理，非本次检测"
                     model_name=None
                 )
+                append_yoloed_md5(cached_md5, file_path=vf_path)
                 batch_count += 1
         if batch_count > 0:
-            print(f'已将 {batch_count} 个视频的处理记录写入数据库')
+            print(f'已将 {batch_count} 个视频的处理记录写入数据库和yoloed.txt')
     except Exception as e:
         print(f'标记目录完成状态失败: {e}')
 
 
 def process_directory_videos(dir_path, target_item, all_objects_switch=False, skip_long_videos=True):
-    """处理目录中的所有视频文件"""
+    """处理目录中的所有视频文件。返回实际处理的视频数量（0 表示全部跳过）。"""
     if os.name == 'posix' and is_windows_style_path(dir_path):
         converted = windows_path_to_wsl(dir_path)
         if converted:
@@ -1691,13 +1911,13 @@ def process_directory_videos(dir_path, target_item, all_objects_switch=False, sk
         all_files = os.listdir(dir_path)
     except (PermissionError, FileNotFoundError) as e:
         print(f"警告: 无法访问目录 '{dir_path}': {e}")
-        return
+        return 0
 
     all_names_lower = set(f.lower() for f in all_files)
     video_file_names = [f for f in all_files if is_video_file(f)]
 
     if not video_file_names:
-        return
+        return 0
 
     # 快速目录级预检查：纯内存比对，判断所有视频是否都已有衍生文件（零额外I/O）
     unprocessed_videos = []
@@ -1710,7 +1930,7 @@ def process_directory_videos(dir_path, target_item, all_objects_switch=False, sk
     if not unprocessed_videos:
         print(f"目录中所有 {len(video_file_names)} 个视频已有衍生文件，跳过整个目录")
         _mark_directory_done(dir_path, video_file_names)
-        return
+        return 0
 
     skipped_count = len(video_file_names) - len(unprocessed_videos)
     if skipped_count > 0:
@@ -1741,7 +1961,7 @@ def process_directory_videos(dir_path, target_item, all_objects_switch=False, sk
         if unprocessed_videos:
             print(f"目录中剩余 {len(unprocessed_videos)} 个视频经精确检查后均无需处理")
         _mark_directory_done(dir_path, video_file_names)
-        return
+        return 0
     
     # 处理视频文件
     for video_file, duration in video_files:
@@ -1763,6 +1983,7 @@ def process_directory_videos(dir_path, target_item, all_objects_switch=False, sk
 
     # 所有视频处理完成后，标记目录为已全部处理
     _mark_directory_done(dir_path, video_file_names)
+    return len(video_files)
 
 if __name__ == "__main__":
     video_path = r"D:\z"  # 可设置为视频文件或目录
@@ -1793,6 +2014,9 @@ if __name__ == "__main__":
         if not leaf_dirs:
             print(f"未找到包含视频文件的叶子节点目录")
         else:
+            # 预加载 yoloed.txt 缓存（在列表显示和主循环中都会用到）
+            load_yoloed_md5(reload=True)
+
             print(f"\n找到 {len(leaf_dirs)} 个包含视频文件的叶子节点目录:")
             for i, (dir_path, video_count, all_processed) in enumerate(leaf_dirs, 1):
                 relative_path = _safe_relpath(dir_path, video_path)
@@ -1800,13 +2024,15 @@ if __name__ == "__main__":
                 print(f"{i:3d}. {relative_path} ({video_count} 个视频文件){status}")
             
             print(f"\n开始按视频数量从多到少的顺序处理叶子节点目录...")
-            
+
             # 按顺序处理每个叶子目录
             db_skipped = 0
-            for i, (dir_path, video_count, _) in enumerate(leaf_dirs, 1):
+            fs_skipped = 0
+            yoloed_skipped = 0
+            for i, (dir_path, video_count, all_processed) in enumerate(leaf_dirs, 1):
                 relative_path = _safe_relpath(dir_path, video_path)
 
-                # 数据库快速跳过：has_artifact=True 且目录 mtime 未变 → 无需任何I/O
+                # 第1层跳过：数据库快速跳过（has_artifact=True 且目录 mtime 未变 → 无需任何I/O）
                 dir_info = DIRECTORY_INDEX.get_directory_info(dir_path)
                 if dir_info:
                     db_has_artifact, db_mtime = dir_info
@@ -1818,17 +2044,36 @@ if __name__ == "__main__":
                                 continue  # 目录未变且已全部处理，完全跳过
                         except (PermissionError, FileNotFoundError, OSError):
                             pass  # 无法获取mtime，退回到正常处理流程
+                elif all_processed:
+                    # 数据库为空（如刚重建后），但文件系统检查确认所有视频都已有衍生文件
+                    fs_skipped += 1
+                    continue
+
+                # 第2层跳过：yoloed.txt 路径+basename 索引比对（仅需一次 listdir + 内存比对，无 MD5 计算）
+                if _check_all_videos_done(dir_path):
+                    yoloed_skipped += 1
+                    continue
 
                 print(f"\n=== [{i}/{len(leaf_dirs)}] {relative_path} ({video_count} 个视频) ===")
-                process_directory_videos(dir_path, target_item, all_objects_switch)
+                actually_processed = process_directory_videos(dir_path, target_item, all_objects_switch)
+                if actually_processed == 0:
+                    yoloed_skipped += 1
                 
                 # 每处理完一个目录后强制垃圾回收
                 gc.collect()
                 # 让系统有时间释放资源
                 time.sleep(2)
 
-            if db_skipped > 0:
-                print(f"\n数据库快速跳过了 {db_skipped}/{len(leaf_dirs)} 个已确认处理完成的目录")
+            total_skipped = db_skipped + fs_skipped + yoloed_skipped
+            if total_skipped > 0:
+                parts = []
+                if db_skipped > 0:
+                    parts.append(f'数据库快速跳过 {db_skipped} 个')
+                if fs_skipped > 0:
+                    parts.append(f'衍生文件跳过 {fs_skipped} 个')
+                if yoloed_skipped > 0:
+                    parts.append(f'yoloed/MD5跳过 {yoloed_skipped} 个')
+                print(f"\n共跳过 {total_skipped}/{len(leaf_dirs)} 个目录（{', '.join(parts)}）")
     
     # 原有的处理逻辑（当 use_leaf_node_processing 为 False 时使用）
     elif os.path.isdir(video_path):
