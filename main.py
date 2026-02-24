@@ -378,10 +378,53 @@ class DirectoryIndex:
             os.makedirs(folder, exist_ok=True)
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
+        # 检测数据库是否损坏
+        if not self._check_integrity():
+            print(f'数据库损坏，正在删除并重建: {self.db_path}')
+            self.conn.close()
+            self._remove_db_files(self.db_path)
+            self.conn = sqlite3.connect(self.db_path)
+            self.conn.row_factory = sqlite3.Row
         with self.conn:
             self.conn.execute('PRAGMA foreign_keys = ON;')
             self.conn.execute('PRAGMA journal_mode = WAL;')
         self._ensure_schema()
+
+    def _check_integrity(self):
+        """执行 PRAGMA integrity_check，返回数据库是否完好"""
+        try:
+            result = self.conn.execute('PRAGMA integrity_check;').fetchone()
+            return result and result[0] == 'ok'
+        except sqlite3.DatabaseError:
+            return False
+
+    @staticmethod
+    def _remove_db_files(db_path):
+        """删除数据库文件及其 WAL/SHM 附属文件"""
+        for suffix in ('', '-wal', '-shm'):
+            p = db_path + suffix
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except OSError as e:
+                print(f'删除 {p} 失败: {e}')
+
+    def _rebuild_if_corrupt(self):
+        """检测到数据库损坏时自动重建，返回是否进行了重建"""
+        if self.db_path == ':memory:':
+            return False
+        if self._check_integrity():
+            return False
+        print(f'数据库损坏，正在重建: {self.db_path}')
+        self.conn.close()
+        self._remove_db_files(self.db_path)
+        self.conn = sqlite3.connect(self.db_path)
+        self.conn.row_factory = sqlite3.Row
+        with self.conn:
+            self.conn.execute('PRAGMA foreign_keys = ON;')
+            self.conn.execute('PRAGMA journal_mode = WAL;')
+        self._ensure_schema()
+        return True
 
     def _normalize_path(self, path):
         if not path:
@@ -536,17 +579,32 @@ class DirectoryIndex:
             self._refresh_directory(child_path, exclusions, normalized)
 
     def _get_directory(self, path):
-        return self.conn.execute('SELECT * FROM directories WHERE path=?', (path,)).fetchone()
+        try:
+            return self.conn.execute('SELECT * FROM directories WHERE path=?', (path,)).fetchone()
+        except sqlite3.DatabaseError:
+            if self._rebuild_if_corrupt():
+                return None
+            raise
 
     def _get_child_paths(self, path):
-        rows = self.conn.execute('SELECT path FROM directories WHERE parent_path=?', (path,)).fetchall()
-        return [row['path'] for row in rows]
+        try:
+            rows = self.conn.execute('SELECT path FROM directories WHERE parent_path=?', (path,)).fetchall()
+            return [row['path'] for row in rows]
+        except sqlite3.DatabaseError:
+            if self._rebuild_if_corrupt():
+                return []
+            raise
 
     def _remove_directory_recursive(self, path):
         normalized = self._normalize_path(path)
         if not normalized:
             return
-        child_rows = self.conn.execute('SELECT path FROM directories WHERE parent_path=?', (normalized,)).fetchall()
+        try:
+            child_rows = self.conn.execute('SELECT path FROM directories WHERE parent_path=?', (normalized,)).fetchall()
+        except sqlite3.DatabaseError:
+            if self._rebuild_if_corrupt():
+                return
+            raise
         for row in child_rows:
             self._remove_directory_recursive(row['path'])
         with self.conn:
@@ -583,14 +641,19 @@ class DirectoryIndex:
         if not normalized_root:
             return []
         like_pattern = f"{normalized_root.rstrip(os.sep)}{os.sep}%"
-        rows = self.conn.execute(
-            """
-            SELECT path, video_count, has_artifact FROM directories
-            WHERE excluded=0 AND video_count>0 AND is_leaf=1
-              AND (path=? OR path LIKE ?)
-            """,
-            (normalized_root, like_pattern)
-        ).fetchall()
+        try:
+            rows = self.conn.execute(
+                """
+                SELECT path, video_count, has_artifact FROM directories
+                WHERE excluded=0 AND video_count>0 AND is_leaf=1
+                  AND (path=? OR path LIKE ?)
+                """,
+                (normalized_root, like_pattern)
+            ).fetchall()
+        except sqlite3.DatabaseError:
+            if self._rebuild_if_corrupt():
+                return []
+            raise
         return [(row['path'], row['video_count'], bool(row['has_artifact'])) for row in rows]
 
     def get_video_count(self, dir_path):
@@ -646,10 +709,15 @@ class DirectoryIndex:
         normalized = self._normalize_path(dir_path)
         if not normalized:
             return []
-        rows = self.conn.execute(
-            'SELECT file_name FROM videos WHERE dir_path=? ORDER BY file_name',
-            (normalized,)
-        ).fetchall()
+        try:
+            rows = self.conn.execute(
+                'SELECT file_name FROM videos WHERE dir_path=? ORDER BY file_name',
+                (normalized,)
+            ).fetchall()
+        except sqlite3.DatabaseError:
+            if self._rebuild_if_corrupt():
+                return []
+            raise
         return [row['file_name'] for row in rows]
 
     def mark_video_processed(self, file_md5, video_path, detection_count=0, model_name=None):
