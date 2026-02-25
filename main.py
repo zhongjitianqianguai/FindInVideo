@@ -429,9 +429,11 @@ class DirectoryIndex:
 
     @staticmethod
     def _remove_db_files(db_path):
-        """将损坏的数据库文件备份为 .corrupt 后删除，保留一份以备手动恢复"""
+        """将损坏的数据库文件备份为 .corrupt 后删除，保留一份以备手动恢复。
+        返回 True 表示主 db 文件已成功移除/重命名，可以安全重建。"""
         import time as _time
         timestamp = _time.strftime('%Y%m%d_%H%M%S')
+        main_db_cleared = False
         for suffix in ('', '-wal', '-shm'):
             p = db_path + suffix
             try:
@@ -440,16 +442,60 @@ class DirectoryIndex:
                     try:
                         os.rename(p, backup)
                         print(f'已备份损坏文件: {p} -> {backup}')
+                        if suffix == '':
+                            main_db_cleared = True
                     except OSError:
                         # 重命名失败则直接删除
-                        os.remove(p)
-                        print(f'备份失败，已直接删除: {p}')
+                        try:
+                            os.remove(p)
+                            print(f'备份失败，已直接删除: {p}')
+                            if suffix == '':
+                                main_db_cleared = True
+                        except OSError as e2:
+                            print(f'处理 {p} 失败: {e2}')
+                else:
+                    if suffix == '':
+                        main_db_cleared = True  # 文件不存在也算"已清除"
             except OSError as e:
                 print(f'处理 {p} 失败: {e}')
+        return main_db_cleared
+
+    def _fallback_to_memory_db(self, reason):
+        """回退到内存数据库，确保程序不会因数据库问题而崩溃。"""
+        print(f'回退到内存数据库（{reason}）')
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+        self.conn = sqlite3.connect(':memory:')
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute('PRAGMA foreign_keys = ON;')
+        self._ensure_schema()
+        # 注意：不修改 self.db_path，下次调用 _rebuild_if_corrupt 时仍可尝试恢复文件数据库
+
+    def _safe_reconnect(self, context_msg):
+        """安全地重新连接到文件数据库。如果连接或完整性检查失败，回退到内存数据库。
+        返回 True 表示成功重连（文件或内存），连接始终可用。"""
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+        try:
+            self.conn = sqlite3.connect(self.db_path, timeout=60)
+            self.conn.row_factory = sqlite3.Row
+            self.conn.execute('PRAGMA busy_timeout = 30000;')
+            # 验证连接是否可用
+            self.conn.execute('SELECT 1;').fetchone()
+            return True
+        except Exception as e:
+            print(f'{context_msg}重连数据库失败: {e}')
+            self._fallback_to_memory_db(f'{context_msg}重连失败')
+            return True
 
     def _rebuild_if_corrupt(self):
         """检测到数据库损坏时自动重建，返回是否进行了重建。
-        使用文件锁防止多个实例同时重建。"""
+        使用文件锁防止多个实例同时重建。
+        保证：无论发生什么情况，self.conn 始终处于可用状态（文件DB或内存DB）。"""
         if self.db_path == ':memory:':
             return False
         if self._check_integrity():
@@ -462,28 +508,34 @@ class DirectoryIndex:
             # 另一个实例正在重建，等待后重新连接即可
             print(f'另一个实例正在重建数据库，等待完成: {e}')
             time.sleep(5)
-            try:
-                self.conn.close()
-            except Exception:
-                pass
-            self.conn = sqlite3.connect(self.db_path, timeout=60)
-            self.conn.row_factory = sqlite3.Row
-            self.conn.execute('PRAGMA busy_timeout = 30000;')
+            self._safe_reconnect('等待其他实例重建后')
             return True
         try:
             # 获取锁后再次检查，可能已被另一个实例重建完毕
             if self._check_integrity():
                 return False
             print(f'数据库损坏，正在备份并重建: {self.db_path}')
-            self.conn.close()
-            self._remove_db_files(self.db_path)
-            self.conn = sqlite3.connect(self.db_path, timeout=60)
-            self.conn.row_factory = sqlite3.Row
-            with self.conn:
-                self.conn.execute('PRAGMA busy_timeout = 30000;')
-                self.conn.execute('PRAGMA foreign_keys = ON;')
-                self.conn.execute('PRAGMA journal_mode = WAL;')
-            self._ensure_schema()
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            db_cleared = self._remove_db_files(self.db_path)
+            if not db_cleared:
+                # 文件被另一台机器锁定，无法删除 → 回退到内存数据库
+                self._fallback_to_memory_db('损坏的数据库文件被锁定，无法删除')
+                return True
+            # 文件已成功清除，创建新的数据库
+            try:
+                self.conn = sqlite3.connect(self.db_path, timeout=60)
+                self.conn.row_factory = sqlite3.Row
+                with self.conn:
+                    self.conn.execute('PRAGMA busy_timeout = 30000;')
+                    self.conn.execute('PRAGMA foreign_keys = ON;')
+                    self.conn.execute('PRAGMA journal_mode = WAL;')
+                self._ensure_schema()
+            except Exception as e:
+                print(f'重建数据库文件失败: {e}')
+                self._fallback_to_memory_db('重建数据库文件失败')
         finally:
             release()
         return True
