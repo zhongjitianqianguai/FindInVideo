@@ -1701,7 +1701,7 @@ if __name__ == "__main__":
     all_objects_switch = False  # 设置为 True 表示显示所有检测对象
     save_mosaic_switch = False  # 设置为 True 启用拼接图片保存
     save_timestamps_switch = False  # 设置为 True 启用检测时间戳txt保存
-    model_path = 'models/nipples-0224.pt'  # YOLO 模型路径
+    model_path = 'models/nipples.pt'  # YOLO 模型路径
 
     # 加载模型（全局一次，所有视频共用）
     print(f'加载模型: {model_path}')
