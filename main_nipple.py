@@ -995,7 +995,7 @@ def save_mosaic_batch(crops_batch, batch_idx, dir_name, base_name, max_cols=8):
     del crops_batch, rows, row, batch_mosaic
     gc.collect()
     
-def detect_objects_in_video(video_path, target_class,
+def detect_objects_in_video(video_path, target_class, model,
                           show_window=False, save_crops=False,
                           save_training_data=False,
                           all_objects=False,
@@ -1009,12 +1009,9 @@ def detect_objects_in_video(video_path, target_class,
     resume_enabled = _truthy_env('FINDINVIDEO_RESUME', default=True)
     imgsz_env = os.environ.get('FINDINVIDEO_IMGSZ')
     try:
-        imgsz = int(imgsz_env) if imgsz_env else 1920
+        imgsz = int(imgsz_env) if imgsz_env else 1280
     except Exception:
-        imgsz = 1920
-
-    # 加载模型
-    model = YOLO('models/nipple-nano-02-21.pt')
+        imgsz = 1280
 
     video_dir = os.path.dirname(video_path)
     artifact_base = safe_artifact_basename(video_path)
@@ -1091,9 +1088,13 @@ def detect_objects_in_video(video_path, target_class,
                 frame_annotations = []
             
             current_time = frame_count / fps_safe
-            results = model.predict(frame, conf=0.5, verbose=False)
+            results = model.predict(frame, conf=0.5, imgsz=imgsz, verbose=False)
             detected = False
             
+            # 训练数据需要无框的原始帧，在画框前保存引用
+            if save_training_data:
+                training_frame = frame.copy()
+
             for result in results:
                 for box in result.boxes:
                     cls_id = int(box.cls)
@@ -1172,7 +1173,7 @@ def detect_objects_in_video(video_path, target_class,
                 video_base = os.path.splitext(os.path.basename(video_path))[0]
                 training_image_path = os.path.join(training_folder, f"{video_base}_{frame_count}.jpg")
                 training_annotation_path = os.path.splitext(training_image_path)[0] + ".txt"
-                cv2.imwrite(training_image_path, frame)
+                cv2.imwrite(training_image_path, training_frame)
                 with open(training_annotation_path, 'w') as f:
                     for line in frame_annotations:
                         f.write(line + "\n")
@@ -1611,7 +1612,7 @@ def _mark_directory_done(dir_path, video_file_names):
         print(f'标记目录完成状态失败: {e}')
 
 
-def process_directory_videos(dir_path, target_item, all_objects_switch=False, skip_long_videos=True):
+def process_directory_videos(dir_path, target_item, model, all_objects_switch=False, skip_long_videos=True):
     """处理目录中的所有视频文件"""
     if os.name == 'posix' and is_windows_style_path(dir_path):
         converted = windows_path_to_wsl(dir_path)
@@ -1664,10 +1665,7 @@ def process_directory_videos(dir_path, target_item, all_objects_switch=False, sk
             cap.release()
             duration = frame_count / fps if fps > 0 else float('inf')
 
-            if duration <= 3600:  # 小于等于1小时的视频
-                video_files.append((file_path, duration))
-            else:
-                print(f"视频时长 {duration:.2f}秒超过一小时，跳过处理: {file_path}")
+            video_files.append((file_path, duration))
     
     if not video_files:
         if unprocessed_videos:
@@ -1680,10 +1678,10 @@ def process_directory_videos(dir_path, target_item, all_objects_switch=False, sk
         if duration == float('inf'):
             print(f"提示: 无法获取视频时长，仍尝试处理: {video_file}")
         print(f"开始处理视频文件: {video_file}")
-        detections = detect_objects_in_video(video_file, target_item,
+        detections = detect_objects_in_video(video_file, target_item, model,
                                 show_window=False,
                                 save_crops=True,
-                                save_training_data=False,
+                                save_training_data=True,
                                 all_objects=all_objects_switch,
                                 save_mosaic=save_mosaic_switch,
                                 save_timestamps=save_timestamps_switch)
@@ -1697,12 +1695,17 @@ def process_directory_videos(dir_path, target_item, all_objects_switch=False, sk
     _mark_directory_done(dir_path, video_file_names)
 
 if __name__ == "__main__":
-    video_path = r"C:\Users\f1094\Downloads\香菜炸地球\20251024_223812.fix_p001.flv"  # 可设置为视频文件或目录
+    video_path = r"C:\Users\f1094\Downloads\氯化氢Q⁰³⁰⁶"  # 可设置为视频文件或目录
     # 如要检测所有模型内对象，则将 target_item 设置为任意值并启用全量检测开关
     target_item = "nipple"  # 当 all_objects 为 True 时，该值不再限制检测
     all_objects_switch = False  # 设置为 True 表示显示所有检测对象
     save_mosaic_switch = False  # 设置为 True 启用拼接图片保存
     save_timestamps_switch = False  # 设置为 True 启用检测时间戳txt保存
+    model_path = 'models/nipples-0224.pt'  # YOLO 模型路径
+
+    # 加载模型（全局一次，所有视频共用）
+    print(f'加载模型: {model_path}')
+    model = YOLO(model_path)
     
     # 初始化处理根目录，数据库和yoloed.txt都放在 <video_path>/md5_list/ 下
     _root = video_path if os.path.isdir(video_path) else os.path.dirname(video_path)
@@ -1718,7 +1721,7 @@ if __name__ == "__main__":
         root_video_count = count_videos_in_directory(video_path)
         if root_video_count > 0:
             print(f"\n=== 处理根目录: {video_path} ({root_video_count} 个视频) ===")
-            process_directory_videos(video_path, target_item, all_objects_switch)
+            process_directory_videos(video_path, target_item, model, all_objects_switch)
 
         leaf_dirs = find_leaf_directories_with_videos(video_path, EXCLUDE_PATHS, refresh_index=False)
 
@@ -1752,7 +1755,7 @@ if __name__ == "__main__":
                             pass  # 无法获取mtime，退回到正常处理流程
 
                 print(f"\n=== [{i}/{len(leaf_dirs)}] {relative_path} ({video_count} 个视频) ===")
-                process_directory_videos(dir_path, target_item, all_objects_switch)
+                process_directory_videos(dir_path, target_item, model, all_objects_switch)
                 
                 # 每处理完一个目录后强制垃圾回收
                 gc.collect()
@@ -1780,13 +1783,9 @@ if __name__ == "__main__":
                         fps = cap.get(cv2.CAP_PROP_FPS)
                         frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
                         cap.release()
-                        duration = frame_count / fps if fps > 0 else float('inf')
-                        if duration > 3600:
-                            print(f"视频时长 {duration:.2f}秒超过一小时，跳过处理: {file_path}")
-                            continue
                         
                         print(f"开始处理视频文件: {file_path}")
-                        detections = detect_objects_in_video(file_path, target_item,
+                        detections = detect_objects_in_video(file_path, target_item, model,
                                                 show_window=False,
                                                 save_crops=True,
                                                 save_training_data=True,
@@ -1801,26 +1800,20 @@ if __name__ == "__main__":
                     else:
                         print(f"已存在拼接图片，跳过处理: {file_path}")
     else:
-        # 处理单个视频文件前检查视频时长
+        # 处理单个视频文件
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             print(f"无法打开视频: {video_path}")
         else:
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
             cap.release()
-            duration = frame_count / fps if fps > 0 else float('inf')
-            if duration > 3600:
-                print(f"视频时长 {duration:.2f}秒超过一小时，跳过处理: {video_path}")
+            if should_process(video_path):
+                detections = detect_objects_in_video(video_path, target_item, model,
+                                       show_window=False,
+                                       save_crops=True,
+                                       save_training_data=True,
+                                       all_objects=all_objects_switch,
+                                       save_mosaic=save_mosaic_switch,
+                                       save_timestamps=save_timestamps_switch)
+                _record_video_processed(video_path, detections)
             else:
-                if should_process(video_path):
-                    detections = detect_objects_in_video(video_path, target_item,
-                                           show_window=False,
-                                           save_crops=True,
-                                           save_training_data=True,
-                                           all_objects=all_objects_switch,
-                                           save_mosaic=save_mosaic_switch,
-                                           save_timestamps=save_timestamps_switch)
-                    _record_video_processed(video_path, detections)
-                else:
-                    print(f"已存在拼接图片，跳过处理: {video_path}")
+                print(f"已存在拼接图片，跳过处理: {video_path}")
