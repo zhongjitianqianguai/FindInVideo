@@ -302,68 +302,89 @@ class DirectoryIndex:
         self.db_path = db_path or ':memory:'
         self.conn = sqlite3.connect(self.db_path, timeout=60)
         self.conn.row_factory = sqlite3.Row
-        with self.conn:
-            self.conn.execute('PRAGMA busy_timeout = 30000;')
-            self.conn.execute('PRAGMA foreign_keys = ON;')
-            self.conn.execute('PRAGMA journal_mode = WAL;')
+        self.conn.execute('PRAGMA busy_timeout = 30000;')
+        self.conn.execute('PRAGMA foreign_keys = ON;')
+        # 网络共享上 WAL 模式不安全（依赖共享内存 -shm，跨机器不一致会导致损坏）
+        # 使用 DELETE 模式（默认），对网络文件系统兼容性最好
+        try:
+            self.conn.execute('PRAGMA journal_mode = DELETE;')
+        except sqlite3.OperationalError as e:
+            if self._is_lock_error(e):
+                print(f'设置journal_mode被锁，跳过: {e}')
+            else:
+                raise
         self._ensure_schema()
 
     def _ensure_schema(self):
-        with self.conn:
-            self.conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS directories (
-                    path TEXT PRIMARY KEY,
-                    parent_path TEXT,
-                    dir_mtime REAL,
-                    last_scan REAL,
-                    is_leaf INTEGER,
-                    video_count INTEGER,
-                    has_artifact INTEGER,
-                    excluded INTEGER DEFAULT 0
-                )
-                """
-            )
-            self.conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS videos (
-                    dir_path TEXT,
-                    file_name TEXT,
-                    file_mtime REAL,
-                    file_size INTEGER,
-                    is_video INTEGER,
-                    PRIMARY KEY (dir_path, file_name),
-                    FOREIGN KEY (dir_path) REFERENCES directories(path) ON DELETE CASCADE
-                )
-                """
-            )
-            self.conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_directories_parent ON directories(parent_path)
-                """
-            )
-            self.conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_videos_dir ON videos(dir_path)
-                """
-            )
-            # 已处理视频记录表（基于文件MD5，跨机器通用）
-            self.conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS processed_videos (
-                    file_md5 TEXT PRIMARY KEY,
-                    video_path TEXT,
-                    processed_at REAL,
-                    detection_count INTEGER,
-                    model_name TEXT
-                )
-                """
-            )
-            self.conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_processed_videos_path ON processed_videos(video_path)
-                """
-            )
+        """创建所需表和索引（如果不存在）。
+        若数据库被另一台机器锁定，表已存在则可安全跳过。"""
+        for _attempt in range(3):
+            try:
+                with self.conn:
+                    self.conn.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS directories (
+                            path TEXT PRIMARY KEY,
+                            parent_path TEXT,
+                            dir_mtime REAL,
+                            last_scan REAL,
+                            is_leaf INTEGER,
+                            video_count INTEGER,
+                            has_artifact INTEGER,
+                            excluded INTEGER DEFAULT 0
+                        )
+                        """
+                    )
+                    self.conn.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS videos (
+                            dir_path TEXT,
+                            file_name TEXT,
+                            file_mtime REAL,
+                            file_size INTEGER,
+                            is_video INTEGER,
+                            PRIMARY KEY (dir_path, file_name),
+                            FOREIGN KEY (dir_path) REFERENCES directories(path) ON DELETE CASCADE
+                        )
+                        """
+                    )
+                    self.conn.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_directories_parent ON directories(parent_path)
+                        """
+                    )
+                    self.conn.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_videos_dir ON videos(dir_path)
+                        """
+                    )
+                    # 已处理视频记录表（基于文件MD5，跨机器通用）
+                    self.conn.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS processed_videos (
+                            file_md5 TEXT PRIMARY KEY,
+                            video_path TEXT,
+                            processed_at REAL,
+                            detection_count INTEGER,
+                            model_name TEXT
+                        )
+                        """
+                    )
+                    self.conn.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_processed_videos_path ON processed_videos(video_path)
+                        """
+                    )
+                return  # 成功创建表结构
+            except sqlite3.OperationalError as e:
+                if self._is_lock_error(e):
+                    if _attempt < 2:
+                        print(f'创建表结构被锁，重试中({_attempt+1}/3)...')
+                        time.sleep(5)
+                    else:
+                        print(f'创建表结构被锁，跳过（表可能已存在）: {e}')
+                else:
+                    raise
 
     def close(self):
         try:
@@ -372,7 +393,9 @@ class DirectoryIndex:
             pass
 
     def reopen(self, new_db_path):
-        """关闭当前连接并在新路径重新打开数据库。"""
+        """关闭当前连接并在新路径重新打开数据库。
+        不在启动时执行 integrity_check（在网络共享上容易误判为损坏），
+        只做基本连接验证。真正的损坏会在后续操作中由 _rebuild_if_corrupt 处理。"""
         self.close()
         self.db_path = new_db_path
         folder = os.path.dirname(new_db_path)
@@ -381,33 +404,28 @@ class DirectoryIndex:
         self.conn = sqlite3.connect(self.db_path, timeout=60)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute('PRAGMA busy_timeout = 30000;')
-        # 检测数据库是否损坏（先设置 busy_timeout 防止锁冲突被误判为损坏）
-        if not self._check_integrity():
-            lock_path = self.db_path + '.rebuild.lock'
+        # 基本连接验证：确认数据库文件可以打开并执行简单查询
+        try:
+            self.conn.execute('SELECT 1;').fetchone()
+        except sqlite3.DatabaseError as e:
+            print(f'数据库连接验证失败，将在后续操作中按需重建: {e}')
+        self.conn.execute('PRAGMA foreign_keys = ON;')
+        # 网络共享上 WAL 模式不安全，使用 DELETE 模式
+        for _attempt in range(3):
             try:
-                release = _with_lockfile(lock_path, timeout_seconds=60, stale_seconds=120)
-            except (TimeoutError, Exception) as e:
-                print(f'另一个实例正在重建数据库，等待后重连: {e}')
-                time.sleep(5)
-                self.conn.close()
-                self.conn = sqlite3.connect(self.db_path, timeout=60)
-                self.conn.row_factory = sqlite3.Row
-            else:
-                try:
-                    # 获取锁后再次检查
-                    if not self._check_integrity():
-                        print(f'数据库损坏，正在备份并重建: {self.db_path}')
-                        self.conn.close()
-                        self._remove_db_files(self.db_path)
-                        self.conn = sqlite3.connect(self.db_path, timeout=60)
-                        self.conn.row_factory = sqlite3.Row
-                finally:
-                    release()
-        with self.conn:
-            self.conn.execute('PRAGMA busy_timeout = 30000;')
-            self.conn.execute('PRAGMA foreign_keys = ON;')
-            self.conn.execute('PRAGMA journal_mode = WAL;')
+                self.conn.execute('PRAGMA journal_mode = DELETE;')
+                break
+            except sqlite3.OperationalError as e:
+                if self._is_lock_error(e):
+                    if _attempt < 2:
+                        print(f'设置journal_mode被锁，重试中({_attempt+1}/3)...')
+                        time.sleep(5)
+                    else:
+                        print(f'设置journal_mode被锁，跳过: {e}')
+                else:
+                    raise
         self._ensure_schema()
+        print(f'数据库已打开: {self.db_path}')
 
     def _check_integrity(self):
         """执行 PRAGMA integrity_check，返回数据库是否完好。
@@ -423,9 +441,12 @@ class DirectoryIndex:
 
     @staticmethod
     def _is_lock_error(exc):
-        """判断异常是否为数据库锁冲突（而非真正的损坏）"""
+        """判断异常是否为数据库锁冲突或网络瞬态错误（而非真正的损坏）。
+        网络共享上常见的瞬态错误也应视为"非损坏"，避免误判后删库重建。"""
         msg = str(exc).lower()
-        return 'locked' in msg or 'busy' in msg
+        return ('locked' in msg or 'busy' in msg
+                or 'disk i/o error' in msg
+                or 'unable to open' in msg)
 
     @staticmethod
     def _remove_db_files(db_path):
@@ -493,28 +514,46 @@ class DirectoryIndex:
             return True
 
     def _rebuild_if_corrupt(self):
-        """检测到数据库损坏时自动重建，返回是否进行了重建。
-        使用文件锁防止多个实例同时重建。
-        保证：无论发生什么情况，self.conn 始终处于可用状态（文件DB或内存DB）。"""
+        """检测到数据库操作异常时的恢复策略。
+        优先重连（网络瞬态错误最常见），只有在重连后多次 integrity_check
+        均确认损坏时才删库重建。
+        保证：无论发生什么情况，self.conn 始终处于可用状态（文件DB或内存DB）。
+        返回 True 表示进行了恢复操作（重连或重建），调用方应重试原操作。"""
         if self.db_path == ':memory:':
             return False
+
+        # 第一步：尝试重连（大多数网络瞬态错误重连即可恢复）
+        print(f'数据库操作异常，尝试重连: {self.db_path}')
+        self._safe_reconnect('操作异常后')
+
+        # 重连后验证：能否执行简单查询
+        try:
+            self.conn.execute('SELECT 1;').fetchone()
+            # 重连成功，网络瞬态错误已恢复
+            return True
+        except sqlite3.DatabaseError:
+            pass  # 重连后仍然失败，继续检查
+
+        # 第二步：执行 integrity_check 确认是否真的损坏
         if self._check_integrity():
-            return False
-        # 使用文件锁防止多实例同时重建
+            # integrity_check 通过，说明不是损坏，可能是暂时问题
+            return True
+
+        # 第三步：确认损坏，使用文件锁防止多实例同时重建
         lock_path = self.db_path + '.rebuild.lock'
         try:
             release = _with_lockfile(lock_path, timeout_seconds=60, stale_seconds=120)
         except (TimeoutError, Exception) as e:
             # 另一个实例正在重建，等待后重新连接即可
             print(f'另一个实例正在重建数据库，等待完成: {e}')
-            time.sleep(5)
+            time.sleep(10)
             self._safe_reconnect('等待其他实例重建后')
             return True
         try:
             # 获取锁后再次检查，可能已被另一个实例重建完毕
             if self._check_integrity():
-                return False
-            print(f'数据库损坏，正在备份并重建: {self.db_path}')
+                return True
+            print(f'数据库确认损坏，正在备份并重建: {self.db_path}')
             try:
                 self.conn.close()
             except Exception:
@@ -528,10 +567,9 @@ class DirectoryIndex:
             try:
                 self.conn = sqlite3.connect(self.db_path, timeout=60)
                 self.conn.row_factory = sqlite3.Row
-                with self.conn:
-                    self.conn.execute('PRAGMA busy_timeout = 30000;')
-                    self.conn.execute('PRAGMA foreign_keys = ON;')
-                    self.conn.execute('PRAGMA journal_mode = WAL;')
+                self.conn.execute('PRAGMA busy_timeout = 30000;')
+                self.conn.execute('PRAGMA foreign_keys = ON;')
+                self.conn.execute('PRAGMA journal_mode = DELETE;')
                 self._ensure_schema()
             except Exception as e:
                 print(f'重建数据库文件失败: {e}')
@@ -899,7 +937,6 @@ def _init_processing_root(root_dir):
     os.makedirs(db_dir, exist_ok=True)
     db_path = os.path.join(db_dir, 'directory_index.db')
     DIRECTORY_INDEX.reopen(db_path)
-    print(f'数据库已打开: {db_path}')
 
 
 class PauseRequested(Exception):

@@ -299,11 +299,12 @@ class DirectoryIndex:
 
     def __init__(self, db_path=None):
         self.db_path = db_path or ':memory:'
-        self.conn = sqlite3.connect(self.db_path)
+        self.conn = sqlite3.connect(self.db_path, timeout=60)
         self.conn.row_factory = sqlite3.Row
-        with self.conn:
-            self.conn.execute('PRAGMA foreign_keys = ON;')
-            self.conn.execute('PRAGMA journal_mode = WAL;')
+        self.conn.execute('PRAGMA busy_timeout = 30000;')
+        self.conn.execute('PRAGMA foreign_keys = ON;')
+        # 网络共享上 WAL 模式不安全，使用 DELETE 模式
+        self.conn.execute('PRAGMA journal_mode = DELETE;')
         self._ensure_schema()
 
     def _ensure_schema(self):
@@ -376,11 +377,12 @@ class DirectoryIndex:
         folder = os.path.dirname(new_db_path)
         if folder and not os.path.exists(folder):
             os.makedirs(folder, exist_ok=True)
-        self.conn = sqlite3.connect(self.db_path)
+        self.conn = sqlite3.connect(self.db_path, timeout=60)
         self.conn.row_factory = sqlite3.Row
-        with self.conn:
-            self.conn.execute('PRAGMA foreign_keys = ON;')
-            self.conn.execute('PRAGMA journal_mode = WAL;')
+        self.conn.execute('PRAGMA busy_timeout = 30000;')
+        self.conn.execute('PRAGMA foreign_keys = ON;')
+        # 网络共享上 WAL 模式不安全，使用 DELETE 模式
+        self.conn.execute('PRAGMA journal_mode = DELETE;')
         self._ensure_schema()
 
     def _normalize_path(self, path):
