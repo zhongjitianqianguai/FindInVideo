@@ -299,12 +299,11 @@ class DirectoryIndex:
 
     def __init__(self, db_path=None):
         self.db_path = db_path or ':memory:'
-        self.conn = sqlite3.connect(self.db_path, timeout=60)
+        self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute('PRAGMA busy_timeout = 30000;')
-        self.conn.execute('PRAGMA foreign_keys = ON;')
-        # 网络共享上 WAL 模式不安全，使用 DELETE 模式
-        self.conn.execute('PRAGMA journal_mode = DELETE;')
+        with self.conn:
+            self.conn.execute('PRAGMA foreign_keys = ON;')
+            self.conn.execute('PRAGMA journal_mode = WAL;')
         self._ensure_schema()
 
     def _ensure_schema(self):
@@ -377,12 +376,11 @@ class DirectoryIndex:
         folder = os.path.dirname(new_db_path)
         if folder and not os.path.exists(folder):
             os.makedirs(folder, exist_ok=True)
-        self.conn = sqlite3.connect(self.db_path, timeout=60)
+        self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute('PRAGMA busy_timeout = 30000;')
-        self.conn.execute('PRAGMA foreign_keys = ON;')
-        # 网络共享上 WAL 模式不安全，使用 DELETE 模式
-        self.conn.execute('PRAGMA journal_mode = DELETE;')
+        with self.conn:
+            self.conn.execute('PRAGMA foreign_keys = ON;')
+            self.conn.execute('PRAGMA journal_mode = WAL;')
         self._ensure_schema()
 
     def _normalize_path(self, path):
@@ -1703,7 +1701,7 @@ if __name__ == "__main__":
     all_objects_switch = False  # 设置为 True 表示显示所有检测对象
     save_mosaic_switch = False  # 设置为 True 启用拼接图片保存
     save_timestamps_switch = False  # 设置为 True 启用检测时间戳txt保存
-    model_path = 'models/nipples.pt'  # YOLO 模型路径
+    model_path = 'models/nipples-0224.pt'  # YOLO 模型路径
 
     # 加载模型（全局一次，所有视频共用）
     print(f'加载模型: {model_path}')
