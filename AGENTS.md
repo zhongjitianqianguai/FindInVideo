@@ -142,9 +142,10 @@ finally:
 | `FINDINVIDEO_CLAIM_TTL_SECONDS` | TTL for video claim locks | `86400` |
 
 ## Database (SQLite)
-- File: `directory_index.db` in script directory, managed by `DirectoryIndex` class
-- WAL mode enabled, foreign keys on
-- Tables: `directories` (path, parent_path, mtime, scan info, flags) and `videos` (dir_path, file_name, mtime, size, is_video)
+- File: `<processing_target_dir>/md5_list/directory_index.db`（如 `D:\z\md5_list\directory_index.db`），由 `DirectoryIndex` 类管理
+- DELETE journal mode（不使用 WAL，因为数据库通过网络共享访问），foreign keys on
+- Tables: `directories` (path, parent_path, mtime, scan info, flags), `videos` (dir_path, file_name, mtime, size, is_video), `processed_videos` (md5, file_path, processed_at)
+- `processed_videos` 使用文件 MD5 作为主键，支持不同机器通过不同路径访问同一文件
 - Global singleton `DIRECTORY_INDEX` cleaned up via `atexit.register`
 - Always use parameterized queries
 
@@ -164,3 +165,4 @@ finally:
 - Branch: `master`
 - Commit messages: often in Chinese, sometimes prefixed with `feat:`
 - `.gitignore`: `.venv/*`, `__pycache__/*`, `logs/*`
+- **每次修改完代码后，必须自动 `git add`、`git commit` 并 `git push`**，不需要等用户要求。提交信息使用中文，格式如 `feat: 简要描述修改内容`。
