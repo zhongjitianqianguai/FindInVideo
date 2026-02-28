@@ -1725,7 +1725,7 @@ if __name__ == "__main__":
             print(f"\n=== 处理根目录: {video_path} ({root_video_count} 个视频) ===")
             process_directory_videos(video_path, target_item, model, all_objects_switch)
 
-        leaf_dirs = find_leaf_directories_with_videos(video_path, EXCLUDE_PATHS, refresh_index=False)
+        leaf_dirs = find_leaf_directories_with_videos(video_path, EXCLUDE_PATHS, refresh_index=True)
 
         if not leaf_dirs:
             print(f"未找到包含视频文件的叶子节点目录")
