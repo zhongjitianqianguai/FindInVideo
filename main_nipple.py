@@ -276,7 +276,7 @@ DIR_ARTIFACT_SKIP_SUFFIXES = (
 )
 
 # 在判断叶子目录时忽略这些子目录名（工具生成的输出目录，不影响目录结构判断）
-_IGNORED_SUBDIRS = {'_detected', 'yolov5_output', '__pycache__', '.git', '$RECYCLE.BIN', 'System Volume Information'}
+_IGNORED_SUBDIRS = {'_detected', 'yolov5_output', '__pycache__', '.git', '$RECYCLE.BIN', 'System Volume Information', 'training_data', 'md5_list'}
 
 # 需要排除的路径变量
 _EXCLUDE_PATHS_RAW = [
