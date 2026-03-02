@@ -2164,6 +2164,22 @@ def process_directory_videos(dir_path, target_item, all_objects_switch=False, sk
 
 if __name__ == "__main__":
     video_path = r"D:\z"  # 可设置为视频文件或目录
+    
+    # 检查路径是否存在
+    if not os.path.exists(video_path):
+        print(f"错误: 路径不存在: {video_path}")
+        exit(1)
+    
+    # 如果传入的是目录但目录为空或无视频文件，给出提示
+    if os.path.isdir(video_path):
+        try:
+            files = os.listdir(video_path)
+            if not files:
+                print(f"错误: 目录为空: {video_path}")
+                exit(1)
+        except PermissionError:
+            print(f"错误: 无权限访问目录: {video_path}")
+            exit(1)
     # 如要检测所有模型内对象，则将 target_item 设置为任意值并启用全量检测开关
     target_item = "face"  # 当 all_objects 为 True 时，该值不再限制检测
     all_objects_switch = False  # 设置为 True 表示显示所有检测对象
