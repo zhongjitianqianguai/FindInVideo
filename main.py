@@ -375,6 +375,18 @@ class DirectoryIndex:
                         CREATE INDEX IF NOT EXISTS idx_processed_videos_path ON processed_videos(video_path)
                         """
                     )
+                    # 处理中的视频声明表（防止多机器同时处理同一文件）
+                    self.conn.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS processing_claims (
+                            file_md5 TEXT PRIMARY KEY,
+                            video_path TEXT,
+                            claimed_at REAL,
+                            host_name TEXT,
+                            pid INTEGER
+                        )
+                        """
+                    )
                 return  # 成功创建表结构
             except sqlite3.OperationalError as e:
                 if self._is_lock_error(e):
@@ -911,6 +923,7 @@ class DirectoryIndex:
                     """,
                     (file_md5, str(video_path) if video_path else None, now, detection_count, model_name)
                 )
+                self.conn.execute('DELETE FROM processing_claims WHERE file_md5=?', (file_md5,))
         except Exception as e:
             print(f'标记视频已处理失败: {e}')
 
@@ -924,6 +937,68 @@ class DirectoryIndex:
                 (file_md5,)
             ).fetchone()
             return row is not None
+        except Exception:
+            return False
+
+    def try_claim_video(self, file_md5, video_path):
+        """尝试声明视频为"正在处理"状态，防止多机器同时处理同一文件。
+        返回 True 表示成功获取声明，False 表示已被其他机器声明。"""
+        if not file_md5:
+            return False
+        now = time.time()
+        host_name = socket.gethostname()
+        pid = os.getpid()
+        try:
+            self.conn.execute(
+                """
+                INSERT INTO processing_claims (file_md5, video_path, claimed_at, host_name, pid)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(file_md5) DO NOTHING
+                """,
+                (file_md5, str(video_path) if video_path else None, now, host_name, pid)
+            )
+            self.conn.commit()
+            row = self.conn.execute(
+                'SELECT host_name, pid FROM processing_claims WHERE file_md5=?',
+                (file_md5,)
+            ).fetchone()
+            if row and row['host_name'] == host_name and row['pid'] == pid:
+                return True
+            return False
+        except Exception as e:
+            print(f'声明视频处理失败: {e}')
+            return False
+
+    def release_claim(self, file_md5):
+        """释放视频声明，允许其他机器处理。"""
+        if not file_md5:
+            return
+        try:
+            self.conn.execute(
+                'DELETE FROM processing_claims WHERE file_md5=?',
+                (file_md5,)
+            )
+            self.conn.commit()
+        except Exception as e:
+            print(f'释放视频声明失败: {e}')
+
+    def is_video_claimed(self, file_md5):
+        """检查视频是否已被其他机器声明（正在处理中）。"""
+        if not file_md5:
+            return False
+        try:
+            row = self.conn.execute(
+                'SELECT host_name, pid, claimed_at FROM processing_claims WHERE file_md5=?',
+                (file_md5,)
+            ).fetchone()
+            if not row:
+                return False
+            claimed_at = row['claimed_at']
+            ttl = int(os.environ.get('FINDINVIDEO_CLAIM_TTL_SECONDS', '86400'))
+            if time.time() - claimed_at > ttl:
+                self.release_claim(file_md5)
+                return False
+            return True
         except Exception:
             return False
 
@@ -1901,11 +1976,13 @@ def append_yoloed_md5(md5, file_path=None):
 
 
 def should_process(file_path):
+    """检查文件是否需要处理。
+    返回 MD5 字符串表示需要处理，返回 None 表示不需要处理。
+    """
     if has_existing_artifacts(file_path):
-        return False
+        return None
     if is_path_already_yoloed(file_path):
-        return False
-    # basename + 父目录名快速匹配（避免对已处理视频进行昂贵的 MD5 计算）
+        return None
     basename_cache = _YOLOED_BASENAME_CACHE or {}
     if basename_cache:
         _fp = str(file_path).replace('\\', '/')
@@ -1915,17 +1992,22 @@ def should_process(file_path):
             _parent = _parts_list[-2].lower()
             parent_dirs = basename_cache.get(_fname)
             if parent_dirs and _parent in parent_dirs:
-                return False
+                return None
     md5 = get_file_md5_cached(file_path)
     if not md5:
-        return False
-    # 数据库查询：基于MD5判断是否已处理（跨机器通用）
+        return None
     if DIRECTORY_INDEX.is_video_processed_by_md5(md5):
-        return False
+        return None
     yoloed_md5 = load_yoloed_md5(reload=False)
     if md5 in yoloed_md5:
-        return False
-    return True
+        return None
+    if DIRECTORY_INDEX.is_video_claimed(md5):
+        print(f'视频已被其他机器声明，跳过: {file_path}')
+        return None
+    if not DIRECTORY_INDEX.try_claim_video(md5, file_path):
+        print(f'无法声明视频，跳过: {file_path}')
+        return None
+    return md5
 
 
 def is_path_already_yoloed(file_path):
@@ -2034,7 +2116,8 @@ def process_directory_videos(dir_path, target_item, all_objects_switch=False, sk
     video_files = []
     for file in unprocessed_videos:
         file_path = os.path.join(dir_path, file)
-        if should_process(file_path):
+        md5 = should_process(file_path)
+        if md5:
             # 检查视频时长
             cap = cv2.VideoCapture(file_path)
             if not cap.isOpened():
@@ -2209,7 +2292,8 @@ if __name__ == "__main__":
                 ext = os.path.splitext(file)[1].lower()
                 if ext in video_extensions:
                     file_path = os.path.join(root, file)
-                    if should_process(file_path):
+                    md5 = should_process(file_path)
+                    if md5:
                         # 获取视频时长
                         cap = cv2.VideoCapture(file_path)
                         if not cap.isOpened():
@@ -2252,7 +2336,8 @@ if __name__ == "__main__":
             if duration > 3600:
                 print(f"视频时长 {duration:.2f}秒超过一小时，跳过处理: {video_path}")
             else:
-                if should_process(video_path):
+                md5 = should_process(video_path)
+                if md5:
                     detections = detect_objects_in_video(video_path, target_item,
                                            show_window=False,
                                            save_crops=True,
