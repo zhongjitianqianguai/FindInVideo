@@ -2163,7 +2163,7 @@ def process_directory_videos(dir_path, target_item, all_objects_switch=False, sk
     return len(video_files)
 
 if __name__ == "__main__":
-    video_path = r"D:\z"  # 可设置为视频文件或目录
+    video_path = r"E:\z"  # 可设置为视频文件或目录
     
     # 检查路径是否存在
     if not os.path.exists(video_path):
