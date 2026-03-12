@@ -1723,54 +1723,73 @@ if __name__ == "__main__":
     
     if use_leaf_node_processing and os.path.isdir(video_path):
         print(f"启用叶子节点处理模式，正在扫描目录: {video_path}")
-        print("正在查找包含视频文件的叶子节点目录...")
+        
+        scan_round = 0
+        while True:
+            scan_round += 1
+            if scan_round > 1:
+                print(f"\n{'='*60}")
+                print(f"第 {scan_round} 轮扫描：检查是否有新增视频...")
+                print(f"{'='*60}")
 
-        root_video_count = count_videos_in_directory(video_path)
-        if root_video_count > 0:
-            print(f"\n=== 处理根目录: {video_path} ({root_video_count} 个视频) ===")
-            process_directory_videos(video_path, target_item, model, all_objects_switch)
+            print("正在查找包含视频文件的叶子节点目录...")
 
-        leaf_dirs = find_leaf_directories_with_videos(video_path, EXCLUDE_PATHS, refresh_index=True)
+            root_video_count = count_videos_in_directory(video_path)
+            if root_video_count > 0:
+                print(f"\n=== 处理根目录: {video_path} ({root_video_count} 个视频) ===")
+                process_directory_videos(video_path, target_item, model, all_objects_switch)
 
-        if not leaf_dirs:
-            print(f"未找到包含视频文件的叶子节点目录")
-        else:
-            print(f"\n找到 {len(leaf_dirs)} 个包含视频文件的叶子节点目录:")
-            for i, (dir_path, video_count, all_processed) in enumerate(leaf_dirs, 1):
-                relative_path = _safe_relpath(dir_path, video_path)
-                status = ' [已处理]' if all_processed else ''
-                print(f"{i:3d}. {relative_path} ({video_count} 个视频文件){status}")
-            
-            print(f"\n开始按视频数量从多到少的顺序处理叶子节点目录...")
-            
-            # 按顺序处理每个叶子目录
-            db_skipped = 0
-            for i, (dir_path, video_count, _) in enumerate(leaf_dirs, 1):
-                relative_path = _safe_relpath(dir_path, video_path)
+            leaf_dirs = find_leaf_directories_with_videos(video_path, EXCLUDE_PATHS, refresh_index=True)
 
-                # 数据库快速跳过：has_artifact=True 且目录 mtime 未变 → 无需任何I/O
-                dir_info = DIRECTORY_INDEX.get_directory_info(dir_path)
-                if dir_info:
-                    db_has_artifact, db_mtime = dir_info
-                    if db_has_artifact and db_mtime is not None:
-                        try:
-                            current_mtime = os.stat(dir_path).st_mtime
-                            if current_mtime == db_mtime:
-                                db_skipped += 1
-                                continue  # 目录未变且已全部处理，完全跳过
-                        except (PermissionError, FileNotFoundError, OSError):
-                            pass  # 无法获取mtime，退回到正常处理流程
-
-                print(f"\n=== [{i}/{len(leaf_dirs)}] {relative_path} ({video_count} 个视频) ===")
-                process_directory_videos(dir_path, target_item, model, all_objects_switch)
+            if not leaf_dirs:
+                print(f"未找到包含视频文件的叶子节点目录")
+                break
+            else:
+                print(f"\n找到 {len(leaf_dirs)} 个包含视频文件的叶子节点目录:")
+                for i, (dir_path, video_count, all_processed) in enumerate(leaf_dirs, 1):
+                    relative_path = _safe_relpath(dir_path, video_path)
+                    status = ' [已处理]' if all_processed else ''
+                    print(f"{i:3d}. {relative_path} ({video_count} 个视频文件){status}")
                 
-                # 每处理完一个目录后强制垃圾回收
-                gc.collect()
-                # 让系统有时间释放资源
-                time.sleep(2)
+                print(f"\n开始按视频数量从多到少的顺序处理叶子节点目录...")
+                
+                # 按顺序处理每个叶子目录
+                db_skipped = 0
+                processed_this_round = 0
+                for i, (dir_path, video_count, _) in enumerate(leaf_dirs, 1):
+                    relative_path = _safe_relpath(dir_path, video_path)
 
-            if db_skipped > 0:
-                print(f"\n数据库快速跳过了 {db_skipped}/{len(leaf_dirs)} 个已确认处理完成的目录")
+                    # 数据库快速跳过：has_artifact=True 且目录 mtime 未变 → 无需任何I/O
+                    dir_info = DIRECTORY_INDEX.get_directory_info(dir_path)
+                    if dir_info:
+                        db_has_artifact, db_mtime = dir_info
+                        if db_has_artifact and db_mtime is not None:
+                            try:
+                                current_mtime = os.stat(dir_path).st_mtime
+                                if current_mtime == db_mtime:
+                                    db_skipped += 1
+                                    continue  # 目录未变且已全部处理，完全跳过
+                            except (PermissionError, FileNotFoundError, OSError):
+                                pass  # 无法获取mtime，退回到正常处理流程
+
+                    print(f"\n=== [{i}/{len(leaf_dirs)}] {relative_path} ({video_count} 个视频) ===")
+                    process_directory_videos(dir_path, target_item, model, all_objects_switch)
+                    processed_this_round += 1
+                    
+                    # 每处理完一个目录后强制垃圾回收
+                    gc.collect()
+                    # 让系统有时间释放资源
+                    time.sleep(2)
+
+                if db_skipped > 0:
+                    print(f"\n数据库快速跳过了 {db_skipped}/{len(leaf_dirs)} 个已确认处理完成的目录")
+
+                # 本轮没有实际处理任何目录，说明全部完成，无需再扫描
+                if processed_this_round == 0:
+                    print(f"\n所有目录均已处理完成，无需继续扫描")
+                    break
+
+            print(f"\n第 {scan_round} 轮处理完成，准备重新扫描检查新增...")
     
     # 原有的处理逻辑（当 use_leaf_node_processing 为 False 时使用）
     elif os.path.isdir(video_path):
