@@ -30,22 +30,28 @@ def is_windows_style_path(path):
     if len(path) < 2:
         return False
     drive, sep = path[0], path[1]
-    return drive.isalpha() and sep == ':'
+    return drive.isalpha() and sep == ":"
 
 
 def windows_path_to_wsl(path):
     if not path:
         return None
     try:
-        result = subprocess.run(['wslpath', '-a', path], check=True,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, encoding='utf-8', errors='ignore')
+        result = subprocess.run(
+            ["wslpath", "-a", path],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+        )
         converted = result.stdout.strip()
         return converted or None
     except Exception:
         if is_windows_style_path(path):
             drive = path[0].lower()
-            remainder = path[2:].replace('\\', '/').lstrip('/')
+            remainder = path[2:].replace("\\", "/").lstrip("/")
             return f"/mnt/{drive}/{remainder}" if remainder else f"/mnt/{drive}"
         return None
 
@@ -54,18 +60,28 @@ def wsl_path_to_windows(path):
     if not path:
         return None
     try:
-        result = subprocess.run(['wslpath', '-w', path], check=True,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, encoding='utf-8', errors='ignore')
+        result = subprocess.run(
+            ["wslpath", "-w", path],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+        )
         converted = result.stdout.strip()
         return converted or None
     except Exception:
-        prefix = '/mnt/'
+        prefix = "/mnt/"
         if path.startswith(prefix) and len(path) > len(prefix):
             drive = path[len(prefix)]
             if drive.isalpha():
-                remainder = path[len(prefix) + 1:].lstrip('/')
-                return f"{drive.upper()}:\\{remainder.replace('/', '\\')}" if remainder else f"{drive.upper()}:\\"
+                remainder = path[len(prefix) + 1 :].lstrip("/")
+                return (
+                    f"{drive.upper()}:\\{remainder.replace('/', '\\')}"
+                    if remainder
+                    else f"{drive.upper()}:\\"
+                )
         return None
 
 
@@ -80,17 +96,21 @@ def normalize_posix_path_with_fs(path):
 
 
 def windows_path_to_unc(path):
-    if os.name != 'nt' or not path:
+    if os.name != "nt" or not path:
         return None
     try:
         drive, tail = ntpath.splitdrive(str(path))
-        if not drive or len(drive) < 2 or drive[1] != ':':
+        if not drive or len(drive) < 2 or drive[1] != ":":
             return None
-        drive_root = drive[0].upper() + ':'
+        drive_root = drive[0].upper() + ":"
 
-        mpr = ctypes.WinDLL('mpr')
+        mpr = ctypes.WinDLL("mpr")
         WNetGetConnectionW = mpr.WNetGetConnectionW
-        WNetGetConnectionW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+        WNetGetConnectionW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
         WNetGetConnectionW.restype = wintypes.DWORD
 
         buf_len = wintypes.DWORD(1024)
@@ -99,8 +119,8 @@ def windows_path_to_unc(path):
         if rc != 0:
             return None
         unc_root = buf.value
-        remainder = tail.lstrip('\\/')
-        return unc_root.rstrip('\\/') + ('\\' + remainder if remainder else '')
+        remainder = tail.lstrip("\\/")
+        return unc_root.rstrip("\\/") + ("\\" + remainder if remainder else "")
     except Exception:
         return None
 
@@ -108,28 +128,32 @@ def windows_path_to_unc(path):
 def unc_to_drive_letter(path):
     """将UNC路径（如 \\\\192.168.6.100\\d\\...）转换回本机映射的盘符路径（如 D:\\...）。
     遍历所有已映射的网络驱动器，找到匹配的UNC前缀并替换为盘符。"""
-    if os.name != 'nt' or not path:
+    if os.name != "nt" or not path:
         return None
     p = str(path)
-    if not p.startswith('\\\\'):
+    if not p.startswith("\\\\"):
         return None
     try:
-        mpr = ctypes.WinDLL('mpr')
+        mpr = ctypes.WinDLL("mpr")
         WNetGetConnectionW = mpr.WNetGetConnectionW
-        WNetGetConnectionW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+        WNetGetConnectionW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
         WNetGetConnectionW.restype = wintypes.DWORD
 
         p_norm = os.path.normpath(p).lower()
-        for letter in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
-            drive = f'{letter}:'
+        for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+            drive = f"{letter}:"
             buf_len = wintypes.DWORD(1024)
             buf = ctypes.create_unicode_buffer(buf_len.value)
             rc = WNetGetConnectionW(drive, buf, ctypes.byref(buf_len))
             if rc != 0:
                 continue
             unc_root = os.path.normpath(buf.value).lower()
-            if p_norm == unc_root or p_norm.startswith(unc_root + '\\'):
-                remainder = os.path.normpath(p)[len(unc_root):]
+            if p_norm == unc_root or p_norm.startswith(unc_root + "\\"):
+                remainder = os.path.normpath(p)[len(unc_root) :]
                 return drive + remainder
         return None
     except Exception:
@@ -142,8 +166,10 @@ def _safe_relpath(path, start):
         return os.path.relpath(path, start)
     except ValueError:
         # 尝试将UNC路径转换为盘符路径后重试
-        converted_path = unc_to_drive_letter(path) if path.startswith('\\\\') else path
-        converted_start = unc_to_drive_letter(start) if start.startswith('\\\\') else start
+        converted_path = unc_to_drive_letter(path) if path.startswith("\\\\") else path
+        converted_start = (
+            unc_to_drive_letter(start) if start.startswith("\\\\") else start
+        )
         p = converted_path or path
         s = converted_start or start
         try:
@@ -157,7 +183,7 @@ def canonical_video_path(path):
     if not path:
         return None
     p = str(path)
-    if os.name == 'nt':
+    if os.name == "nt":
         p_norm = ntpath.normpath(p)
         unc = windows_path_to_unc(p_norm)
         if unc:
@@ -175,10 +201,10 @@ def _get_env_path(name):
 
 
 def get_shared_state_dir():
-    shared = _get_env_path('FINDINVIDEO_SHARED_STATE_DIR')
+    shared = _get_env_path("FINDINVIDEO_SHARED_STATE_DIR")
     if not shared:
         return None
-    if os.name == 'posix' and is_windows_style_path(shared):
+    if os.name == "posix" and is_windows_style_path(shared):
         converted = windows_path_to_wsl(shared)
         if converted:
             shared = normalize_posix_path_with_fs(converted)
@@ -204,11 +230,11 @@ def _atomic_create_file(path, content):
     except FileExistsError:
         return False
     except OSError as e:
-        if getattr(e, 'errno', None) == errno.EEXIST:
+        if getattr(e, "errno", None) == errno.EEXIST:
             return False
         raise
     try:
-        with os.fdopen(fd, 'w', encoding='utf-8', errors='ignore') as f:
+        with os.fdopen(fd, "w", encoding="utf-8", errors="ignore") as f:
             f.write(content)
         return True
     except Exception:
@@ -230,17 +256,21 @@ def _with_lockfile(lock_path, timeout_seconds=30, stale_seconds=3600):
         try:
             created = _atomic_create_file(lock_path, payload)
             if created:
+
                 def _release():
                     try:
                         os.unlink(lock_path)
                     except Exception:
                         pass
+
                 return _release
         except Exception:
             pass
         try:
             st = os.stat(lock_path)
-            age = time.time() - float(getattr(st, 'st_mtime', time.time()) or time.time())
+            age = time.time() - float(
+                getattr(st, "st_mtime", time.time()) or time.time()
+            )
             if stale_seconds > 0 and age > stale_seconds:
                 try:
                     os.unlink(lock_path)
@@ -252,32 +282,60 @@ def _with_lockfile(lock_path, timeout_seconds=30, stale_seconds=3600):
             raise TimeoutError(f"等待锁超时: {lock_path}")
         time.sleep(0.2)
 
+
 # 常见的视频文件扩展名
 VIDEO_EXTENSIONS = {
-    '.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.m4v', 
-    '.mpg', '.mpeg', '.3gp', '.f4v', '.ts', '.vob', '.rmvb', '.rm',
-    '.asf', '.divx', '.xvid', '.m2ts', '.mts'
+    ".mp4",
+    ".avi",
+    ".mkv",
+    ".mov",
+    ".wmv",
+    ".flv",
+    ".webm",
+    ".m4v",
+    ".mpg",
+    ".mpeg",
+    ".3gp",
+    ".f4v",
+    ".ts",
+    ".vob",
+    ".rmvb",
+    ".rm",
+    ".asf",
+    ".divx",
+    ".xvid",
+    ".m2ts",
+    ".mts",
 }
 
 ARTIFACT_SUFFIXES = [
-    '_frames.mp4',
-    '_objects.mp4',
-    '_detections.mp4',
-    '_mosaic.jpg',
-    '.txt',
-    '.done',
+    "_frames.mp4",
+    "_objects.mp4",
+    "_detections.mp4",
+    "_mosaic.jpg",
+    ".txt",
+    ".done",
 ]
 
-DONE_SUFFIX = '.done'
+DONE_SUFFIX = ".done"
 
 DIR_ARTIFACT_SKIP_SUFFIXES = (
-    '_mosaic.jpg',
-    '_detection.mp4',
-    '_detections.mp4',
+    "_mosaic.jpg",
+    "_detection.mp4",
+    "_detections.mp4",
 )
 
 # 在判断叶子目录时忽略这些子目录名（工具生成的输出目录，不影响目录结构判断）
-_IGNORED_SUBDIRS = {'_detected', 'yolov5_output', '__pycache__', '.git', '$RECYCLE.BIN', 'System Volume Information', 'training_data', 'md5_list'}
+_IGNORED_SUBDIRS = {
+    "_detected",
+    "yolov5_output",
+    "__pycache__",
+    ".git",
+    "$RECYCLE.BIN",
+    "System Volume Information",
+    "training_data",
+    "md5_list",
+}
 
 # 需要排除的路径变量
 _EXCLUDE_PATHS_RAW = [
@@ -294,23 +352,22 @@ for _ep in _EXCLUDE_PATHS_RAW:
         EXCLUDE_PATHS.append(_unc)
 
 
-
 class DirectoryIndex:
     """SQLite-backed cache for directory metadata and video listings."""
 
     def __init__(self, db_path=None):
-        self.db_path = db_path or ':memory:'
+        self.db_path = db_path or ":memory:"
         self.conn = sqlite3.connect(self.db_path, timeout=60)
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute('PRAGMA busy_timeout = 30000;')
-        self.conn.execute('PRAGMA foreign_keys = ON;')
+        self.conn.execute("PRAGMA busy_timeout = 30000;")
+        self.conn.execute("PRAGMA foreign_keys = ON;")
         # 网络共享上 WAL 模式不安全（依赖共享内存 -shm，跨机器不一致会导致损坏）
         # 使用 DELETE 模式（默认），对网络文件系统兼容性最好
         try:
-            self.conn.execute('PRAGMA journal_mode = DELETE;')
+            self.conn.execute("PRAGMA journal_mode = DELETE;")
         except sqlite3.OperationalError as e:
             if self._is_lock_error(e):
-                print(f'设置journal_mode被锁，跳过: {e}')
+                print(f"设置journal_mode被锁，跳过: {e}")
             else:
                 raise
         self._ensure_schema()
@@ -391,10 +448,10 @@ class DirectoryIndex:
             except sqlite3.OperationalError as e:
                 if self._is_lock_error(e):
                     if _attempt < 2:
-                        print(f'创建表结构被锁，重试中({_attempt+1}/3)...')
+                        print(f"创建表结构被锁，重试中({_attempt + 1}/3)...")
                         time.sleep(5)
                     else:
-                        print(f'创建表结构被锁，跳过（表可能已存在）: {e}')
+                        print(f"创建表结构被锁，跳过（表可能已存在）: {e}")
                 else:
                     raise
 
@@ -415,39 +472,39 @@ class DirectoryIndex:
             os.makedirs(folder, exist_ok=True)
         self.conn = sqlite3.connect(self.db_path, timeout=60)
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute('PRAGMA busy_timeout = 30000;')
+        self.conn.execute("PRAGMA busy_timeout = 30000;")
         # 基本连接验证：确认数据库文件可以打开并执行简单查询
         try:
-            self.conn.execute('SELECT 1;').fetchone()
+            self.conn.execute("SELECT 1;").fetchone()
         except sqlite3.DatabaseError as e:
-            print(f'数据库连接验证失败，将在后续操作中按需重建: {e}')
-        self.conn.execute('PRAGMA foreign_keys = ON;')
+            print(f"数据库连接验证失败，将在后续操作中按需重建: {e}")
+        self.conn.execute("PRAGMA foreign_keys = ON;")
         # 网络共享上 WAL 模式不安全，使用 DELETE 模式
         for _attempt in range(3):
             try:
-                self.conn.execute('PRAGMA journal_mode = DELETE;')
+                self.conn.execute("PRAGMA journal_mode = DELETE;")
                 break
             except sqlite3.OperationalError as e:
                 if self._is_lock_error(e):
                     if _attempt < 2:
-                        print(f'设置journal_mode被锁，重试中({_attempt+1}/3)...')
+                        print(f"设置journal_mode被锁，重试中({_attempt + 1}/3)...")
                         time.sleep(5)
                     else:
-                        print(f'设置journal_mode被锁，跳过: {e}')
+                        print(f"设置journal_mode被锁，跳过: {e}")
                 else:
                     raise
         self._ensure_schema()
-        print(f'数据库已打开: {self.db_path}')
+        print(f"数据库已打开: {self.db_path}")
 
     def _check_integrity(self):
         """执行 PRAGMA integrity_check，返回数据库是否完好。
         注意：如果数据库被锁导致无法执行检查，视为"完好"（不应误判为损坏）。"""
         try:
-            result = self.conn.execute('PRAGMA integrity_check;').fetchone()
-            return result and result[0] == 'ok'
+            result = self.conn.execute("PRAGMA integrity_check;").fetchone()
+            return result and result[0] == "ok"
         except sqlite3.DatabaseError as e:
             if self._is_lock_error(e):
-                print(f'数据库被锁定，跳过完整性检查（视为完好）: {e}')
+                print(f"数据库被锁定，跳过完整性检查（视为完好）: {e}")
                 return True  # 锁冲突不等于损坏
             return False
 
@@ -456,53 +513,57 @@ class DirectoryIndex:
         """判断异常是否为数据库锁冲突或网络瞬态错误（而非真正的损坏）。
         网络共享上常见的瞬态错误也应视为"非损坏"，避免误判后删库重建。"""
         msg = str(exc).lower()
-        return ('locked' in msg or 'busy' in msg
-                or 'disk i/o error' in msg
-                or 'unable to open' in msg)
+        return (
+            "locked" in msg
+            or "busy" in msg
+            or "disk i/o error" in msg
+            or "unable to open" in msg
+        )
 
     @staticmethod
     def _remove_db_files(db_path):
         """将损坏的数据库文件备份为 .corrupt 后删除，保留一份以备手动恢复。
         返回 True 表示主 db 文件已成功移除/重命名，可以安全重建。"""
         import time as _time
-        timestamp = _time.strftime('%Y%m%d_%H%M%S')
+
+        timestamp = _time.strftime("%Y%m%d_%H%M%S")
         main_db_cleared = False
-        for suffix in ('', '-wal', '-shm'):
+        for suffix in ("", "-wal", "-shm"):
             p = db_path + suffix
             try:
                 if os.path.exists(p):
-                    backup = f'{p}.corrupt.{timestamp}'
+                    backup = f"{p}.corrupt.{timestamp}"
                     try:
                         os.rename(p, backup)
-                        print(f'已备份损坏文件: {p} -> {backup}')
-                        if suffix == '':
+                        print(f"已备份损坏文件: {p} -> {backup}")
+                        if suffix == "":
                             main_db_cleared = True
                     except OSError:
                         # 重命名失败则直接删除
                         try:
                             os.remove(p)
-                            print(f'备份失败，已直接删除: {p}')
-                            if suffix == '':
+                            print(f"备份失败，已直接删除: {p}")
+                            if suffix == "":
                                 main_db_cleared = True
                         except OSError as e2:
-                            print(f'处理 {p} 失败: {e2}')
+                            print(f"处理 {p} 失败: {e2}")
                 else:
-                    if suffix == '':
+                    if suffix == "":
                         main_db_cleared = True  # 文件不存在也算"已清除"
             except OSError as e:
-                print(f'处理 {p} 失败: {e}')
+                print(f"处理 {p} 失败: {e}")
         return main_db_cleared
 
     def _fallback_to_memory_db(self, reason):
         """回退到内存数据库，确保程序不会因数据库问题而崩溃。"""
-        print(f'回退到内存数据库（{reason}）')
+        print(f"回退到内存数据库（{reason}）")
         try:
             self.conn.close()
         except Exception:
             pass
-        self.conn = sqlite3.connect(':memory:')
+        self.conn = sqlite3.connect(":memory:")
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute('PRAGMA foreign_keys = ON;')
+        self.conn.execute("PRAGMA foreign_keys = ON;")
         self._ensure_schema()
         # 注意：不修改 self.db_path，下次调用 _rebuild_if_corrupt 时仍可尝试恢复文件数据库
 
@@ -516,13 +577,13 @@ class DirectoryIndex:
         try:
             self.conn = sqlite3.connect(self.db_path, timeout=60)
             self.conn.row_factory = sqlite3.Row
-            self.conn.execute('PRAGMA busy_timeout = 30000;')
+            self.conn.execute("PRAGMA busy_timeout = 30000;")
             # 验证连接是否可用
-            self.conn.execute('SELECT 1;').fetchone()
+            self.conn.execute("SELECT 1;").fetchone()
             return True
         except Exception as e:
-            print(f'{context_msg}重连数据库失败: {e}')
-            self._fallback_to_memory_db(f'{context_msg}重连失败')
+            print(f"{context_msg}重连数据库失败: {e}")
+            self._fallback_to_memory_db(f"{context_msg}重连失败")
             return True
 
     def _rebuild_if_corrupt(self):
@@ -531,16 +592,16 @@ class DirectoryIndex:
         均确认损坏时才删库重建。
         保证：无论发生什么情况，self.conn 始终处于可用状态（文件DB或内存DB）。
         返回 True 表示进行了恢复操作（重连或重建），调用方应重试原操作。"""
-        if self.db_path == ':memory:':
+        if self.db_path == ":memory:":
             return False
 
         # 第一步：尝试重连（大多数网络瞬态错误重连即可恢复）
-        print(f'数据库操作异常，尝试重连: {self.db_path}')
-        self._safe_reconnect('操作异常后')
+        print(f"数据库操作异常，尝试重连: {self.db_path}")
+        self._safe_reconnect("操作异常后")
 
         # 重连后验证：能否执行简单查询
         try:
-            self.conn.execute('SELECT 1;').fetchone()
+            self.conn.execute("SELECT 1;").fetchone()
             # 重连成功，网络瞬态错误已恢复
             return True
         except sqlite3.DatabaseError:
@@ -552,20 +613,20 @@ class DirectoryIndex:
             return True
 
         # 第三步：确认损坏，使用文件锁防止多实例同时重建
-        lock_path = self.db_path + '.rebuild.lock'
+        lock_path = self.db_path + ".rebuild.lock"
         try:
             release = _with_lockfile(lock_path, timeout_seconds=60, stale_seconds=120)
         except (TimeoutError, Exception) as e:
             # 另一个实例正在重建，等待后重新连接即可
-            print(f'另一个实例正在重建数据库，等待完成: {e}')
+            print(f"另一个实例正在重建数据库，等待完成: {e}")
             time.sleep(10)
-            self._safe_reconnect('等待其他实例重建后')
+            self._safe_reconnect("等待其他实例重建后")
             return True
         try:
             # 获取锁后再次检查，可能已被另一个实例重建完毕
             if self._check_integrity():
                 return True
-            print(f'数据库确认损坏，正在备份并重建: {self.db_path}')
+            print(f"数据库确认损坏，正在备份并重建: {self.db_path}")
             try:
                 self.conn.close()
             except Exception:
@@ -573,19 +634,19 @@ class DirectoryIndex:
             db_cleared = self._remove_db_files(self.db_path)
             if not db_cleared:
                 # 文件被另一台机器锁定，无法删除 → 回退到内存数据库
-                self._fallback_to_memory_db('损坏的数据库文件被锁定，无法删除')
+                self._fallback_to_memory_db("损坏的数据库文件被锁定，无法删除")
                 return True
             # 文件已成功清除，创建新的数据库
             try:
                 self.conn = sqlite3.connect(self.db_path, timeout=60)
                 self.conn.row_factory = sqlite3.Row
-                self.conn.execute('PRAGMA busy_timeout = 30000;')
-                self.conn.execute('PRAGMA foreign_keys = ON;')
-                self.conn.execute('PRAGMA journal_mode = DELETE;')
+                self.conn.execute("PRAGMA busy_timeout = 30000;")
+                self.conn.execute("PRAGMA foreign_keys = ON;")
+                self.conn.execute("PRAGMA journal_mode = DELETE;")
                 self._ensure_schema()
             except Exception as e:
-                print(f'重建数据库文件失败: {e}')
-                self._fallback_to_memory_db('重建数据库文件失败')
+                print(f"重建数据库文件失败: {e}")
+                self._fallback_to_memory_db("重建数据库文件失败")
         finally:
             release()
         return True
@@ -613,12 +674,12 @@ class DirectoryIndex:
             normalized.add(entry)
             normalized.add(os.path.normpath(entry))
             # 盘符 → UNC，确保排除路径能匹配 UNC 格式的扫描路径
-            if os.name == 'nt':
+            if os.name == "nt":
                 unc = windows_path_to_unc(entry)
                 if unc:
                     normalized.add(unc)
                     normalized.add(os.path.normpath(unc))
-            if os.name == 'posix':
+            if os.name == "posix":
                 converted = windows_path_to_wsl(entry)
                 if converted:
                     normalized.add(self._normalize_path(converted))
@@ -657,12 +718,12 @@ class DirectoryIndex:
             return
 
         row = self._get_directory(normalized)
-        if row and not row['excluded'] and row['dir_mtime'] == current_mtime:
-            if row['parent_path'] != parent_path:
+        if row and not row["excluded"] and row["dir_mtime"] == current_mtime:
+            if row["parent_path"] != parent_path:
                 with self.conn:
                     self.conn.execute(
                         "UPDATE directories SET parent_path=? WHERE path=?",
-                        (parent_path, normalized)
+                        (parent_path, normalized),
                     )
             for child in self._get_child_paths(normalized):
                 self._refresh_directory(child, exclusions, normalized)
@@ -688,7 +749,11 @@ class DirectoryIndex:
                                 try:
                                     stat_info = entry.stat(follow_symlinks=False)
                                     video_records.append(
-                                        (entry.name, stat_info.st_mtime, stat_info.st_size)
+                                        (
+                                            entry.name,
+                                            stat_info.st_mtime,
+                                            stat_info.st_size,
+                                        )
                                     )
                                 except OSError:
                                     continue
@@ -704,9 +769,12 @@ class DirectoryIndex:
             for v_name, _, _ in video_records:
                 v_base = os.path.splitext(v_name)[0].lower()
                 # 检查当前命名格式的衍生文件（base + artifact suffix）
-                if any((v_base + s.lower()) in all_file_names_lower for s in ARTIFACT_SUFFIXES):
+                if any(
+                    (v_base + s.lower()) in all_file_names_lower
+                    for s in ARTIFACT_SUFFIXES
+                ):
                     processed_count += 1
-            has_artifact = (processed_count == len(video_records))
+            has_artifact = processed_count == len(video_records)
         else:
             has_artifact = False
 
@@ -732,16 +800,24 @@ class DirectoryIndex:
                     has_artifact=excluded.has_artifact,
                     excluded=0
                 """,
-                (normalized, parent_path, current_mtime, now, is_leaf, video_count, 1 if has_artifact else 0)
+                (
+                    normalized,
+                    parent_path,
+                    current_mtime,
+                    now,
+                    is_leaf,
+                    video_count,
+                    1 if has_artifact else 0,
+                ),
             )
-            self.conn.execute('DELETE FROM videos WHERE dir_path=?', (normalized,))
+            self.conn.execute("DELETE FROM videos WHERE dir_path=?", (normalized,))
             for name, mtime, size in video_records:
                 self.conn.execute(
                     """
                     INSERT OR REPLACE INTO videos (dir_path, file_name, file_mtime, file_size, is_video)
                     VALUES (?, ?, ?, ?, 1)
                     """,
-                    (normalized, name, mtime, size)
+                    (normalized, name, mtime, size),
                 )
 
         for child_path in child_dirs:
@@ -749,10 +825,12 @@ class DirectoryIndex:
 
     def _get_directory(self, path):
         try:
-            return self.conn.execute('SELECT * FROM directories WHERE path=?', (path,)).fetchone()
+            return self.conn.execute(
+                "SELECT * FROM directories WHERE path=?", (path,)
+            ).fetchone()
         except sqlite3.DatabaseError as e:
             if self._is_lock_error(e):
-                print(f'数据库被锁定，跳过查询: {e}')
+                print(f"数据库被锁定，跳过查询: {e}")
                 return None
             if self._rebuild_if_corrupt():
                 return None
@@ -760,11 +838,13 @@ class DirectoryIndex:
 
     def _get_child_paths(self, path):
         try:
-            rows = self.conn.execute('SELECT path FROM directories WHERE parent_path=?', (path,)).fetchall()
-            return [row['path'] for row in rows]
+            rows = self.conn.execute(
+                "SELECT path FROM directories WHERE parent_path=?", (path,)
+            ).fetchall()
+            return [row["path"] for row in rows]
         except sqlite3.DatabaseError as e:
             if self._is_lock_error(e):
-                print(f'数据库被锁定，跳过查询: {e}')
+                print(f"数据库被锁定，跳过查询: {e}")
                 return []
             if self._rebuild_if_corrupt():
                 return []
@@ -775,18 +855,20 @@ class DirectoryIndex:
         if not normalized:
             return
         try:
-            child_rows = self.conn.execute('SELECT path FROM directories WHERE parent_path=?', (normalized,)).fetchall()
+            child_rows = self.conn.execute(
+                "SELECT path FROM directories WHERE parent_path=?", (normalized,)
+            ).fetchall()
         except sqlite3.DatabaseError as e:
             if self._is_lock_error(e):
-                print(f'数据库被锁定，跳过删除: {e}')
+                print(f"数据库被锁定，跳过删除: {e}")
                 return
             if self._rebuild_if_corrupt():
                 return
             raise
         for row in child_rows:
-            self._remove_directory_recursive(row['path'])
+            self._remove_directory_recursive(row["path"])
         with self.conn:
-            self.conn.execute('DELETE FROM directories WHERE path=?', (normalized,))
+            self.conn.execute("DELETE FROM directories WHERE path=?", (normalized,))
 
     def _mark_excluded(self, path, parent_path):
         current_mtime = 0.0
@@ -808,9 +890,9 @@ class DirectoryIndex:
                     has_artifact=0,
                     excluded=1
                 """,
-                (path, parent_path, current_mtime, time.time())
+                (path, parent_path, current_mtime, time.time()),
             )
-            self.conn.execute('DELETE FROM videos WHERE dir_path=?', (path,))
+            self.conn.execute("DELETE FROM videos WHERE dir_path=?", (path,))
         for child in self._get_child_paths(path):
             self._remove_directory_recursive(child)
 
@@ -826,24 +908,26 @@ class DirectoryIndex:
                 WHERE excluded=0 AND video_count>0 AND is_leaf=1
                   AND (path=? OR path LIKE ?)
                 """,
-                (normalized_root, like_pattern)
+                (normalized_root, like_pattern),
             ).fetchall()
         except sqlite3.DatabaseError as e:
             if self._is_lock_error(e):
-                print(f'数据库被锁定，跳过查询叶子目录: {e}')
+                print(f"数据库被锁定，跳过查询叶子目录: {e}")
                 return []
             if self._rebuild_if_corrupt():
                 return []
             raise
-        return [(row['path'], row['video_count'], bool(row['has_artifact'])) for row in rows]
+        return [
+            (row["path"], row["video_count"], bool(row["has_artifact"])) for row in rows
+        ]
 
     def get_video_count(self, dir_path):
         normalized = self._normalize_path(dir_path)
         if not normalized:
             return None
         row = self._get_directory(normalized)
-        if row and not row['excluded']:
-            return row['video_count'] or 0
+        if row and not row["excluded"]:
+            return row["video_count"] or 0
         return None
 
     def directory_has_artifacts(self, dir_path):
@@ -851,8 +935,8 @@ class DirectoryIndex:
         if not normalized:
             return None
         row = self._get_directory(normalized)
-        if row and not row['excluded']:
-            return bool(row['has_artifact'])
+        if row and not row["excluded"]:
+            return bool(row["has_artifact"])
         return None
 
     def get_directory_info(self, dir_path):
@@ -861,8 +945,8 @@ class DirectoryIndex:
         if not normalized:
             return None
         row = self._get_directory(normalized)
-        if row and not row['excluded']:
-            return (bool(row['has_artifact']), row['dir_mtime'])
+        if row and not row["excluded"]:
+            return (bool(row["has_artifact"]), row["dir_mtime"])
         return None
 
     def mark_directory_processed(self, dir_path):
@@ -881,10 +965,10 @@ class DirectoryIndex:
                     UPDATE directories SET has_artifact=1, dir_mtime=?
                     WHERE path=?
                     """,
-                    (current_mtime, normalized)
+                    (current_mtime, normalized),
                 )
         except Exception as e:
-            print(f'标记目录已处理失败: {e}')
+            print(f"标记目录已处理失败: {e}")
 
     def get_videos(self, dir_path):
         normalized = self._normalize_path(dir_path)
@@ -892,19 +976,21 @@ class DirectoryIndex:
             return []
         try:
             rows = self.conn.execute(
-                'SELECT file_name FROM videos WHERE dir_path=? ORDER BY file_name',
-                (normalized,)
+                "SELECT file_name FROM videos WHERE dir_path=? ORDER BY file_name",
+                (normalized,),
             ).fetchall()
         except sqlite3.DatabaseError as e:
             if self._is_lock_error(e):
-                print(f'数据库被锁定，跳过查询视频列表: {e}')
+                print(f"数据库被锁定，跳过查询视频列表: {e}")
                 return []
             if self._rebuild_if_corrupt():
                 return []
             raise
-        return [row['file_name'] for row in rows]
+        return [row["file_name"] for row in rows]
 
-    def mark_video_processed(self, file_md5, video_path, detection_count=0, model_name=None):
+    def mark_video_processed(
+        self, file_md5, video_path, detection_count=0, model_name=None
+    ):
         """将视频标记为已处理（基于文件MD5，跨机器通用）。"""
         if not file_md5:
             return
@@ -921,11 +1007,19 @@ class DirectoryIndex:
                         detection_count=excluded.detection_count,
                         model_name=excluded.model_name
                     """,
-                    (file_md5, str(video_path) if video_path else None, now, detection_count, model_name)
+                    (
+                        file_md5,
+                        str(video_path) if video_path else None,
+                        now,
+                        detection_count,
+                        model_name,
+                    ),
                 )
-                self.conn.execute('DELETE FROM processing_claims WHERE file_md5=?', (file_md5,))
+                self.conn.execute(
+                    "DELETE FROM processing_claims WHERE file_md5=?", (file_md5,)
+                )
         except Exception as e:
-            print(f'标记视频已处理失败: {e}')
+            print(f"标记视频已处理失败: {e}")
 
     def is_video_processed_by_md5(self, file_md5):
         """根据文件MD5查询视频是否已处理过。"""
@@ -933,8 +1027,7 @@ class DirectoryIndex:
             return False
         try:
             row = self.conn.execute(
-                'SELECT 1 FROM processed_videos WHERE file_md5=?',
-                (file_md5,)
+                "SELECT 1 FROM processed_videos WHERE file_md5=?", (file_md5,)
             ).fetchone()
             return row is not None
         except Exception:
@@ -955,18 +1048,24 @@ class DirectoryIndex:
                 VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(file_md5) DO NOTHING
                 """,
-                (file_md5, str(video_path) if video_path else None, now, host_name, pid)
+                (
+                    file_md5,
+                    str(video_path) if video_path else None,
+                    now,
+                    host_name,
+                    pid,
+                ),
             )
             self.conn.commit()
             row = self.conn.execute(
-                'SELECT host_name, pid FROM processing_claims WHERE file_md5=?',
-                (file_md5,)
+                "SELECT host_name, pid FROM processing_claims WHERE file_md5=?",
+                (file_md5,),
             ).fetchone()
-            if row and row['host_name'] == host_name and row['pid'] == pid:
+            if row and row["host_name"] == host_name and row["pid"] == pid:
                 return True
             return False
         except Exception as e:
-            print(f'声明视频处理失败: {e}')
+            print(f"声明视频处理失败: {e}")
             return False
 
     def release_claim(self, file_md5):
@@ -975,12 +1074,11 @@ class DirectoryIndex:
             return
         try:
             self.conn.execute(
-                'DELETE FROM processing_claims WHERE file_md5=?',
-                (file_md5,)
+                "DELETE FROM processing_claims WHERE file_md5=?", (file_md5,)
             )
             self.conn.commit()
         except Exception as e:
-            print(f'释放视频声明失败: {e}')
+            print(f"释放视频声明失败: {e}")
 
     def is_video_claimed(self, file_md5):
         """检查视频是否已被其他机器声明（正在处理中）。"""
@@ -988,13 +1086,13 @@ class DirectoryIndex:
             return False
         try:
             row = self.conn.execute(
-                'SELECT host_name, pid, claimed_at FROM processing_claims WHERE file_md5=?',
-                (file_md5,)
+                "SELECT host_name, pid, claimed_at FROM processing_claims WHERE file_md5=?",
+                (file_md5,),
             ).fetchone()
             if not row:
                 return False
-            claimed_at = row['claimed_at']
-            ttl = int(os.environ.get('FINDINVIDEO_CLAIM_TTL_SECONDS', '86400'))
+            claimed_at = row["claimed_at"]
+            ttl = int(os.environ.get("FINDINVIDEO_CLAIM_TTL_SECONDS", "86400"))
             if time.time() - claimed_at > ttl:
                 self.release_claim(file_md5)
                 return False
@@ -1013,9 +1111,9 @@ def _init_processing_root(root_dir):
     if not root_dir or not os.path.isdir(root_dir):
         return
     _PROCESSING_ROOT_DIR = root_dir
-    db_dir = os.path.join(root_dir, 'md5_list')
+    db_dir = os.path.join(root_dir, "md5_list")
     os.makedirs(db_dir, exist_ok=True)
-    db_path = os.path.join(db_dir, 'directory_index.db')
+    db_path = os.path.join(db_dir, "directory_index.db")
     DIRECTORY_INDEX.reopen(db_path)
 
 
@@ -1023,26 +1121,26 @@ class PauseRequested(Exception):
     """Raised to request a graceful stop with checkpoint saved."""
 
 
-CHECKPOINT_SUFFIX = '.checkpoint.json'
+CHECKPOINT_SUFFIX = ".checkpoint.json"
 
 
 def _truthy_env(name, default=False):
     val = os.environ.get(name)
     if val is None:
         return default
-    return str(val).strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+    return str(val).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 def _get_pause_file_path():
     """Return the pause flag path (best-effort)."""
-    explicit = os.environ.get('FINDINVIDEO_PAUSE_FILE')
+    explicit = os.environ.get("FINDINVIDEO_PAUSE_FILE")
     if explicit:
         return explicit
     try:
         base_dir = os.path.dirname(os.path.abspath(__file__))
     except Exception:
         base_dir = os.getcwd()
-    return os.path.join(base_dir, 'pause.flag')
+    return os.path.join(base_dir, "pause.flag")
 
 
 def _pause_requested(pause_file_path=None):
@@ -1061,6 +1159,7 @@ def _pause_requested(pause_file_path=None):
 # 例: 原视频 "1 (44).mp4" → "1 (44)_frames.mp4", "1 (44)_mosaic.jpg" 等。
 # ---------------------------------------------------------------------------
 
+
 def safe_artifact_basename(video_path):
     """返回用于创建衍生文件的基础名（= 原视频文件名去掉扩展名）。
 
@@ -1073,8 +1172,8 @@ def safe_artifact_basename(video_path):
 def _sanitize_basename(video_path):
     """将文件名中的非 alnum / - / _ 字符替换为 _（旧格式辅助函数）。"""
     base_name = os.path.basename(os.path.splitext(video_path)[0])
-    sanitized = ''.join(c if c.isalnum() or c in ('-', '_') else '_' for c in base_name)
-    return sanitized or 'video'
+    sanitized = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in base_name)
+    return sanitized or "video"
 
 
 def legacy_artifact_basename(video_path, max_length=80):
@@ -1082,11 +1181,13 @@ def legacy_artifact_basename(video_path, max_length=80):
     sanitized = _sanitize_basename(video_path)
     try:
         st = os.stat(video_path)
-        size = int(getattr(st, 'st_size', 0) or 0)
-        mtime = float(getattr(st, 'st_mtime', 0.0) or 0.0)
-        digest = hashlib.md5(f"{size}|{mtime}".encode('utf-8', 'ignore')).hexdigest()[:8]
+        size = int(getattr(st, "st_size", 0) or 0)
+        mtime = float(getattr(st, "st_mtime", 0.0) or 0.0)
+        digest = hashlib.md5(f"{size}|{mtime}".encode("utf-8", "ignore")).hexdigest()[
+            :8
+        ]
     except Exception:
-        digest = hashlib.md5(sanitized.encode('utf-8', 'ignore')).hexdigest()[:8]
+        digest = hashlib.md5(sanitized.encode("utf-8", "ignore")).hexdigest()[:8]
     limit = max(8, max_length - len(digest) - 1)
     if len(sanitized) > limit:
         sanitized = sanitized[:limit]
@@ -1096,7 +1197,7 @@ def legacy_artifact_basename(video_path, max_length=80):
 def _legacy_artifact_basename_v1(video_path, max_length=80):
     """旧格式 v1: sanitized_name + path-based hash — 仅用于检测已有衍生文件。"""
     sanitized = _sanitize_basename(video_path)
-    digest = hashlib.md5(str(video_path).encode('utf-8', 'ignore')).hexdigest()[:8]
+    digest = hashlib.md5(str(video_path).encode("utf-8", "ignore")).hexdigest()[:8]
     limit = max(8, max_length - len(digest) - 1)
     if len(sanitized) > limit:
         sanitized = sanitized[:limit]
@@ -1104,7 +1205,7 @@ def _legacy_artifact_basename_v1(video_path, max_length=80):
 
 
 def _checkpoint_path(video_path):
-    video_dir = os.path.dirname(video_path) or '.'
+    video_dir = os.path.dirname(video_path) or "."
     base = safe_artifact_basename(video_path)
     return os.path.join(video_dir, base + CHECKPOINT_SUFFIX)
 
@@ -1114,13 +1215,16 @@ def _load_checkpoint(video_path):
     try:
         if not os.path.exists(path):
             return None
-        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
             data = json.load(f)
         try:
             st = os.stat(video_path)
-            if data.get('size') not in (None, st.st_size):
+            if data.get("size") not in (None, st.st_size):
                 return None
-            if data.get('mtime') is not None and abs(float(data.get('mtime')) - float(st.st_mtime)) > 2.0:
+            if (
+                data.get("mtime") is not None
+                and abs(float(data.get("mtime")) - float(st.st_mtime)) > 2.0
+            ):
                 return None
         except Exception:
             pass
@@ -1132,21 +1236,21 @@ def _load_checkpoint(video_path):
 def _save_checkpoint(video_path, next_frame, detections, last_detected):
     path = _checkpoint_path(video_path)
     payload = {
-        'version': 1,
-        'next_frame': int(max(0, next_frame or 0)),
-        'detections': detections or [],
-        'last_detected': float(last_detected) if last_detected is not None else -5.0,
-        'saved_at': time.time(),
+        "version": 1,
+        "next_frame": int(max(0, next_frame or 0)),
+        "detections": detections or [],
+        "last_detected": float(last_detected) if last_detected is not None else -5.0,
+        "saved_at": time.time(),
     }
     try:
         st = os.stat(video_path)
-        payload['size'] = st.st_size
-        payload['mtime'] = st.st_mtime
+        payload["size"] = st.st_size
+        payload["mtime"] = st.st_mtime
     except Exception:
         pass
     try:
-        tmp = path + '.tmp'
-        with open(tmp, 'w', encoding='utf-8', errors='ignore') as f:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8", errors="ignore") as f:
             json.dump(payload, f)
         os.replace(tmp, path)
     except Exception:
@@ -1167,10 +1271,14 @@ def is_video_file(file_path):
     # 直接用原始文件名，避免特殊字符被截断
     _, ext = os.path.splitext(file_path.lower())
     base = file_path.lower()
-    if base.endswith('_frames.mp4') or base.endswith('_objects.mp4') or base.endswith('_detections.mp4'):
+    if (
+        base.endswith("_frames.mp4")
+        or base.endswith("_objects.mp4")
+        or base.endswith("_detections.mp4")
+    ):
         return False
     # 续跑/分段输出文件，避免被当作输入视频再次处理
-    if '_frames.part' in base or '_objects.part' in base or '_detections.part' in base:
+    if "_frames.part" in base or "_objects.part" in base or "_detections.part" in base:
         return False
     return ext in VIDEO_EXTENSIONS
 
@@ -1183,10 +1291,12 @@ def has_existing_artifacts(video_path):
             return False
     except Exception:
         pass
-    video_dir = os.path.dirname(video_path) or '.'
-    bases = [safe_artifact_basename(video_path),
-             legacy_artifact_basename(video_path),
-             _legacy_artifact_basename_v1(video_path)]
+    video_dir = os.path.dirname(video_path) or "."
+    bases = [
+        safe_artifact_basename(video_path),
+        legacy_artifact_basename(video_path),
+        _legacy_artifact_basename_v1(video_path),
+    ]
     for base in bases:
         # Fast marker first
         done_path = os.path.join(video_dir, base + DONE_SUFFIX)
@@ -1202,12 +1312,12 @@ def has_existing_artifacts(video_path):
 def write_done_marker(video_path):
     """Write a small marker file so future runs can skip without hashing."""
     try:
-        video_dir = os.path.dirname(video_path) or '.'
+        video_dir = os.path.dirname(video_path) or "."
         base = safe_artifact_basename(video_path)
         marker = os.path.join(video_dir, base + DONE_SUFFIX)
         if os.path.exists(marker):
             return
-        with open(marker, 'w', encoding='utf-8', errors='ignore') as f:
+        with open(marker, "w", encoding="utf-8", errors="ignore") as f:
             f.write(f"done\n")
     except Exception:
         pass
@@ -1223,6 +1333,7 @@ def directory_has_artifact_outputs(dir_path):
         return False
     return False
 
+
 def is_leaf_directory(dir_path):
     """检查目录是否为叶子节点（不包含子目录，忽略工具生成的输出目录）"""
     try:
@@ -1235,6 +1346,7 @@ def is_leaf_directory(dir_path):
         return True
     except (PermissionError, FileNotFoundError):
         return False
+
 
 def count_videos_in_directory(dir_path):
     """统计目录中的视频文件数量"""
@@ -1250,6 +1362,7 @@ def count_videos_in_directory(dir_path):
     except (PermissionError, FileNotFoundError):
         pass
     return count
+
 
 def _check_all_videos_have_artifacts(dir_path, file_list=None):
     """检查目录中所有视频是否都已有衍生文件（纯内存比对）。
@@ -1288,7 +1401,7 @@ def _check_all_videos_in_yoloed(dir_path, file_list=None):
     if not video_names:
         return False  # 没有视频文件，不算"全部已处理"
     # 获取当前目录的 basename（用于 basename 缓存匹配）
-    dir_basename = os.path.basename(dir_path.rstrip(os.sep + '/')).lower()
+    dir_basename = os.path.basename(dir_path.rstrip(os.sep + "/")).lower()
     for vf in video_names:
         file_path = os.path.join(dir_path, vf)
         # 1. 快速路径匹配（与 is_path_already_yoloed 相同逻辑）
@@ -1328,7 +1441,7 @@ def _check_all_videos_done(dir_path, file_list=None):
     load_yoloed_md5(reload=False)
     path_cache = _YOLOED_PATH_CACHE or set()
     basename_cache = _YOLOED_BASENAME_CACHE or {}
-    dir_basename = os.path.basename(dir_path.rstrip(os.sep + '/')).lower()
+    dir_basename = os.path.basename(dir_path.rstrip(os.sep + "/")).lower()
 
     for vf in video_names:
         # 检查1：是否有衍生文件（纯内存比对）
@@ -1377,7 +1490,14 @@ def find_leaf_directories_with_videos(root_path, exclusions=None, refresh_index=
                 is_excluded = any(root.startswith(ex_path) for ex_path in exclusions)
                 if is_excluded:
                     continue
-                dirs[:] = [d for d in dirs if not any(os.path.join(root, d).startswith(ex_path) for ex_path in exclusions)]
+                dirs[:] = [
+                    d
+                    for d in dirs
+                    if not any(
+                        os.path.join(root, d).startswith(ex_path)
+                        for ex_path in exclusions
+                    )
+                ]
                 if is_leaf_directory(root):
                     video_count = count_videos_in_directory(root)
                     if video_count > 0:
@@ -1389,11 +1509,12 @@ def find_leaf_directories_with_videos(root_path, exclusions=None, refresh_index=
     leaf_dirs.sort(key=lambda x: x[1], reverse=True)
     return leaf_dirs
 
+
 def save_mosaic_batch(crops_batch, batch_idx, dir_name, base_name, max_cols=8):
     """保存一批检测到的目标区域为拼接图像"""
     if not crops_batch:
         return
-    
+
     rows = []
     row = []
     for i, crop in enumerate(crops_batch):
@@ -1401,13 +1522,13 @@ def save_mosaic_batch(crops_batch, batch_idx, dir_name, base_name, max_cols=8):
         if (i + 1) % max_cols == 0:
             rows.append(np.hstack(row))
             row = []
-    
+
     if row:
         missing = max_cols - len(row)
         blank = np.zeros_like(crops_batch[0])
         row.extend([blank] * missing)
         rows.append(np.hstack(row))
-    
+
     if rows:
         batch_mosaic = np.vstack(rows)
         # 根据批次保存不同的文件名
@@ -1418,33 +1539,38 @@ def save_mosaic_batch(crops_batch, batch_idx, dir_name, base_name, max_cols=8):
     # 清理内存
     del crops_batch, rows, row, batch_mosaic
     gc.collect()
-    
-def detect_objects_in_video(video_path, target_class,
-                          show_window=False, save_crops=False,
-                          save_training_data=False,
-                          all_objects=False,
-                          save_mosaic=False,
-                          save_timestamps=False):
+
+
+def detect_objects_in_video(
+    video_path,
+    target_class,
+    show_window=False,
+    save_crops=False,
+    save_training_data=False,
+    all_objects=False,
+    save_mosaic=False,
+    save_timestamps=False,
+):
     # 如果不开启全量检测，则保证 target_class 为列表
     if not all_objects and isinstance(target_class, str):
         target_class = [target_class]
 
     pause_file = _get_pause_file_path()
-    resume_enabled = _truthy_env('FINDINVIDEO_RESUME', default=True)
-    imgsz_env = os.environ.get('FINDINVIDEO_IMGSZ')
+    resume_enabled = _truthy_env("FINDINVIDEO_RESUME", default=True)
+    imgsz_env = os.environ.get("FINDINVIDEO_IMGSZ")
     try:
         imgsz = int(imgsz_env) if imgsz_env else 1920
     except Exception:
         imgsz = 1920
 
     # 加载模型
-    model = YOLO('models/yolov11l-face.pt')
+    model = YOLO("models/yolov11l-face.pt")
 
     video_dir = os.path.dirname(video_path)
     artifact_base = safe_artifact_basename(video_path)
-    txt_save_path = os.path.join(video_dir, artifact_base + '.txt')
-    mosaic_path = os.path.join(video_dir, artifact_base + '_mosaic.jpg')
-    video_save_path = os.path.join(video_dir, artifact_base + '_frames.mp4')
+    txt_save_path = os.path.join(video_dir, artifact_base + ".txt")
+    mosaic_path = os.path.join(video_dir, artifact_base + "_mosaic.jpg")
+    video_save_path = os.path.join(video_dir, artifact_base + "_frames.mp4")
 
     # 若需要生成训练数据，则构造保存目录及生成 classes.txt 文件
     if save_training_data:
@@ -1460,18 +1586,22 @@ def detect_objects_in_video(video_path, target_class,
                 else:
                     for cls in target_class:
                         f.write(cls + "\n")
-    
+
     ckpt = _load_checkpoint(video_path) if resume_enabled else None
-    start_frame = int(ckpt.get('next_frame', 0)) if ckpt else 0
-    detections = list(ckpt.get('detections', [])) if ckpt else []
-    last_detected = float(ckpt.get('last_detected', detections[-1] if detections else -5.0)) if ckpt else -5
+    start_frame = int(ckpt.get("next_frame", 0)) if ckpt else 0
+    detections = list(ckpt.get("detections", [])) if ckpt else []
+    last_detected = (
+        float(ckpt.get("last_detected", detections[-1] if detections else -5.0))
+        if ckpt
+        else -5
+    )
 
     # 视频处理初始化
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"无法打开视频: {video_path}")
         return []
-        
+
     fps = cap.get(cv2.CAP_PROP_FPS)
     fps_safe = fps if fps and fps > 0 else 25
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
@@ -1482,10 +1612,14 @@ def detect_objects_in_video(video_path, target_class,
             pass
 
     # 初始化进度条
-    pbar = tqdm(total=total_frames, initial=min(start_frame, total_frames), desc=f"处理视频: {os.path.basename(video_path)}")
+    pbar = tqdm(
+        total=total_frames,
+        initial=min(start_frame, total_frames),
+        desc=f"处理视频: {os.path.basename(video_path)}",
+    )
 
     frame_count = start_frame
-    
+
     # 截图存储配置（用于拼接大图）
     crop_size = (160, 160)  # 统一缩放到的小图尺寸
     max_cols = 8  # 拼接大图每行最多显示数量
@@ -1496,28 +1630,33 @@ def detect_objects_in_video(video_path, target_class,
     # ---- 检测帧视频写入器（懒初始化，首次检测到目标时创建）----
     video_writer = None
     frame_w, frame_h = 0, 0
-    
+
     paused = False
     try:
         while cap.isOpened():
             if _pause_requested(pause_file):
-                _save_checkpoint(video_path, next_frame=frame_count, detections=detections, last_detected=last_detected)
+                _save_checkpoint(
+                    video_path,
+                    next_frame=frame_count,
+                    detections=detections,
+                    last_detected=last_detected,
+                )
                 paused = True
                 raise PauseRequested()
             success, frame = cap.read()
             if not success:
                 break
-            
+
             # 更新进度条
             pbar.update(1)
-            
+
             if save_training_data:
                 frame_annotations = []
-            
+
             current_time = frame_count / fps_safe
             results = model.predict(frame, conf=0.5, verbose=False)
             detected = False
-            
+
             for result in results:
                 for box in result.boxes:
                     cls_id = int(box.cls)
@@ -1527,7 +1666,7 @@ def detect_objects_in_video(video_path, target_class,
                             detections.append(current_time)
                             last_detected = current_time
                             detected = True
-                        
+
                         if save_crops:
                             xyxy = box.xyxy[0].cpu().numpy()
                             x1, y1, x2, y2 = map(int, xyxy)
@@ -1535,34 +1674,51 @@ def detect_objects_in_video(video_path, target_class,
                             h, w = frame.shape[:2]
                             x1, y1 = max(0, x1), max(0, y1)
                             x2, y2 = min(w, x2), min(h, y2)
-                            
+
                             if x2 > x1 and y2 > y1:  # 确保有效区域
-                                crop = frame[y1:y2, x1:x2].copy()  # 使用.copy()避免引用原始帧
+                                crop = frame[
+                                    y1:y2, x1:x2
+                                ].copy()  # 使用.copy()避免引用原始帧
                                 try:
                                     resized = cv2.resize(crop, crop_size)
                                     crops_batch.append(resized)
-                                    
+
                                     # 批处理，避免占用过多内存
                                     if len(crops_batch) >= batch_size:
                                         if save_mosaic:
                                             dir_name = os.path.dirname(video_path)
-                                            base_name = os.path.splitext(os.path.basename(video_path))[0]
-                                            save_mosaic_batch(crops_batch, batch_idx, dir_name, base_name, max_cols)
+                                            base_name = os.path.splitext(
+                                                os.path.basename(video_path)
+                                            )[0]
+                                            save_mosaic_batch(
+                                                crops_batch,
+                                                batch_idx,
+                                                dir_name,
+                                                base_name,
+                                                max_cols,
+                                            )
                                             batch_idx += 1
                                         crops_batch = []
                                         # 强制垃圾回收
                                         gc.collect()
                                 except Exception as e:
                                     print(f"处理裁剪图像时出错: {e}")
-                        
+
                         # 在帧上绘制检测框（供视频写入和窗口预览共用）
                         xyxy_draw = box.xyxy[0].cpu().numpy()
                         dx1, dy1, dx2, dy2 = map(int, xyxy_draw)
                         cv2.rectangle(frame, (dx1, dy1), (dx2, dy2), (0, 255, 0), 2)
                         label = model.names[cls_id]
-                        cv2.putText(frame, label, (dx1, max(dy1 - 6, 0)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                        
+                        cv2.putText(
+                            frame,
+                            label,
+                            (dx1, max(dy1 - 6, 0)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            (0, 255, 0),
+                            1,
+                        )
+
                         if save_training_data:
                             h, w, _ = frame.shape
                             xyxy = box.xyxy[0].cpu().numpy()
@@ -1576,53 +1732,75 @@ def detect_objects_in_video(video_path, target_class,
                                 class_index = cls_id
                             else:
                                 class_index = target_class.index(model.names[cls_id])
-                            annotation_line = f"{class_index} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}"
+                            annotation_line = (
+                                f"{class_index} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}"
+                            )
                             frame_annotations.append(annotation_line)
-            
+
             # 若本帧有检测结果，写入输出视频
             if detected:
                 if video_writer is None:
                     frame_h, frame_w = frame.shape[:2]
-                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                    video_writer = cv2.VideoWriter(video_save_path, fourcc, fps_safe, (frame_w, frame_h))
+                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                    video_writer = cv2.VideoWriter(
+                        video_save_path, fourcc, fps_safe, (frame_w, frame_h)
+                    )
                 video_writer.write(frame)
 
             if show_window and detected:
-                cv2.imshow('Detection Preview', frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
+                cv2.imshow("Detection Preview", frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
-            
+
             if save_training_data and frame_annotations:
                 video_base = os.path.splitext(os.path.basename(video_path))[0]
-                training_image_path = os.path.join(training_folder, f"{video_base}_{frame_count}.jpg")
-                training_annotation_path = os.path.splitext(training_image_path)[0] + ".txt"
+                training_image_path = os.path.join(
+                    training_folder, f"{video_base}_{frame_count}.jpg"
+                )
+                training_annotation_path = (
+                    os.path.splitext(training_image_path)[0] + ".txt"
+                )
                 cv2.imwrite(training_image_path, frame)
-                with open(training_annotation_path, 'w') as f:
+                with open(training_annotation_path, "w") as f:
                     for line in frame_annotations:
                         f.write(line + "\n")
-            
+
             frame_count += 1
-            
+
             # 每100帧清理一次内存
             if frame_count % 100 == 0:
                 # 手动触发垃圾回收
                 gc.collect()
-                
+
                 # 为减轻内存压力，暂停一小段时间
                 if frame_count % 500 == 0:
                     time.sleep(0.1)
-                
+
             # 释放当前帧
             del frame
-    
+
     except KeyboardInterrupt:
-        _save_checkpoint(video_path, next_frame=frame_count, detections=detections, last_detected=last_detected)
+        _save_checkpoint(
+            video_path,
+            next_frame=frame_count,
+            detections=detections,
+            last_detected=last_detected,
+        )
+        print(f"\nCtrl+C 已保存检查点，正在退出...")
         paused = True
+        # 释放资源后重新抛出，让调用方知道是用户中断，不要标记为已完成
+        if video_writer is not None:
+            video_writer.release()
+        cap.release()
+        pbar.close()
+        if show_window:
+            cv2.destroyAllWindows()
+        raise
     except PauseRequested:
         paused = True
     except Exception as e:
         print(f"处理视频时发生错误: {e}")
-    
+
     finally:
         # 确保资源释放
         if video_writer is not None:
@@ -1634,7 +1812,7 @@ def detect_objects_in_video(video_path, target_class,
 
     if not paused and (frame_count >= total_frames or total_frames == 0):
         _clear_checkpoint(video_path)
-    
+
     # 处理剩余的裁剪图像
     if save_mosaic and save_crops and crops_batch:
         dir_name = os.path.dirname(video_path)
@@ -1646,16 +1824,16 @@ def detect_objects_in_video(video_path, target_class,
         print(f"已保存检测帧视频至: {video_save_path}")
     else:
         print(f"未检测到目标，未生成帧视频: {os.path.basename(video_path)}")
-    
+
     # 保存检测结果
     if save_timestamps:
         txt_save_path = video_path + ".txt"
-        with open(txt_save_path, 'w') as f:
+        with open(txt_save_path, "w") as f:
             f.write("检测到目标的时间位置（秒）:\n")
             for t in detections:
                 f.write(f"{t:.2f}\n")
         print(f"已保存检测时间戳至: {txt_save_path}")
-    
+
     # 创建总拼接图
     if save_mosaic and save_crops and batch_idx > 1:
         try:
@@ -1675,7 +1853,7 @@ def detect_objects_in_video(video_path, target_class,
                 y_offset = 0
                 for img in mosaic_images:
                     h, w = img.shape[:2]
-                    final_mosaic[y_offset:y_offset+h, 0:w] = img
+                    final_mosaic[y_offset : y_offset + h, 0:w] = img
                     y_offset += h
                 final_mosaic_path = os.path.join(dir_name, f"{base_name}_mosaic.jpg")
                 cv2.imwrite(final_mosaic_path, final_mosaic)
@@ -1686,14 +1864,15 @@ def detect_objects_in_video(video_path, target_class,
                         os.remove(temp_path)
         except Exception as e:
             print(f"创建最终拼接图时出错: {e}")
-    
+
     # 清理内存
     gc.collect()
     return detections
 
+
 def get_yoloed_md5_path():
     # 支持路径转换；默认使用处理目标目录下的 md5_list/yoloed.txt
-    yoloed_path = _get_env_path('FINDINVIDEO_YOLOED_PATH')
+    yoloed_path = _get_env_path("FINDINVIDEO_YOLOED_PATH")
     if not yoloed_path:
         base_dir = _PROCESSING_ROOT_DIR
         if not base_dir:
@@ -1701,8 +1880,8 @@ def get_yoloed_md5_path():
                 base_dir = os.path.dirname(os.path.abspath(__file__))
             except Exception:
                 base_dir = os.getcwd()
-        yoloed_path = os.path.join(base_dir, 'md5_list', 'yoloed.txt')
-    if os.name == 'posix':
+        yoloed_path = os.path.join(base_dir, "md5_list", "yoloed.txt")
+    if os.name == "posix":
         yoloed_path = windows_path_to_wsl(yoloed_path)
         if yoloed_path:
             yoloed_path = normalize_posix_path_with_fs(yoloed_path)
@@ -1721,25 +1900,25 @@ def get_file_md5(file_path):
             if variant and variant not in seen:
                 seen.add(variant)
                 yield variant
-        if os.name == 'posix':
+        if os.name == "posix":
             win = wsl_path_to_windows(original)
             if win and win not in seen:
                 seen.add(win)
                 yield win
 
-    short_dir = '/tmp/findinvideo_md5'
+    short_dir = "/tmp/findinvideo_md5"
 
     def open_stream(path):
         hash_md5 = hashlib.md5()
-        with open(path, 'rb') as fh:
-            for chunk in iter(lambda: fh.read(1024 * 1024), b''):
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
                 hash_md5.update(chunk)
         return hash_md5.hexdigest()
 
     def attempt_symlink(path):
         os.makedirs(short_dir, exist_ok=True)
-        ext = os.path.splitext(path)[1] or ''
-        hashed = hashlib.md5(path.encode('utf-8', 'ignore')).hexdigest()
+        ext = os.path.splitext(path)[1] or ""
+        hashed = hashlib.md5(path.encode("utf-8", "ignore")).hexdigest()
         link_path = os.path.join(short_dir, hashed + ext)
         try:
             if os.path.exists(link_path):
@@ -1753,13 +1932,20 @@ def get_file_md5(file_path):
         win_src = path if is_windows_style_path(path) else wsl_path_to_windows(path)
         if not win_src:
             return None
-        win_src = win_src.replace('/', '\\')
-        ext = os.path.splitext(win_src)[1] or '.bin'
-        hashed = hashlib.md5(win_src.encode('utf-8', 'ignore')).hexdigest()
-        base = os.environ.get('FINDINVIDEO_WIN_TEMP', r'C:\Temp\findinvideo_md5') or r'C:\Temp\findinvideo_md5'
-        base = base.replace('/', '\\').rstrip('\\') or r'C:\Temp\findinvideo_md5'
+        win_src = win_src.replace("/", "\\")
+        ext = os.path.splitext(win_src)[1] or ".bin"
+        hashed = hashlib.md5(win_src.encode("utf-8", "ignore")).hexdigest()
+        base = (
+            os.environ.get("FINDINVIDEO_WIN_TEMP", r"C:\Temp\findinvideo_md5")
+            or r"C:\Temp\findinvideo_md5"
+        )
+        base = base.replace("/", "\\").rstrip("\\") or r"C:\Temp\findinvideo_md5"
         drive, tail = ntpath.splitdrive(base)
-        base = ntpath.join('C:\\', base.lstrip('\\')) if not drive else ntpath.normpath(drive + tail)
+        base = (
+            ntpath.join("C:\\", base.lstrip("\\"))
+            if not drive
+            else ntpath.normpath(drive + tail)
+        )
         dest_win = ntpath.normpath(ntpath.join(base, hashed + ext))
         dest_dir = ntpath.dirname(dest_win)
 
@@ -1778,8 +1964,18 @@ def get_file_md5(file_path):
             "Copy-Item -LiteralPath $src -Destination $dst -Force"
         )
         try:
-            subprocess.run(["powershell", "-NoProfile", "-Command", ensure_script], check=True, capture_output=True, text=True)
-            subprocess.run(["powershell", "-NoProfile", "-Command", copy_script], check=True, capture_output=True, text=True)
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ensure_script],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command", copy_script],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
         except subprocess.CalledProcessError as exc:
             print(f"复制文件用于MD5失败: {exc}")
             return None
@@ -1794,7 +1990,7 @@ def get_file_md5(file_path):
             last_error = e
         except OSError as e:
             last_error = e
-            if os.name == 'posix':
+            if os.name == "posix":
                 link = attempt_symlink(candidate)
                 if link:
                     try:
@@ -1820,7 +2016,11 @@ def get_file_md5_cached(file_path):
         return None
     try:
         st = os.stat(file_path)
-        key = (str(file_path), int(getattr(st, 'st_size', 0) or 0), float(getattr(st, 'st_mtime', 0.0) or 0.0))
+        key = (
+            str(file_path),
+            int(getattr(st, "st_size", 0) or 0),
+            float(getattr(st, "st_mtime", 0.0) or 0.0),
+        )
     except Exception:
         key = (str(file_path), None, None)
     cached = _FILE_MD5_CACHE.get(key)
@@ -1832,6 +2032,7 @@ def get_file_md5_cached(file_path):
         _FILE_MD5_CACHE.clear()
     _FILE_MD5_CACHE[key] = digest
     return digest
+
 
 def ensure_yoloed_storage():
     path = get_yoloed_md5_path()
@@ -1846,14 +2047,19 @@ def ensure_yoloed_storage():
             return None
     if not os.path.exists(path):
         try:
-            open(path, 'a', encoding='utf-8').close()
+            open(path, "a", encoding="utf-8").close()
         except Exception as e:
             print(f"初始化MD5存储文件失败: {e}")
             return None
     return path
 
+
 def load_yoloed_md5(reload=False):
-    global _YOLOED_MD5_CACHE, _YOLOED_MD5_CACHE_MTIME, _YOLOED_PATH_CACHE, _YOLOED_BASENAME_CACHE
+    global \
+        _YOLOED_MD5_CACHE, \
+        _YOLOED_MD5_CACHE_MTIME, \
+        _YOLOED_PATH_CACHE, \
+        _YOLOED_BASENAME_CACHE
     path = ensure_yoloed_storage()
     if not path:
         _YOLOED_MD5_CACHE = set()
@@ -1880,12 +2086,12 @@ def load_yoloed_md5(reload=False):
     path_set = set()
     basename_map = {}  # filename.lower() → set of (parent_dir_basename.lower(),)
     try:
-        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
                 entry = line.strip()
                 if not entry:
                     continue
-                parts = entry.split('|', 1)
+                parts = entry.split("|", 1)
                 md5_part = parts[0].strip()
                 if md5_part:
                     md5_set.add(md5_part)
@@ -1900,18 +2106,26 @@ def load_yoloed_md5(reload=False):
                             path_set.add(canon)
                         # 构建 basename 索引：文件名 → 所属父目录名集合
                         # 使用 '/' 和 '\\' 通用分割，兼容 WSL/Windows 路径
-                        _normalized = raw_path.replace('\\', '/')
-                        _parts_list = _normalized.rsplit('/', 2)
+                        _normalized = raw_path.replace("\\", "/")
+                        _parts_list = _normalized.rsplit("/", 2)
                         if len(_parts_list) >= 2:
                             _fname = _parts_list[-1].lower()
                             _parent = _parts_list[-2].lower()
                             if _fname:
                                 basename_map.setdefault(_fname, set()).add(_parent)
                         # 跨平台: 若为 WSL 路径 (/mnt/<drive>/...), 同时生成 Windows 盘符 + UNC 变体
-                        if raw_path.startswith('/mnt/') and len(raw_path) > 5 and raw_path[5].isalpha():
+                        if (
+                            raw_path.startswith("/mnt/")
+                            and len(raw_path) > 5
+                            and raw_path[5].isalpha()
+                        ):
                             _drv = raw_path[5]
-                            _rest = raw_path[6:].lstrip('/').replace('/', '\\')
-                            _win = f"{_drv.upper()}:\\{_rest}" if _rest else f"{_drv.upper()}:\\"
+                            _rest = raw_path[6:].lstrip("/").replace("/", "\\")
+                            _win = (
+                                f"{_drv.upper()}:\\{_rest}"
+                                if _rest
+                                else f"{_drv.upper()}:\\"
+                            )
                             path_set.add(_win)
                             _win_norm = os.path.normpath(_win)
                             path_set.add(_win_norm)
@@ -1926,16 +2140,21 @@ def load_yoloed_md5(reload=False):
     _YOLOED_MD5_CACHE_MTIME = mtime
     return _YOLOED_MD5_CACHE
 
+
 def append_yoloed_md5(md5, file_path=None):
-    global _YOLOED_MD5_CACHE, _YOLOED_MD5_CACHE_MTIME, _YOLOED_PATH_CACHE, _YOLOED_BASENAME_CACHE
+    global \
+        _YOLOED_MD5_CACHE, \
+        _YOLOED_MD5_CACHE_MTIME, \
+        _YOLOED_PATH_CACHE, \
+        _YOLOED_BASENAME_CACHE
     path = ensure_yoloed_storage()
     try:
-        lock_path = path + '.lock'
+        lock_path = path + ".lock"
         release = _with_lockfile(lock_path, timeout_seconds=30, stale_seconds=3600)
         entry = md5 if not file_path else f"{md5}|{file_path}"
         try:
-            with open(path, 'a', encoding='utf-8', errors='ignore') as f:
-                f.write(entry + '\n')
+            with open(path, "a", encoding="utf-8", errors="ignore") as f:
+                f.write(entry + "\n")
         finally:
             release()
 
@@ -1954,17 +2173,17 @@ def append_yoloed_md5(md5, file_path=None):
             if canon:
                 _YOLOED_PATH_CACHE.add(canon)
             # 维护 basename 缓存
-            _normalized = _fp.replace('\\', '/')
-            _parts_list = _normalized.rsplit('/', 2)
+            _normalized = _fp.replace("\\", "/")
+            _parts_list = _normalized.rsplit("/", 2)
             if len(_parts_list) >= 2:
                 _fname = _parts_list[-1].lower()
                 _parent = _parts_list[-2].lower()
                 if _fname:
                     _YOLOED_BASENAME_CACHE.setdefault(_fname, set()).add(_parent)
             # 跨平台: WSL 路径同时添加 Windows 变体
-            if _fp.startswith('/mnt/') and len(_fp) > 5 and _fp[5].isalpha():
+            if _fp.startswith("/mnt/") and len(_fp) > 5 and _fp[5].isalpha():
                 _drv = _fp[5]
-                _rest = _fp[6:].lstrip('/').replace('/', '\\')
+                _rest = _fp[6:].lstrip("/").replace("/", "\\")
                 _win = f"{_drv.upper()}:\\{_rest}" if _rest else f"{_drv.upper()}:\\"
                 _YOLOED_PATH_CACHE.add(_win)
                 _YOLOED_PATH_CACHE.add(os.path.normpath(_win))
@@ -1985,8 +2204,8 @@ def should_process(file_path):
         return None
     basename_cache = _YOLOED_BASENAME_CACHE or {}
     if basename_cache:
-        _fp = str(file_path).replace('\\', '/')
-        _parts_list = _fp.rsplit('/', 2)
+        _fp = str(file_path).replace("\\", "/")
+        _parts_list = _fp.rsplit("/", 2)
         if len(_parts_list) >= 2:
             _fname = _parts_list[-1].lower()
             _parent = _parts_list[-2].lower()
@@ -2002,10 +2221,10 @@ def should_process(file_path):
     if md5 in yoloed_md5:
         return None
     if DIRECTORY_INDEX.is_video_claimed(md5):
-        print(f'视频已被其他机器声明，跳过: {file_path}')
+        print(f"视频已被其他机器声明，跳过: {file_path}")
         return None
     if not DIRECTORY_INDEX.try_claim_video(md5, file_path):
-        print(f'无法声明视频，跳过: {file_path}')
+        print(f"无法声明视频，跳过: {file_path}")
         return None
     return md5
 
@@ -2024,6 +2243,7 @@ def is_path_already_yoloed(file_path):
         candidates.append(canon)
     return any(c in _YOLOED_PATH_CACHE for c in candidates)
 
+
 def _record_video_processed(video_path, detections):
     """将已处理的视频记录到数据库和yoloed.txt中（确保零检测视频也不会被重复处理）。"""
     try:
@@ -2034,13 +2254,16 @@ def _record_video_processed(video_path, detections):
                 file_md5=md5,
                 video_path=str(video_path),
                 detection_count=detection_count,
-                model_name='yolov11l-face'
+                model_name="yolov11l-face",
             )
             # 同时写入yoloed.txt以保持向后兼容
             append_yoloed_md5(md5, file_path=video_path)
-            print(f'已记录视频处理完成（检测数={detection_count}）: {os.path.basename(video_path)}')
+            print(
+                f"已记录视频处理完成（检测数={detection_count}）: {os.path.basename(video_path)}"
+            )
     except Exception as e:
-        print(f'记录视频处理状态失败: {e}')
+        print(f"记录视频处理状态失败: {e}")
+
 
 def _mark_directory_done(dir_path, video_file_names):
     """将目录标记为已全部处理，并将MD5缓存中已有的视频批量写入数据库和yoloed.txt（双重保险）。"""
@@ -2054,8 +2277,11 @@ def _mark_directory_done(dir_path, video_file_names):
             # 构造与 get_file_md5_cached 相同格式的缓存键
             try:
                 st = os.stat(vf_path)
-                cache_key = (str(vf_path), int(getattr(st, 'st_size', 0) or 0),
-                             float(getattr(st, 'st_mtime', 0.0) or 0.0))
+                cache_key = (
+                    str(vf_path),
+                    int(getattr(st, "st_size", 0) or 0),
+                    float(getattr(st, "st_mtime", 0.0) or 0.0),
+                )
             except (OSError, PermissionError):
                 cache_key = (str(vf_path), None, None)
             cached_md5 = _FILE_MD5_CACHE.get(cache_key)
@@ -2065,19 +2291,21 @@ def _mark_directory_done(dir_path, video_file_names):
                     file_md5=cached_md5,
                     video_path=vf_path,
                     detection_count=-1,  # -1 表示"通过衍生文件/跳过逻辑确认已处理，非本次检测"
-                    model_name=None
+                    model_name=None,
                 )
                 append_yoloed_md5(cached_md5, file_path=vf_path)
                 batch_count += 1
         if batch_count > 0:
-            print(f'已将 {batch_count} 个视频的处理记录写入数据库和yoloed.txt')
+            print(f"已将 {batch_count} 个视频的处理记录写入数据库和yoloed.txt")
     except Exception as e:
-        print(f'标记目录完成状态失败: {e}')
+        print(f"标记目录完成状态失败: {e}")
 
 
-def process_directory_videos(dir_path, target_item, all_objects_switch=False, skip_long_videos=True):
+def process_directory_videos(
+    dir_path, target_item, all_objects_switch=False, skip_long_videos=True
+):
     """处理目录中的所有视频文件。返回实际处理的视频数量（0 表示全部跳过）。"""
-    if os.name == 'posix' and is_windows_style_path(dir_path):
+    if os.name == "posix" and is_windows_style_path(dir_path):
         converted = windows_path_to_wsl(dir_path)
         if converted:
             dir_path = normalize_posix_path_with_fs(converted)
@@ -2127,31 +2355,34 @@ def process_directory_videos(dir_path, target_item, all_objects_switch=False, sk
             fps = cap.get(cv2.CAP_PROP_FPS)
             frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
             cap.release()
-            duration = frame_count / fps if fps > 0 else float('inf')
+            duration = frame_count / fps if fps > 0 else float("inf")
 
             if duration <= 3600:  # 小于等于1小时的视频
                 video_files.append((file_path, duration))
             else:
                 print(f"视频时长 {duration:.2f}秒超过一小时，跳过处理: {file_path}")
-    
+
     if not video_files:
         if unprocessed_videos:
             print(f"目录中剩余 {len(unprocessed_videos)} 个视频经精确检查后均无需处理")
         _mark_directory_done(dir_path, video_file_names)
         return 0
-    
+
     # 处理视频文件
     for video_file, duration in video_files:
-        if duration == float('inf'):
+        if duration == float("inf"):
             print(f"提示: 无法获取视频时长，仍尝试处理: {video_file}")
         print(f"开始处理视频文件: {video_file}")
-        detections = detect_objects_in_video(video_file, target_item,
-                                show_window=False,
-                                save_crops=True,
-                                save_training_data=False,
-                                all_objects=all_objects_switch,
-                                save_mosaic=save_mosaic_switch,
-                                save_timestamps=save_timestamps_switch)
+        detections = detect_objects_in_video(
+            video_file,
+            target_item,
+            show_window=False,
+            save_crops=True,
+            save_training_data=False,
+            all_objects=all_objects_switch,
+            save_mosaic=save_mosaic_switch,
+            save_timestamps=save_timestamps_switch,
+        )
         _record_video_processed(video_file, detections)
         # 视频处理完成后强制垃圾回收
         gc.collect()
@@ -2162,14 +2393,15 @@ def process_directory_videos(dir_path, target_item, all_objects_switch=False, sk
     _mark_directory_done(dir_path, video_file_names)
     return len(video_files)
 
+
 if __name__ == "__main__":
     video_path = r"E:\z"  # 可设置为视频文件或目录
-    
+
     # 检查路径是否存在
     if not os.path.exists(video_path):
         print(f"错误: 路径不存在: {video_path}")
         exit(1)
-    
+
     # 如果传入的是目录但目录为空或无视频文件，给出提示
     if os.path.isdir(video_path):
         try:
@@ -2185,14 +2417,14 @@ if __name__ == "__main__":
     all_objects_switch = False  # 设置为 True 表示显示所有检测对象
     save_mosaic_switch = False  # 设置为 True 启用拼接图片保存
     save_timestamps_switch = False  # 设置为 True 启用检测时间戳txt保存
-    
+
     # 初始化处理根目录，数据库和yoloed.txt都放在 <video_path>/md5_list/ 下
     _root = video_path if os.path.isdir(video_path) else os.path.dirname(video_path)
     _init_processing_root(_root)
-    
+
     # 新增功能：按叶子节点视频数量排序处理
     use_leaf_node_processing = True  # 设置为 True 启用叶子节点处理模式
-    
+
     if use_leaf_node_processing and os.path.isdir(video_path):
         print(f"启用叶子节点处理模式，正在扫描目录: {video_path}")
         print("正在查找包含视频文件的叶子节点目录...")
@@ -2202,7 +2434,9 @@ if __name__ == "__main__":
             print(f"\n=== 处理根目录: {video_path} ({root_video_count} 个视频) ===")
             process_directory_videos(video_path, target_item, all_objects_switch)
 
-        leaf_dirs = find_leaf_directories_with_videos(video_path, EXCLUDE_PATHS, refresh_index=True)
+        leaf_dirs = find_leaf_directories_with_videos(
+            video_path, EXCLUDE_PATHS, refresh_index=True
+        )
 
         if not leaf_dirs:
             print(f"未找到包含视频文件的叶子节点目录")
@@ -2213,9 +2447,9 @@ if __name__ == "__main__":
             print(f"\n找到 {len(leaf_dirs)} 个包含视频文件的叶子节点目录:")
             for i, (dir_path, video_count, all_processed) in enumerate(leaf_dirs, 1):
                 relative_path = _safe_relpath(dir_path, video_path)
-                status = ' [已处理]' if all_processed else ''
+                status = " [已处理]" if all_processed else ""
                 print(f"{i:3d}. {relative_path} ({video_count} 个视频文件){status}")
-            
+
             print(f"\n开始按视频数量从多到少的顺序处理叶子节点目录...")
 
             # 按顺序处理每个叶子目录
@@ -2224,9 +2458,13 @@ if __name__ == "__main__":
             yoloed_skipped = 0
             _diag_count = 0  # 诊断计数器：只对前几个未跳过的目录输出详细信息
             _yoloed_path_count = len(_YOLOED_PATH_CACHE) if _YOLOED_PATH_CACHE else 0
-            _yoloed_basename_count = len(_YOLOED_BASENAME_CACHE) if _YOLOED_BASENAME_CACHE else 0
-            print(f'[诊断] yoloed.txt 缓存状态: {len(_YOLOED_MD5_CACHE or set())} 条MD5, '
-                  f'{_yoloed_path_count} 条路径, {_yoloed_basename_count} 个文件名索引')
+            _yoloed_basename_count = (
+                len(_YOLOED_BASENAME_CACHE) if _YOLOED_BASENAME_CACHE else 0
+            )
+            print(
+                f"[诊断] yoloed.txt 缓存状态: {len(_YOLOED_MD5_CACHE or set())} 条MD5, "
+                f"{_yoloed_path_count} 条路径, {_yoloed_basename_count} 个文件名索引"
+            )
             for i, (dir_path, video_count, all_processed) in enumerate(leaf_dirs, 1):
                 relative_path = _safe_relpath(dir_path, video_path)
 
@@ -2255,35 +2493,52 @@ if __name__ == "__main__":
                 # 诊断输出：前3个未跳过的目录打印详细原因
                 if _diag_count < 3:
                     _diag_count += 1
-                    _diag_dir_info = f'dir_info={dir_info}, all_processed={all_processed}'
-                    print(f'[诊断 {_diag_count}/3] 未跳过: {relative_path}')
-                    print(f'  DB层: {_diag_dir_info}')
+                    _diag_dir_info = (
+                        f"dir_info={dir_info}, all_processed={all_processed}"
+                    )
+                    print(f"[诊断 {_diag_count}/3] 未跳过: {relative_path}")
+                    print(f"  DB层: {_diag_dir_info}")
                     try:
                         _diag_files = os.listdir(dir_path)
                         _diag_videos = [f for f in _diag_files if is_video_file(f)]
-                        _diag_dir_bn = os.path.basename(dir_path.rstrip(os.sep + '/')).lower()
-                        print(f'  目录basename: {_diag_dir_bn}, 视频数: {len(_diag_videos)}')
+                        _diag_dir_bn = os.path.basename(
+                            dir_path.rstrip(os.sep + "/")
+                        ).lower()
+                        print(
+                            f"  目录basename: {_diag_dir_bn}, 视频数: {len(_diag_videos)}"
+                        )
                         for _dv in _diag_videos[:3]:  # 最多显示3个视频的匹配情况
                             _dv_path = os.path.join(dir_path, _dv)
                             _dv_lower = _dv.lower()
-                            _in_path_cache = (str(_dv_path) in (_YOLOED_PATH_CACHE or set())
-                                              or os.path.normpath(str(_dv_path)) in (_YOLOED_PATH_CACHE or set()))
+                            _in_path_cache = str(_dv_path) in (
+                                _YOLOED_PATH_CACHE or set()
+                            ) or os.path.normpath(str(_dv_path)) in (
+                                _YOLOED_PATH_CACHE or set()
+                            )
                             _bn_parents = (_YOLOED_BASENAME_CACHE or {}).get(_dv_lower)
                             _bn_match = _bn_parents and _diag_dir_bn in _bn_parents
-                            print(f'  视频 {_dv}: 路径缓存={_in_path_cache}, '
-                                  f'basename索引={_bn_parents is not None}(父目录匹配={_bn_match})')
+                            print(
+                                f"  视频 {_dv}: 路径缓存={_in_path_cache}, "
+                                f"basename索引={_bn_parents is not None}(父目录匹配={_bn_match})"
+                            )
                             if _bn_parents and not _bn_match:
                                 # 显示实际存储的父目录名与当前目录名的差异
                                 _sample_parents = list(_bn_parents)[:3]
-                                print(f'    yoloed中的父目录: {_sample_parents}, 当前目录: {_diag_dir_bn}')
+                                print(
+                                    f"    yoloed中的父目录: {_sample_parents}, 当前目录: {_diag_dir_bn}"
+                                )
                     except Exception as _de:
-                        print(f'  诊断读取失败: {_de}')
+                        print(f"  诊断读取失败: {_de}")
 
-                print(f"\n=== [{i}/{len(leaf_dirs)}] {relative_path} ({video_count} 个视频) ===")
-                actually_processed = process_directory_videos(dir_path, target_item, all_objects_switch)
+                print(
+                    f"\n=== [{i}/{len(leaf_dirs)}] {relative_path} ({video_count} 个视频) ==="
+                )
+                actually_processed = process_directory_videos(
+                    dir_path, target_item, all_objects_switch
+                )
                 if actually_processed == 0:
                     yoloed_skipped += 1
-                
+
                 # 每处理完一个目录后强制垃圾回收
                 gc.collect()
                 # 让系统有时间释放资源
@@ -2293,16 +2548,18 @@ if __name__ == "__main__":
             if total_skipped > 0:
                 parts = []
                 if db_skipped > 0:
-                    parts.append(f'数据库快速跳过 {db_skipped} 个')
+                    parts.append(f"数据库快速跳过 {db_skipped} 个")
                 if fs_skipped > 0:
-                    parts.append(f'衍生文件跳过 {fs_skipped} 个')
+                    parts.append(f"衍生文件跳过 {fs_skipped} 个")
                 if yoloed_skipped > 0:
-                    parts.append(f'yoloed/MD5跳过 {yoloed_skipped} 个')
-                print(f"\n共跳过 {total_skipped}/{len(leaf_dirs)} 个目录（{', '.join(parts)}）")
-    
+                    parts.append(f"yoloed/MD5跳过 {yoloed_skipped} 个")
+                print(
+                    f"\n共跳过 {total_skipped}/{len(leaf_dirs)} 个目录（{', '.join(parts)}）"
+                )
+
     # 原有的处理逻辑（当 use_leaf_node_processing 为 False 时使用）
     elif os.path.isdir(video_path):
-        video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv']
+        video_extensions = [".mp4", ".avi", ".mov", ".mkv", ".wmv"]
         for root, dirs, files in os.walk(video_path):
             for file in files:
                 ext = os.path.splitext(file)[1].lower()
@@ -2315,25 +2572,30 @@ if __name__ == "__main__":
                         if not cap.isOpened():
                             print(f"无法打开视频: {file_path}")
                             continue
-                            
+
                         fps = cap.get(cv2.CAP_PROP_FPS)
                         frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
                         cap.release()
-                        duration = frame_count / fps if fps > 0 else float('inf')
+                        duration = frame_count / fps if fps > 0 else float("inf")
                         if duration > 3600:
-                            print(f"视频时长 {duration:.2f}秒超过一小时，跳过处理: {file_path}")
+                            print(
+                                f"视频时长 {duration:.2f}秒超过一小时，跳过处理: {file_path}"
+                            )
                             continue
-                        
+
                         print(f"开始处理视频文件: {file_path}")
-                        detections = detect_objects_in_video(file_path, target_item,
-                                                show_window=False,
-                                                save_crops=True,
-                                                save_training_data=False,
-                                                all_objects=all_objects_switch,
-                                                save_mosaic=save_mosaic_switch,
-                                                save_timestamps=save_timestamps_switch)
+                        detections = detect_objects_in_video(
+                            file_path,
+                            target_item,
+                            show_window=False,
+                            save_crops=True,
+                            save_training_data=False,
+                            all_objects=all_objects_switch,
+                            save_mosaic=save_mosaic_switch,
+                            save_timestamps=save_timestamps_switch,
+                        )
                         _record_video_processed(file_path, detections)
-                        
+
                         # 强制垃圾回收
                         gc.collect()
                         time.sleep(1)
@@ -2348,19 +2610,22 @@ if __name__ == "__main__":
             fps = cap.get(cv2.CAP_PROP_FPS)
             frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
             cap.release()
-            duration = frame_count / fps if fps > 0 else float('inf')
+            duration = frame_count / fps if fps > 0 else float("inf")
             if duration > 3600:
                 print(f"视频时长 {duration:.2f}秒超过一小时，跳过处理: {video_path}")
             else:
                 md5 = should_process(video_path)
                 if md5:
-                    detections = detect_objects_in_video(video_path, target_item,
-                                           show_window=False,
-                                           save_crops=True,
-                                            save_training_data=False,
-                                           all_objects=all_objects_switch,
-                                           save_mosaic=save_mosaic_switch,
-                                           save_timestamps=save_timestamps_switch)
+                    detections = detect_objects_in_video(
+                        video_path,
+                        target_item,
+                        show_window=False,
+                        save_crops=True,
+                        save_training_data=False,
+                        all_objects=all_objects_switch,
+                        save_mosaic=save_mosaic_switch,
+                        save_timestamps=save_timestamps_switch,
+                    )
                     _record_video_processed(video_path, detections)
                 else:
                     print(f"已存在拼接图片，跳过处理: {video_path}")
