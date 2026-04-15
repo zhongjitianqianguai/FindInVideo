@@ -1,4 +1,4 @@
-"""用 ffmpeg 剪辑静音视频片段并压缩到 480p，便于上传 Telegram"""
+"""用 ffmpeg 剪辑静音视频片段，保留原分辨率，便于上传 Telegram"""
 
 import os
 import sys
@@ -96,7 +96,7 @@ def time_to_filename_safe(seconds):
 
 def clip_video_for_upload_telegram(video_path, start_seconds, end_seconds):
     """
-    用 ffmpeg 从 video_path 中剪出静音片段，并压缩为 480p。
+    用 ffmpeg 从 video_path 中剪出静音片段，保留原分辨率。
     适合上传 Telegram。
     """
     if not os.path.isfile(video_path):
@@ -114,12 +114,12 @@ def clip_video_for_upload_telegram(video_path, start_seconds, end_seconds):
 
     start_tag = time_to_filename_safe(start_seconds)
     end_tag = time_to_filename_safe(end_seconds)
-    out_name = f'{video_stem}_{start_tag}-{end_tag}_telegram_480p{video_ext}'
+    out_name = f'{video_stem}_{start_tag}-{end_tag}_telegram{video_ext}'
     out_path = os.path.join(video_dir, out_name)
 
     print(f'剪辑范围：{seconds_to_display(start_seconds)} → {seconds_to_display(end_seconds)}')
     print(f'片段时长：{duration:.3f}s')
-    print('输出模式：静音 + 压缩到 480p')
+    print('输出模式：静音 + 保持原分辨率')
     print(f'输出文件：{out_path}')
     print()
 
@@ -129,7 +129,6 @@ def clip_video_for_upload_telegram(video_path, start_seconds, end_seconds):
         '-ss', seconds_to_ffmpeg_time(start_seconds),
         '-i', video_path,
         '-t', str(duration),
-        '-vf', 'scale=-2:480:flags=lanczos',
         '-c:v', 'libx264',
         '-preset', 'medium',
         '-crf', '28',
@@ -140,7 +139,7 @@ def clip_video_for_upload_telegram(video_path, start_seconds, end_seconds):
         '-y'
     ]
 
-    print('正在生成 Telegram 上传版片段...')
+    print('正在生成 Telegram 上传版片段（原分辨率）...')
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8')
         if result.returncode != 0:
@@ -161,7 +160,7 @@ def clip_video_for_upload_telegram(video_path, start_seconds, end_seconds):
 def main():
     """主入口：交互式获取视频路径、开始时间、结束时间"""
     print('=== Telegram 上传视频剪辑工具 ===')
-    print('从视频中剪出指定时间范围的静音片段，并压缩为 480p')
+    print('从视频中剪出指定时间范围的静音片段，并保持原分辨率')
     print()
 
     if not os.path.isfile(FFMPEG):
