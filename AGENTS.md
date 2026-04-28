@@ -24,6 +24,12 @@ pip install ultralytics         # For main.py (YOLOv11)
 ```bash
 python main.py              # YOLOv11 entry point (recommended)
 python main_yolov5.py       # YOLOv5 entry point
+python main_nipple.py       # YOLOv11 with custom model
+python main_nipple_rog.py   # YOLOv11 with custom model (ROG variant)
+python main_image.py        # YOLOv11 image detection (not video)
+python main_image_yolov5.py # YOLOv5 image detection
+python clip_video.py        # ffmpeg-based video clipping utility
+python extract_frames.py    # Extract frames from video by timestamp
 python estimate_remaining_time.py --root D:\z   # ETA utility
 ```
 
@@ -47,39 +53,39 @@ ruff check . --fix
 ## Project Structure
 ```
 FindInVideo/
-├── main.py                     # Main entry, YOLOv11 (ultralytics), ~1556 lines
-├── main_yolov5.py              # YOLOv5 entry point, ~1493 lines
-├── main_restored.py            # Non-functional decompilation artifact (ignore)
+├── main.py                     # Main entry, YOLOv11 (ultralytics), ~2631 lines
+├── main_yolov5.py              # YOLOv5 entry point, ~1492 lines
+├── main_nipple.py              # YOLOv11 with custom nipple model, ~2080 lines
+├── main_nipple_rog.py          # Same as above, ROG variant, ~1819 lines
+├── main_image.py               # YOLOv11 image-only detection, ~293 lines
+├── main_image_yolov5.py        # YOLOv5 image-only detection, ~346 lines
+├── clip_video.py               # ffmpeg video clipping CLI, ~253 lines
+├── extract_frames.py           # Frame extraction + clipping CLI, ~414 lines
 ├── estimate_remaining_time.py  # CLI tool for processing time estimation
+├── main_restored.py            # Non-functional decompilation artifact (ignore)
 ├── yolov5/                     # YOLOv5 git submodule (external code)
-│   ├── detect.py, train.py, ...
-│   ├── requirements.txt
-│   └── utils/, models/, data/
 ├── models/                     # YOLO model weights (.pt files)
-├── md5_list/                   # Processed-files MD5 tracking
 ├── logs/                       # Runtime logs (crash.log, run.log)
-├── training_data/              # Training data output
-└── run_main.bat, run_main_yolov5.bat  # Windows launchers
+└── run_main*.bat               # Windows launchers
 ```
 
-Note: `main.py` and `main_yolov5.py` contain significant duplicated code (path utils, MD5, checkpoint system, artifact naming, directory traversal).
+Note: `main.py`, `main_yolov5.py`, `main_nipple.py`, and `main_nipple_rog.py` contain significant duplicated code (path utils, MD5, checkpoint system, artifact naming, directory traversal, `DirectoryIndex` class).
 
 ## Code Style Guidelines
 
 ### Imports
-- Standard library first, third-party second, local last
-- Blank lines between groups are not strictly enforced but preferred
+- The codebase does NOT strictly sort imports; third-party imports often appear before stdlib
+- When adding code, follow the existing pattern in each file: group related imports together
 ```python
-import os
-import sys
-import json
-
+from ultralytics import YOLO
 import cv2
 import numpy as np
-import torch
+import os
+import hashlib
+import json
+import sqlite3
 from tqdm import tqdm
-
-from yolov5.utils.general import non_max_suppression
+import gc
 ```
 
 ### Formatting
@@ -99,8 +105,7 @@ from yolov5.utils.general import non_max_suppression
 
 ### Comments and Strings
 - **Chinese** is the primary language for inline comments and print/log messages
-- English is used for AGENTS.md and README
-- Docstrings use triple double quotes, content often in Chinese (e.g., `"""检查文件是否为视频文件"""`)
+- Docstrings use triple double quotes, content in Chinese (e.g., `"""检查文件是否为视频文件"""`)
 - Keep comments current with the code
 
 ### Error Handling
