@@ -15,6 +15,9 @@ from ctypes import wintypes
 from tqdm import tqdm
 import gc  # 导入垃圾回收模块
 import time
+import signal
+import logging
+import traceback
 
 _PROCESSING_ROOT_DIR = None
 _YOLOED_MD5_CACHE = None
@@ -22,6 +25,10 @@ _YOLOED_MD5_CACHE_MTIME = None
 _YOLOED_PATH_CACHE = None
 _YOLOED_BASENAME_CACHE = {}  # basename.lower() → set of parent dir basenames (用于目录级快速跳过)
 _FILE_MD5_CACHE = {}
+_STOP_REQUESTED = False
+_LOGGER = logging.getLogger(__name__)
+
+CLAIM_HEARTBEAT_INTERVAL_FRAMES = 100
 
 
 def is_windows_style_path(path):
@@ -439,11 +446,13 @@ class DirectoryIndex:
                             file_md5 TEXT PRIMARY KEY,
                             video_path TEXT,
                             claimed_at REAL,
+                            heartbeat_at REAL,
                             host_name TEXT,
                             pid INTEGER
                         )
                         """
                     )
+                    self._ensure_claim_schema_compat()
                 return  # 成功创建表结构
             except sqlite3.OperationalError as e:
                 if self._is_lock_error(e):
@@ -460,6 +469,16 @@ class DirectoryIndex:
             self.conn.close()
         except sqlite3.Error:
             pass
+
+    def _ensure_claim_schema_compat(self):
+        """为旧数据库补齐 processing_claims 新字段。"""
+        try:
+            rows = self.conn.execute("PRAGMA table_info(processing_claims)").fetchall()
+        except sqlite3.DatabaseError:
+            return
+        columns = {row["name"] if isinstance(row, sqlite3.Row) else row[1] for row in rows}
+        if "heartbeat_at" not in columns:
+            self.conn.execute("ALTER TABLE processing_claims ADD COLUMN heartbeat_at REAL")
 
     def reopen(self, new_db_path):
         """关闭当前连接并在新路径重新打开数据库。
@@ -1044,13 +1063,14 @@ class DirectoryIndex:
         try:
             self.conn.execute(
                 """
-                INSERT INTO processing_claims (file_md5, video_path, claimed_at, host_name, pid)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO processing_claims (file_md5, video_path, claimed_at, heartbeat_at, host_name, pid)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(file_md5) DO NOTHING
                 """,
                 (
                     file_md5,
                     str(video_path) if video_path else None,
+                    now,
                     now,
                     host_name,
                     pid,
@@ -1066,6 +1086,28 @@ class DirectoryIndex:
             return False
         except Exception as e:
             print(f"声明视频处理失败: {e}")
+            return False
+
+    def refresh_claim(self, file_md5):
+        """刷新当前进程持有的 claim 心跳，避免长视频处理期间被 TTL 误回收。"""
+        if not file_md5:
+            return False
+        try:
+            now = time.time()
+            host_name = socket.gethostname()
+            pid = os.getpid()
+            with self.conn:
+                cur = self.conn.execute(
+                    """
+                    UPDATE processing_claims
+                    SET heartbeat_at=?
+                    WHERE file_md5=? AND host_name=? AND pid=?
+                    """,
+                    (now, file_md5, host_name, pid),
+                )
+            return bool(cur.rowcount)
+        except Exception as e:
+            print(f"刷新视频声明心跳失败: {e}")
             return False
 
     def release_claim(self, file_md5):
@@ -1086,12 +1128,12 @@ class DirectoryIndex:
             return False
         try:
             row = self.conn.execute(
-                "SELECT host_name, pid, claimed_at FROM processing_claims WHERE file_md5=?",
+                "SELECT host_name, pid, claimed_at, heartbeat_at FROM processing_claims WHERE file_md5=?",
                 (file_md5,),
             ).fetchone()
             if not row:
                 return False
-            claimed_at = row["claimed_at"]
+            claimed_at = row["heartbeat_at"] or row["claimed_at"]
             ttl = int(os.environ.get("FINDINVIDEO_CLAIM_TTL_SECONDS", "86400"))
             if time.time() - claimed_at > ttl:
                 self.release_claim(file_md5)
@@ -1131,6 +1173,22 @@ def _truthy_env(name, default=False):
     return str(val).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+def _install_pause_signal_handler():
+    """将 Ctrl+C 转成安全暂停请求，在循环安全点统一落 checkpoint。"""
+    def _handler(signum, frame):
+        global _STOP_REQUESTED
+        _STOP_REQUESTED = True
+        try:
+            print("\n收到 Ctrl+C：将于安全点暂停、保存进度并释放声明。")
+        except Exception:
+            pass
+
+    try:
+        signal.signal(signal.SIGINT, _handler)
+    except Exception:
+        pass
+
+
 def _get_pause_file_path():
     """Return the pause flag path (best-effort)."""
     explicit = os.environ.get("FINDINVIDEO_PAUSE_FILE")
@@ -1144,6 +1202,8 @@ def _get_pause_file_path():
 
 
 def _pause_requested(pause_file_path=None):
+    if _STOP_REQUESTED:
+        return True
     path = pause_file_path or _get_pause_file_path()
     try:
         return bool(path) and os.path.exists(path)
@@ -1544,6 +1604,7 @@ def save_mosaic_batch(crops_batch, batch_idx, dir_name, base_name, max_cols=8):
 def detect_objects_in_video(
     video_path,
     target_class,
+    claim_md5=None,
     show_window=False,
     save_crops=False,
     save_training_data=False,
@@ -1769,6 +1830,8 @@ def detect_objects_in_video(
 
             # 每100帧清理一次内存
             if frame_count % 100 == 0:
+                if claim_md5:
+                    DIRECTORY_INDEX.refresh_claim(claim_md5)
                 # 手动触发垃圾回收
                 gc.collect()
 
@@ -2245,10 +2308,10 @@ def is_path_already_yoloed(file_path):
     return any(c in _YOLOED_PATH_CACHE for c in candidates)
 
 
-def _record_video_processed(video_path, detections):
-    """将已处理的视频记录到数据库和yoloed.txt中（确保零检测视频也不会被重复处理）。"""
+def _mark_video_completed(video_path, detections, file_md5=None):
+    """统一写入视频完成态，避免 completed/processed/done 多处漂移。"""
     try:
-        md5 = get_file_md5_cached(video_path)
+        md5 = file_md5 or get_file_md5_cached(video_path)
         if md5:
             detection_count = len(detections) if detections else 0
             DIRECTORY_INDEX.mark_video_processed(
@@ -2257,13 +2320,13 @@ def _record_video_processed(video_path, detections):
                 detection_count=detection_count,
                 model_name="yolov11l-face",
             )
-            # 同时写入yoloed.txt以保持向后兼容
             append_yoloed_md5(md5, file_path=video_path)
+            write_done_marker(video_path)
             print(
-                f"已记录视频处理完成（检测数={detection_count}）: {os.path.basename(video_path)}"
+                f"已写入完成状态（检测数={detection_count}）: {os.path.basename(video_path)}"
             )
     except Exception as e:
-        print(f"记录视频处理状态失败: {e}")
+        print(f"写入视频完成状态失败: {e}")
 
 
 def _release_claim_safely(file_md5):
@@ -2380,6 +2443,8 @@ def process_directory_videos(
         return 0
 
     # 处理视频文件
+    failed_videos = []
+    completed_count = 0
     for video_file, duration, md5 in video_files:
         if duration == float("inf"):
             print(f"提示: 无法获取视频时长，仍尝试处理: {video_file}")
@@ -2388,6 +2453,7 @@ def process_directory_videos(
             detections = detect_objects_in_video(
                 video_file,
                 target_item,
+                claim_md5=md5,
                 show_window=False,
                 save_crops=True,
                 save_training_data=False,
@@ -2401,19 +2467,27 @@ def process_directory_videos(
         except Exception:
             _release_claim_safely(md5)
             _LOGGER.error("Video failed: %s\n%s", video_file, traceback.format_exc())
+            failed_videos.append(video_file)
             continue
-        _record_video_processed(video_file, detections)
+        _mark_video_completed(video_file, detections, file_md5=md5)
+        completed_count += 1
         # 视频处理完成后强制垃圾回收
         gc.collect()
         # 短暂休眠，让系统有时间释放资源
         time.sleep(1)
 
+    if failed_videos:
+        print(f"本轮有 {len(failed_videos)} 个视频处理失败，目录不会标记为已完成")
+        return completed_count
+
     # 所有视频处理完成后，标记目录为已全部处理
     _mark_directory_done(dir_path, video_file_names)
-    return len(video_files)
+    return completed_count
 
 
 if __name__ == "__main__":
+    _STOP_REQUESTED = False
+    _install_pause_signal_handler()
     video_path = r"G:\z"  # 可设置为视频文件或目录
 
     # 检查路径是否存在
@@ -2607,6 +2681,7 @@ if __name__ == "__main__":
                             detections = detect_objects_in_video(
                                 file_path,
                                 target_item,
+                                claim_md5=md5,
                                 show_window=False,
                                 save_crops=True,
                                 save_training_data=False,
@@ -2625,7 +2700,7 @@ if __name__ == "__main__":
                                 traceback.format_exc(),
                             )
                             continue
-                        _record_video_processed(file_path, detections)
+                        _mark_video_completed(file_path, detections, file_md5=md5)
 
                         # 强制垃圾回收
                         gc.collect()
@@ -2651,6 +2726,7 @@ if __name__ == "__main__":
                         detections = detect_objects_in_video(
                             video_path,
                             target_item,
+                            claim_md5=md5,
                             show_window=False,
                             save_crops=True,
                             save_training_data=False,
@@ -2669,6 +2745,6 @@ if __name__ == "__main__":
                             traceback.format_exc(),
                         )
                     else:
-                        _record_video_processed(video_path, detections)
+                        _mark_video_completed(video_path, detections, file_md5=md5)
                 else:
                     print(f"已存在拼接图片，跳过处理: {video_path}")
