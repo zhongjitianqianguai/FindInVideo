@@ -15,12 +15,19 @@ from ctypes import wintypes
 from tqdm import tqdm
 import gc  # 导入垃圾回收模块
 import time
+import signal
+import logging
+import traceback
 
 _PROCESSING_ROOT_DIR = None
 _YOLOED_MD5_CACHE = None
 _YOLOED_MD5_CACHE_MTIME = None
 _YOLOED_PATH_CACHE = None
 _FILE_MD5_CACHE = {}
+_STOP_REQUESTED = False
+_LOGGER = logging.getLogger(__name__)
+
+CLAIM_HEARTBEAT_INTERVAL_FRAMES = 100
 
 
 def is_windows_style_path(path):
@@ -420,12 +427,35 @@ class DirectoryIndex:
                 CREATE INDEX IF NOT EXISTS idx_processed_videos_path ON processed_videos(video_path)
                 """
             )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS processing_claims (
+                    file_md5 TEXT PRIMARY KEY,
+                    video_path TEXT,
+                    claimed_at REAL,
+                    heartbeat_at REAL,
+                    host_name TEXT,
+                    pid INTEGER
+                )
+                """
+            )
+            self._ensure_claim_schema_compat()
 
     def close(self):
         try:
             self.conn.close()
         except sqlite3.Error:
             pass
+
+    def _ensure_claim_schema_compat(self):
+        """为旧数据库补齐 processing_claims 新字段。"""
+        try:
+            rows = self.conn.execute("PRAGMA table_info(processing_claims)").fetchall()
+        except sqlite3.DatabaseError:
+            return
+        columns = {row["name"] if isinstance(row, sqlite3.Row) else row[1] for row in rows}
+        if "heartbeat_at" not in columns:
+            self.conn.execute("ALTER TABLE processing_claims ADD COLUMN heartbeat_at REAL")
 
     def reopen(self, new_db_path):
         """关闭当前连接并在新路径重新打开数据库。"""
@@ -781,6 +811,86 @@ class DirectoryIndex:
         except Exception:
             return False
 
+    def try_claim_video(self, file_md5, video_path):
+        """尝试声明视频为正在处理状态，防止多机器同时处理同一文件。"""
+        if not file_md5:
+            return False
+        now = time.time()
+        host_name = socket.gethostname()
+        pid = os.getpid()
+        try:
+            self.conn.execute(
+                """
+                INSERT INTO processing_claims (file_md5, video_path, claimed_at, heartbeat_at, host_name, pid)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(file_md5) DO NOTHING
+                """,
+                (file_md5, str(video_path) if video_path else None, now, now, host_name, pid),
+            )
+            self.conn.commit()
+            row = self.conn.execute(
+                "SELECT host_name, pid FROM processing_claims WHERE file_md5=?",
+                (file_md5,),
+            ).fetchone()
+            if row and row["host_name"] == host_name and row["pid"] == pid:
+                return True
+            return False
+        except Exception as e:
+            print(f"声明视频处理失败: {e}")
+            return False
+
+    def refresh_claim(self, file_md5):
+        """刷新当前进程持有的 claim 心跳，避免长视频处理期间被 TTL 误回收。"""
+        if not file_md5:
+            return False
+        try:
+            now = time.time()
+            host_name = socket.gethostname()
+            pid = os.getpid()
+            with self.conn:
+                cur = self.conn.execute(
+                    """
+                    UPDATE processing_claims
+                    SET heartbeat_at=?
+                    WHERE file_md5=? AND host_name=? AND pid=?
+                    """,
+                    (now, file_md5, host_name, pid),
+                )
+            return bool(cur.rowcount)
+        except Exception as e:
+            print(f"刷新视频声明心跳失败: {e}")
+            return False
+
+    def release_claim(self, file_md5):
+        """释放视频声明，允许其他机器处理。"""
+        if not file_md5:
+            return
+        try:
+            self.conn.execute("DELETE FROM processing_claims WHERE file_md5=?", (file_md5,))
+            self.conn.commit()
+        except Exception as e:
+            print(f"释放视频声明失败: {e}")
+
+    def is_video_claimed(self, file_md5):
+        """检查视频是否已被其他机器声明。"""
+        if not file_md5:
+            return False
+        try:
+            row = self.conn.execute(
+                "SELECT host_name, pid, claimed_at, heartbeat_at FROM processing_claims WHERE file_md5=?",
+                (file_md5,),
+            ).fetchone()
+            if not row:
+                return False
+            claimed_at = row["heartbeat_at"] or row["claimed_at"]
+            ttl = int(os.environ.get("FINDINVIDEO_CLAIM_TTL_SECONDS", "86400"))
+            if time.time() - claimed_at > ttl:
+                self.release_claim(file_md5)
+                return False
+            return True
+        except Exception:
+            return False
+
 
 DIRECTORY_INDEX = DirectoryIndex()
 atexit.register(DIRECTORY_INDEX.close)
@@ -813,6 +923,22 @@ def _truthy_env(name, default=False):
     return str(val).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+def _install_pause_signal_handler():
+    """将 Ctrl+C 转成安全暂停请求，在循环安全点统一落 checkpoint。"""
+    def _handler(signum, frame):
+        global _STOP_REQUESTED
+        _STOP_REQUESTED = True
+        try:
+            print("\n收到 Ctrl+C：将于安全点暂停、保存进度并释放声明。")
+        except Exception:
+            pass
+
+    try:
+        signal.signal(signal.SIGINT, _handler)
+    except Exception:
+        pass
+
+
 def _get_pause_file_path():
     """Return the pause flag path (best-effort)."""
     explicit = os.environ.get("FINDINVIDEO_PAUSE_FILE")
@@ -826,6 +952,8 @@ def _get_pause_file_path():
 
 
 def _pause_requested(pause_file_path=None):
+    if _STOP_REQUESTED:
+        return True
     path = pause_file_path or _get_pause_file_path()
     try:
         return bool(path) and os.path.exists(path)
@@ -915,7 +1043,25 @@ def _load_checkpoint(video_path):
         return None
 
 
-def _save_checkpoint(video_path, next_frame, detections, last_detected):
+def _checkpoint_owner_snapshot(claim_md5=None):
+    """采样当前 checkpoint 写入者信息，便于恢复和排障。"""
+    owner = {
+        "host_name": socket.gethostname(),
+        "pid": os.getpid(),
+    }
+    if claim_md5:
+        owner["claim_md5"] = claim_md5
+    return owner
+
+
+def _save_checkpoint(
+    video_path,
+    next_frame,
+    detections,
+    last_detected,
+    claim_md5=None,
+    last_success_frame=None,
+):
     path = _checkpoint_path(video_path)
     payload = {
         "version": 1,
@@ -923,6 +1069,11 @@ def _save_checkpoint(video_path, next_frame, detections, last_detected):
         "detections": detections or [],
         "last_detected": float(last_detected) if last_detected is not None else -5.0,
         "saved_at": time.time(),
+        "last_success_frame": int(last_success_frame)
+        if last_success_frame is not None
+        else int(max(-1, (next_frame or 0) - 1)),
+        "checkpoint_owner": _checkpoint_owner_snapshot(claim_md5),
+        "claim_heartbeat_at": time.time() if claim_md5 else None,
     }
     try:
         st = os.stat(video_path)
@@ -1117,6 +1268,7 @@ def detect_objects_in_video(
     video_path,
     target_class,
     model,
+    claim_md5=None,
     show_window=False,
     save_crops=False,
     save_training_data=False,
@@ -1202,6 +1354,7 @@ def detect_objects_in_video(
     frame_w, frame_h = 0, 0
 
     paused = False
+    last_success_frame = start_frame - 1
     try:
         while cap.isOpened():
             if _pause_requested(pause_file):
@@ -1210,6 +1363,8 @@ def detect_objects_in_video(
                     next_frame=frame_count,
                     detections=detections,
                     last_detected=last_detected,
+                    claim_md5=claim_md5,
+                    last_success_frame=last_success_frame,
                 )
                 paused = True
                 raise PauseRequested()
@@ -1339,10 +1494,13 @@ def detect_objects_in_video(
                     for line in frame_annotations:
                         f.write(line + "\n")
 
+            last_success_frame = frame_count
             frame_count += 1
 
             # 每100帧清理一次内存
             if frame_count % 100 == 0:
+                if claim_md5:
+                    DIRECTORY_INDEX.refresh_claim(claim_md5)
                 # 手动触发垃圾回收
                 gc.collect()
 
@@ -1359,6 +1517,8 @@ def detect_objects_in_video(
             next_frame=frame_count,
             detections=detections,
             last_detected=last_detected,
+            claim_md5=claim_md5,
+            last_success_frame=last_success_frame,
         )
         print(f"\nCtrl+C 已保存检查点，正在退出...")
         paused = True
@@ -1743,19 +1903,25 @@ def append_yoloed_md5(md5, file_path=None):
 
 def should_process(file_path):
     if has_existing_artifacts(file_path):
-        return False
+        return None
     if is_path_already_yoloed(file_path):
-        return False
+        return None
     md5 = get_file_md5_cached(file_path)
     if not md5:
-        return False
+        return None
     # 数据库查询：基于MD5判断是否已处理（跨机器通用）
     if DIRECTORY_INDEX.is_video_processed_by_md5(md5):
-        return False
+        return None
     yoloed_md5 = load_yoloed_md5(reload=False)
     if md5 in yoloed_md5:
-        return False
-    return True
+        return None
+    if DIRECTORY_INDEX.is_video_claimed(md5):
+        print(f"视频已被其他机器声明，跳过: {file_path}")
+        return None
+    if not DIRECTORY_INDEX.try_claim_video(md5, file_path):
+        print(f"无法声明视频，跳过: {file_path}")
+        return None
+    return md5
 
 
 def is_path_already_yoloed(file_path):
@@ -1773,10 +1939,10 @@ def is_path_already_yoloed(file_path):
     return any(c in _YOLOED_PATH_CACHE for c in candidates)
 
 
-def _record_video_processed(video_path, detections):
-    """将已处理的视频记录到数据库和yoloed.txt中（确保零检测视频也不会被重复处理）。"""
+def _mark_video_completed(video_path, detections, file_md5=None):
+    """统一写入视频完成态，避免 completed/processed/done 多处漂移。"""
     try:
-        md5 = get_file_md5_cached(video_path)
+        md5 = file_md5 or get_file_md5_cached(video_path)
         if md5:
             detection_count = len(detections) if detections else 0
             DIRECTORY_INDEX.mark_video_processed(
@@ -1785,13 +1951,23 @@ def _record_video_processed(video_path, detections):
                 detection_count=detection_count,
                 model_name="yolov11l-face",
             )
-            # 同时写入yoloed.txt以保持向后兼容
             append_yoloed_md5(md5, file_path=video_path)
+            write_done_marker(video_path)
             print(
-                f"已记录视频处理完成（检测数={detection_count}）: {os.path.basename(video_path)}"
+                f"已写入完成状态（检测数={detection_count}）: {os.path.basename(video_path)}"
             )
     except Exception as e:
-        print(f"记录视频处理状态失败: {e}")
+        print(f"写入视频完成状态失败: {e}")
+
+
+def _release_claim_safely(file_md5):
+    """尽力释放处理声明，避免 Ctrl+C 后长时间占住 claim。"""
+    if not file_md5:
+        return
+    try:
+        DIRECTORY_INDEX.release_claim(file_md5)
+    except Exception as e:
+        print(f"释放视频声明失败: {e}")
 
 
 def _mark_directory_done(dir_path, video_file_names):
@@ -1871,11 +2047,13 @@ def process_directory_videos(
     video_files = []
     for file in unprocessed_videos:
         file_path = os.path.join(dir_path, file)
-        if should_process(file_path):
+        md5 = should_process(file_path)
+        if md5:
             # 检查视频时长
             cap = cv2.VideoCapture(file_path)
             if not cap.isOpened():
                 print(f"无法打开视频: {file_path}")
+                _release_claim_safely(md5)
                 continue
 
             fps = cap.get(cv2.CAP_PROP_FPS)
@@ -1883,7 +2061,7 @@ def process_directory_videos(
             cap.release()
             duration = frame_count / fps if fps > 0 else float("inf")
 
-            video_files.append((file_path, duration))
+            video_files.append((file_path, duration, md5))
 
     if not video_files:
         if unprocessed_videos:
@@ -1892,32 +2070,52 @@ def process_directory_videos(
         return
 
     # 处理视频文件
-    for video_file, duration in video_files:
+    failed_videos = []
+    completed_count = 0
+    for video_file, duration, md5 in video_files:
         if duration == float("inf"):
             print(f"提示: 无法获取视频时长，仍尝试处理: {video_file}")
         print(f"开始处理视频文件: {video_file}")
-        detections = detect_objects_in_video(
-            video_file,
-            target_item,
-            model,
-            show_window=False,
-            save_crops=True,
-            save_training_data=True,
-            all_objects=all_objects_switch,
-            save_mosaic=save_mosaic_switch,
-            save_timestamps=save_timestamps_switch,
-        )
-        _record_video_processed(video_file, detections)
+        try:
+            detections = detect_objects_in_video(
+                video_file,
+                target_item,
+                model,
+                claim_md5=md5,
+                show_window=False,
+                save_crops=True,
+                save_training_data=True,
+                all_objects=all_objects_switch,
+                save_mosaic=save_mosaic_switch,
+                save_timestamps=save_timestamps_switch,
+            )
+        except (PauseRequested, KeyboardInterrupt):
+            _release_claim_safely(md5)
+            raise
+        except Exception:
+            _release_claim_safely(md5)
+            _LOGGER.error("Video failed: %s\n%s", video_file, traceback.format_exc())
+            failed_videos.append(video_file)
+            continue
+        _mark_video_completed(video_file, detections, file_md5=md5)
+        completed_count += 1
         # 视频处理完成后强制垃圾回收
         gc.collect()
         # 短暂休眠，让系统有时间释放资源
         time.sleep(1)
 
+    if failed_videos:
+        print(f"本轮有 {len(failed_videos)} 个视频处理失败，目录不会标记为已完成")
+        return completed_count
+
     # 所有视频处理完成后，标记目录为已全部处理
     _mark_directory_done(dir_path, video_file_names)
+    return completed_count
 
 
 if __name__ == "__main__":
+    _STOP_REQUESTED = False
+    _install_pause_signal_handler()
     video_path = r"Z:\待检测"  # 可设置为视频文件或目录
     # 如要检测所有模型内对象，则将 target_item 设置为任意值并启用全量检测开关
     target_item = "nipple"  # 当 all_objects 为 True 时，该值不再限制检测
@@ -2027,11 +2225,13 @@ if __name__ == "__main__":
                 ext = os.path.splitext(file)[1].lower()
                 if ext in video_extensions:
                     file_path = os.path.join(root, file)
-                    if should_process(file_path):
+                    md5 = should_process(file_path)
+                    if md5:
                         # 获取视频时长
                         cap = cv2.VideoCapture(file_path)
                         if not cap.isOpened():
                             print(f"无法打开视频: {file_path}")
+                            _release_claim_safely(md5)
                             continue
 
                         fps = cap.get(cv2.CAP_PROP_FPS)
@@ -2039,18 +2239,31 @@ if __name__ == "__main__":
                         cap.release()
 
                         print(f"开始处理视频文件: {file_path}")
-                        detections = detect_objects_in_video(
-                            file_path,
-                            target_item,
-                            model,
-                            show_window=False,
-                            save_crops=True,
-                            save_training_data=True,
-                            all_objects=all_objects_switch,
-                            save_mosaic=save_mosaic_switch,
-                            save_timestamps=save_timestamps_switch,
-                        )
-                        _record_video_processed(file_path, detections)
+                        try:
+                            detections = detect_objects_in_video(
+                                file_path,
+                                target_item,
+                                model,
+                                claim_md5=md5,
+                                show_window=False,
+                                save_crops=True,
+                                save_training_data=True,
+                                all_objects=all_objects_switch,
+                                save_mosaic=save_mosaic_switch,
+                                save_timestamps=save_timestamps_switch,
+                            )
+                        except (PauseRequested, KeyboardInterrupt):
+                            _release_claim_safely(md5)
+                            raise
+                        except Exception:
+                            _release_claim_safely(md5)
+                            _LOGGER.error(
+                                "Video failed: %s\n%s",
+                                file_path,
+                                traceback.format_exc(),
+                            )
+                            continue
+                        _mark_video_completed(file_path, detections, file_md5=md5)
 
                         # 强制垃圾回收
                         gc.collect()
@@ -2064,18 +2277,32 @@ if __name__ == "__main__":
             print(f"无法打开视频: {video_path}")
         else:
             cap.release()
-            if should_process(video_path):
-                detections = detect_objects_in_video(
-                    video_path,
-                    target_item,
-                    model,
-                    show_window=False,
-                    save_crops=True,
-                    save_training_data=True,
-                    all_objects=all_objects_switch,
-                    save_mosaic=save_mosaic_switch,
-                    save_timestamps=save_timestamps_switch,
-                )
-                _record_video_processed(video_path, detections)
+            md5 = should_process(video_path)
+            if md5:
+                try:
+                    detections = detect_objects_in_video(
+                        video_path,
+                        target_item,
+                        model,
+                        claim_md5=md5,
+                        show_window=False,
+                        save_crops=True,
+                        save_training_data=True,
+                        all_objects=all_objects_switch,
+                        save_mosaic=save_mosaic_switch,
+                        save_timestamps=save_timestamps_switch,
+                    )
+                except (PauseRequested, KeyboardInterrupt):
+                    _release_claim_safely(md5)
+                    raise
+                except Exception:
+                    _release_claim_safely(md5)
+                    _LOGGER.error(
+                        "Video failed: %s\n%s",
+                        video_path,
+                        traceback.format_exc(),
+                    )
+                else:
+                    _mark_video_completed(video_path, detections, file_md5=md5)
             else:
                 print(f"已存在拼接图片，跳过处理: {video_path}")

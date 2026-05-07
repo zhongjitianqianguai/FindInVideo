@@ -1,6 +1,7 @@
 import importlib.util
 import pathlib
 import sys
+import tempfile
 import time
 import types
 import unittest
@@ -125,6 +126,28 @@ class ProcessingStateTests(unittest.TestCase):
         )
         self.assertEqual(yoloed, [('md5-b', 'video.mp4')])
         self.assertEqual(done, ['video.mp4'])
+
+    def test_save_checkpoint_includes_owner_and_progress_metadata(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_path = pathlib.Path(tmpdir) / 'video.mp4'
+            video_path.write_bytes(b'data')
+
+            self.main_module._save_checkpoint(
+                str(video_path),
+                next_frame=15,
+                detections=[1.2],
+                last_detected=1.2,
+                claim_md5='md5-meta',
+                last_success_frame=14,
+            )
+
+            payload = self.main_module._load_checkpoint(str(video_path))
+
+        self.assertEqual(payload['next_frame'], 15)
+        self.assertEqual(payload['last_success_frame'], 14)
+        self.assertEqual(payload['checkpoint_owner']['claim_md5'], 'md5-meta')
+        self.assertEqual(payload['checkpoint_owner']['pid'], self.main_module.os.getpid())
+        self.assertIsNotNone(payload['claim_heartbeat_at'])
 
     def test_process_directory_videos_does_not_mark_directory_done_after_failure(self):
         released = []

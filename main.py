@@ -1293,7 +1293,25 @@ def _load_checkpoint(video_path):
         return None
 
 
-def _save_checkpoint(video_path, next_frame, detections, last_detected):
+def _checkpoint_owner_snapshot(claim_md5=None):
+    """采样当前 checkpoint 写入者信息，便于恢复和排障。"""
+    owner = {
+        "host_name": socket.gethostname(),
+        "pid": os.getpid(),
+    }
+    if claim_md5:
+        owner["claim_md5"] = claim_md5
+    return owner
+
+
+def _save_checkpoint(
+    video_path,
+    next_frame,
+    detections,
+    last_detected,
+    claim_md5=None,
+    last_success_frame=None,
+):
     path = _checkpoint_path(video_path)
     payload = {
         "version": 1,
@@ -1301,6 +1319,11 @@ def _save_checkpoint(video_path, next_frame, detections, last_detected):
         "detections": detections or [],
         "last_detected": float(last_detected) if last_detected is not None else -5.0,
         "saved_at": time.time(),
+        "last_success_frame": int(last_success_frame)
+        if last_success_frame is not None
+        else int(max(-1, (next_frame or 0) - 1)),
+        "checkpoint_owner": _checkpoint_owner_snapshot(claim_md5),
+        "claim_heartbeat_at": time.time() if claim_md5 else None,
     }
     try:
         st = os.stat(video_path)
@@ -1693,6 +1716,7 @@ def detect_objects_in_video(
     frame_w, frame_h = 0, 0
 
     paused = False
+    last_success_frame = start_frame - 1
     try:
         while cap.isOpened():
             if _pause_requested(pause_file):
@@ -1701,6 +1725,8 @@ def detect_objects_in_video(
                     next_frame=frame_count,
                     detections=detections,
                     last_detected=last_detected,
+                    claim_md5=claim_md5,
+                    last_success_frame=last_success_frame,
                 )
                 paused = True
                 raise PauseRequested()
@@ -1826,6 +1852,7 @@ def detect_objects_in_video(
                     for line in frame_annotations:
                         f.write(line + "\n")
 
+            last_success_frame = frame_count
             frame_count += 1
 
             # 每100帧清理一次内存
@@ -1848,6 +1875,8 @@ def detect_objects_in_video(
             next_frame=frame_count,
             detections=detections,
             last_detected=last_detected,
+            claim_md5=claim_md5,
+            last_success_frame=last_success_frame,
         )
         print(f"\nCtrl+C 已保存检查点，正在退出...")
         paused = True
