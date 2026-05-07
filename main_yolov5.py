@@ -1267,12 +1267,11 @@ def detect_objects_with_frame_analysis(video_path, target_class,
             crops_dir = os.path.join(results_dir, 'crops')
             if os.path.exists(crops_dir):
                 create_mosaic_from_crops(crops_dir, video_path)
-        write_done_marker(video_path)
         return detections
         
     except Exception as e:
         print(f"检测失败: {e}")
-        return []
+        raise
 
 def process_directory_videos(dir_path, target_item, all_objects_switch=False, model_path='models/yolov5s.pt', use_detectpy=False, skip_long_videos=True):
     """处理目录中的所有视频文件"""
@@ -1290,7 +1289,7 @@ def process_directory_videos(dir_path, target_item, all_objects_switch=False, mo
         print(f"警告: 无法访问目录 '{dir_path}': {e}")
         return
 
-    for video_file, duration, claim_path, md5 in video_files:
+    for video_file in video_files:
         print(f"开始处理视频文件: {video_file}")
         try:
             if use_detectpy:
@@ -1308,16 +1307,15 @@ def process_directory_videos(dir_path, target_item, all_objects_switch=False, mo
                                               all_objects=all_objects_switch,
                                               model_path=model_path)
         except PauseRequested:
-            release_video_claim(claim_path)
             raise
         except Exception as exc:
             print(f"处理视频失败: {video_file}, 错误: {exc}")
             _LOGGER.error("Video failed: %s\n%s", video_file, traceback.format_exc())
-        md5 = md5 or get_file_md5_cached(video_file)
+            continue
+        md5 = get_file_md5_cached(video_file)
         if md5:
             append_yoloed_md5(md5, file_path=video_file)
         write_done_marker(video_file)
-        release_video_claim(claim_path)
 
 
 def get_file_md5(file_path):

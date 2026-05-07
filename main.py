@@ -1800,6 +1800,7 @@ def detect_objects_in_video(
         paused = True
     except Exception as e:
         print(f"处理视频时发生错误: {e}")
+        raise
 
     finally:
         # 确保资源释放
@@ -2358,7 +2359,7 @@ def process_directory_videos(
             duration = frame_count / fps if fps > 0 else float("inf")
 
             if duration <= 3600:  # 小于等于1小时的视频
-                video_files.append((file_path, duration))
+                video_files.append((file_path, duration, md5))
             else:
                 print(f"视频时长 {duration:.2f}秒超过一小时，跳过处理: {file_path}")
 
@@ -2369,20 +2370,28 @@ def process_directory_videos(
         return 0
 
     # 处理视频文件
-    for video_file, duration in video_files:
+    for video_file, duration, md5 in video_files:
         if duration == float("inf"):
             print(f"提示: 无法获取视频时长，仍尝试处理: {video_file}")
         print(f"开始处理视频文件: {video_file}")
-        detections = detect_objects_in_video(
-            video_file,
-            target_item,
-            show_window=False,
-            save_crops=True,
-            save_training_data=False,
-            all_objects=all_objects_switch,
-            save_mosaic=save_mosaic_switch,
-            save_timestamps=save_timestamps_switch,
-        )
+        try:
+            detections = detect_objects_in_video(
+                video_file,
+                target_item,
+                show_window=False,
+                save_crops=True,
+                save_training_data=False,
+                all_objects=all_objects_switch,
+                save_mosaic=save_mosaic_switch,
+                save_timestamps=save_timestamps_switch,
+            )
+        except PauseRequested:
+            DIRECTORY_INDEX.release_claim(md5)
+            raise
+        except Exception:
+            DIRECTORY_INDEX.release_claim(md5)
+            _LOGGER.error("Video failed: %s\n%s", video_file, traceback.format_exc())
+            continue
         _record_video_processed(video_file, detections)
         # 视频处理完成后强制垃圾回收
         gc.collect()
@@ -2584,16 +2593,28 @@ if __name__ == "__main__":
                             continue
 
                         print(f"开始处理视频文件: {file_path}")
-                        detections = detect_objects_in_video(
-                            file_path,
-                            target_item,
-                            show_window=False,
-                            save_crops=True,
-                            save_training_data=False,
-                            all_objects=all_objects_switch,
-                            save_mosaic=save_mosaic_switch,
-                            save_timestamps=save_timestamps_switch,
-                        )
+                        try:
+                            detections = detect_objects_in_video(
+                                file_path,
+                                target_item,
+                                show_window=False,
+                                save_crops=True,
+                                save_training_data=False,
+                                all_objects=all_objects_switch,
+                                save_mosaic=save_mosaic_switch,
+                                save_timestamps=save_timestamps_switch,
+                            )
+                        except PauseRequested:
+                            DIRECTORY_INDEX.release_claim(md5)
+                            raise
+                        except Exception:
+                            DIRECTORY_INDEX.release_claim(md5)
+                            _LOGGER.error(
+                                "Video failed: %s\n%s",
+                                file_path,
+                                traceback.format_exc(),
+                            )
+                            continue
                         _record_video_processed(file_path, detections)
 
                         # 强制垃圾回收
@@ -2616,16 +2637,28 @@ if __name__ == "__main__":
             else:
                 md5 = should_process(video_path)
                 if md5:
-                    detections = detect_objects_in_video(
-                        video_path,
-                        target_item,
-                        show_window=False,
-                        save_crops=True,
-                        save_training_data=False,
-                        all_objects=all_objects_switch,
-                        save_mosaic=save_mosaic_switch,
-                        save_timestamps=save_timestamps_switch,
-                    )
-                    _record_video_processed(video_path, detections)
+                    try:
+                        detections = detect_objects_in_video(
+                            video_path,
+                            target_item,
+                            show_window=False,
+                            save_crops=True,
+                            save_training_data=False,
+                            all_objects=all_objects_switch,
+                            save_mosaic=save_mosaic_switch,
+                            save_timestamps=save_timestamps_switch,
+                        )
+                    except PauseRequested:
+                        DIRECTORY_INDEX.release_claim(md5)
+                        raise
+                    except Exception:
+                        DIRECTORY_INDEX.release_claim(md5)
+                        _LOGGER.error(
+                            "Video failed: %s\n%s",
+                            video_path,
+                            traceback.format_exc(),
+                        )
+                    else:
+                        _record_video_processed(video_path, detections)
                 else:
                     print(f"已存在拼接图片，跳过处理: {video_path}")

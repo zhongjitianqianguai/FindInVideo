@@ -1199,6 +1199,7 @@ def detect_objects_in_video(video_path, target_class, model,
         paused = True
     except Exception as e:
         print(f"处理视频时发生错误: {e}")
+        raise
     
     finally:
         # 确保资源释放
