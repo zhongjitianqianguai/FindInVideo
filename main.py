@@ -2266,6 +2266,16 @@ def _record_video_processed(video_path, detections):
         print(f"记录视频处理状态失败: {e}")
 
 
+def _release_claim_safely(file_md5):
+    """尽力释放处理声明，避免 Ctrl+C 后长时间占住 claim。"""
+    if not file_md5:
+        return
+    try:
+        DIRECTORY_INDEX.release_claim(file_md5)
+    except Exception as e:
+        print(f"释放视频声明失败: {e}")
+
+
 def _mark_directory_done(dir_path, video_file_names):
     """将目录标记为已全部处理，并将MD5缓存中已有的视频批量写入数据库和yoloed.txt（双重保险）。"""
     try:
@@ -2385,11 +2395,11 @@ def process_directory_videos(
                 save_mosaic=save_mosaic_switch,
                 save_timestamps=save_timestamps_switch,
             )
-        except PauseRequested:
-            DIRECTORY_INDEX.release_claim(md5)
+        except (PauseRequested, KeyboardInterrupt):
+            _release_claim_safely(md5)
             raise
         except Exception:
-            DIRECTORY_INDEX.release_claim(md5)
+            _release_claim_safely(md5)
             _LOGGER.error("Video failed: %s\n%s", video_file, traceback.format_exc())
             continue
         _record_video_processed(video_file, detections)
@@ -2604,11 +2614,11 @@ if __name__ == "__main__":
                                 save_mosaic=save_mosaic_switch,
                                 save_timestamps=save_timestamps_switch,
                             )
-                        except PauseRequested:
-                            DIRECTORY_INDEX.release_claim(md5)
+                        except (PauseRequested, KeyboardInterrupt):
+                            _release_claim_safely(md5)
                             raise
                         except Exception:
-                            DIRECTORY_INDEX.release_claim(md5)
+                            _release_claim_safely(md5)
                             _LOGGER.error(
                                 "Video failed: %s\n%s",
                                 file_path,
@@ -2648,11 +2658,11 @@ if __name__ == "__main__":
                             save_mosaic=save_mosaic_switch,
                             save_timestamps=save_timestamps_switch,
                         )
-                    except PauseRequested:
-                        DIRECTORY_INDEX.release_claim(md5)
+                    except (PauseRequested, KeyboardInterrupt):
+                        _release_claim_safely(md5)
                         raise
                     except Exception:
-                        DIRECTORY_INDEX.release_claim(md5)
+                        _release_claim_safely(md5)
                         _LOGGER.error(
                             "Video failed: %s\n%s",
                             video_path,
