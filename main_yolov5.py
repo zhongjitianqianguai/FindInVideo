@@ -111,7 +111,7 @@ def _install_pause_signal_handler():
         global _STOP_REQUESTED
         _STOP_REQUESTED = True
         try:
-            print("\n收到 Ctrl+C：将于安全点暂停并保存进度（可直接再次运行续跑）。")
+            print("\n收到 Ctrl+C：已请求暂停，当前帧结束后将保存进度并退出，不会继续处理后续视频。")
         except Exception:
             pass
     try:
@@ -900,6 +900,7 @@ def detect_objects_in_video_yolov5(video_path, target_class,
     while cap.isOpened():
         if _pause_requested(pause_file):
             _save_checkpoint(video_path, next_frame=frame_count, detections=detections, last_detected=last_detected)
+            print('\n已在当前帧结束后保存检查点，准备退出，不会继续处理后续视频。')
             raise PauseRequested()
         success, frame, timed_out = _read_frame_with_timeout(cap)
         if not success:
@@ -1012,6 +1013,7 @@ def detect_objects_in_video_yolov5(video_path, target_class,
         
         except KeyboardInterrupt:
             _save_checkpoint(video_path, next_frame=frame_count, detections=detections, last_detected=last_detected)
+            print('\nCtrl+C 已保存检查点，准备退出，不会继续处理后续视频。')
             raise PauseRequested()
         except Exception as e:
             print(f"处理帧 {frame_count} 时出错: {e}")
@@ -1198,6 +1200,7 @@ def detect_objects_with_frame_analysis(video_path, target_class,
         while cap.isOpened():
             if _pause_requested(pause_file):
                 _save_checkpoint(video_path, next_frame=frame_count, detections=detections, last_detected=last_detected)
+                print('\n已在当前帧结束后保存检查点，准备退出，不会继续处理后续视频。')
                 raise PauseRequested()
             success, frame, timed_out = _read_frame_with_timeout(cap)
             if not success:

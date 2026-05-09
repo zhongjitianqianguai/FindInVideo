@@ -1179,7 +1179,7 @@ def _install_pause_signal_handler():
         global _STOP_REQUESTED
         _STOP_REQUESTED = True
         try:
-            print("\n收到 Ctrl+C：将于安全点暂停、保存进度并释放声明。")
+            print("\n收到 Ctrl+C：已请求暂停，当前帧结束后将保存进度并退出，不会继续处理后续视频。")
         except Exception:
             pass
 
@@ -1890,6 +1890,7 @@ def detect_objects_in_video(
         raise
     except PauseRequested:
         paused = True
+        print('\n已在当前帧结束后保存检查点，准备退出，不会继续处理后续视频。')
     except Exception as e:
         print(f"处理视频时发生错误: {e}")
         raise
