@@ -230,6 +230,40 @@ class ProcessingStateTests(unittest.TestCase):
 
         self.assertEqual(released, ['md5-d'])
 
+    def test_detect_objects_in_video_reraises_pause_requested(self):
+        class FakeCapture:
+            def isOpened(self):
+                return True
+
+            def get(self, prop):
+                if prop == self_main.cv2.CAP_PROP_FPS:
+                    return 30
+                if prop == self_main.cv2.CAP_PROP_FRAME_COUNT:
+                    return 300
+                return 0
+
+            def release(self):
+                return None
+
+        class FakeProgress:
+            def close(self):
+                return None
+
+        class FakeYOLO:
+            def __init__(self, *args, **kwargs):
+                self.names = {}
+
+        self_main = self.main_module
+        with mock.patch.object(self_main, 'YOLO', FakeYOLO), \
+             mock.patch.object(self_main.cv2, 'VideoCapture', lambda path: FakeCapture()), \
+             mock.patch.object(self_main, 'tqdm', lambda *args, **kwargs: FakeProgress()), \
+             mock.patch.object(self_main, '_pause_requested', lambda pause_file=None: True), \
+             mock.patch.object(self_main, '_save_checkpoint', lambda *args, **kwargs: None), \
+             mock.patch.object(self_main, '_load_checkpoint', lambda path: None), \
+             mock.patch.object(self_main, '_truthy_env', lambda *args, **kwargs: True):
+            with self.assertRaises(self_main.PauseRequested):
+                self_main.detect_objects_in_video('video.mp4', 'person')
+
 
 if __name__ == '__main__':
     unittest.main()

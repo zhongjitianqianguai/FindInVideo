@@ -1367,6 +1367,7 @@ def detect_objects_in_video(video_path, target_class, model,
     except PauseRequested:
         paused = True
         print('\n已在当前帧结束后保存检查点，准备退出，不会继续处理后续视频。')
+        raise
     except Exception as e:
         print(f"处理视频时发生错误: {e}")
         raise
