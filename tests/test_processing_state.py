@@ -264,6 +264,48 @@ class ProcessingStateTests(unittest.TestCase):
             with self.assertRaises(self_main.PauseRequested):
                 self_main.detect_objects_in_video('video.mp4', 'person')
 
+    def test_process_directory_videos_does_not_mark_completed_after_stop_requested(self):
+        released = []
+        completed = []
+        pause_checks = iter([False, True])
+
+        class FakeCapture:
+            def isOpened(self):
+                return True
+
+            def get(self, prop):
+                if prop == self_main.cv2.CAP_PROP_FPS:
+                    return 30
+                if prop == self_main.cv2.CAP_PROP_FRAME_COUNT:
+                    return 300
+                return 0
+
+            def release(self):
+                return None
+
+        self_main = self.main_module
+        with mock.patch.object(self_main.os, 'listdir', lambda path: ['video.mp4']), \
+             mock.patch.object(self_main, 'is_video_file', lambda path: path.endswith('.mp4')), \
+             mock.patch.object(self_main.cv2, 'VideoCapture', lambda path: FakeCapture()), \
+             mock.patch.object(self_main, 'should_process', lambda path: 'md5-e'), \
+             mock.patch.object(self_main, 'detect_objects_in_video', lambda *args, **kwargs: [1.0]), \
+             mock.patch.object(self_main, '_pause_requested', lambda pause_file=None: next(pause_checks)), \
+             mock.patch.object(
+                 self_main,
+                 '_release_claim_safely',
+                 lambda md5: released.append(md5),
+             ), \
+             mock.patch.object(
+                 self_main,
+                 '_mark_video_completed',
+                 lambda *args, **kwargs: completed.append(args),
+             ):
+            with self.assertRaises(self_main.PauseRequested):
+                self_main.process_directory_videos('root', 'person')
+
+        self.assertEqual(released, ['md5-e'])
+        self.assertEqual(completed, [])
+
 
 if __name__ == '__main__':
     unittest.main()

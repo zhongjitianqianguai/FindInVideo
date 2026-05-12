@@ -2477,6 +2477,8 @@ def process_directory_videos(
     failed_videos = []
     completed_count = 0
     for video_file, duration, md5 in video_files:
+        if _pause_requested():
+            raise PauseRequested()
         if duration == float("inf"):
             print(f"提示: 无法获取视频时长，仍尝试处理: {video_file}")
         print(f"开始处理视频文件: {video_file}")
@@ -2492,6 +2494,8 @@ def process_directory_videos(
                 save_mosaic=save_mosaic_switch,
                 save_timestamps=save_timestamps_switch,
             )
+            if _pause_requested():
+                raise PauseRequested()
         except (PauseRequested, KeyboardInterrupt):
             _release_claim_safely(md5)
             raise
@@ -2553,6 +2557,8 @@ if __name__ == "__main__":
         print(f"启用叶子节点处理模式，正在扫描目录: {video_path}")
         print("正在查找包含视频文件的叶子节点目录...")
 
+        if _pause_requested():
+            raise PauseRequested()
         root_video_count = count_videos_in_directory(video_path)
         if root_video_count > 0:
             print(f"\n=== 处理根目录: {video_path} ({root_video_count} 个视频) ===")
@@ -2590,6 +2596,8 @@ if __name__ == "__main__":
                 f"{_yoloed_path_count} 条路径, {_yoloed_basename_count} 个文件名索引"
             )
             for i, (dir_path, video_count, all_processed) in enumerate(leaf_dirs, 1):
+                if _pause_requested():
+                    raise PauseRequested()
                 relative_path = _safe_relpath(dir_path, video_path)
 
                 # 第1层跳过：数据库快速跳过（has_artifact=True 且目录 mtime 未变 → 无需任何I/O）
@@ -2685,7 +2693,11 @@ if __name__ == "__main__":
     elif os.path.isdir(video_path):
         video_extensions = [".mp4", ".avi", ".mov", ".mkv", ".wmv"]
         for root, dirs, files in os.walk(video_path):
+            if _pause_requested():
+                raise PauseRequested()
             for file in files:
+                if _pause_requested():
+                    raise PauseRequested()
                 ext = os.path.splitext(file)[1].lower()
                 if ext in video_extensions:
                     file_path = os.path.join(root, file)
@@ -2720,6 +2732,8 @@ if __name__ == "__main__":
                                 save_mosaic=save_mosaic_switch,
                                 save_timestamps=save_timestamps_switch,
                             )
+                            if _pause_requested():
+                                raise PauseRequested()
                         except (PauseRequested, KeyboardInterrupt):
                             _release_claim_safely(md5)
                             raise
@@ -2765,6 +2779,8 @@ if __name__ == "__main__":
                             save_mosaic=save_mosaic_switch,
                             save_timestamps=save_timestamps_switch,
                         )
+                        if _pause_requested():
+                            raise PauseRequested()
                     except (PauseRequested, KeyboardInterrupt):
                         _release_claim_safely(md5)
                         raise
