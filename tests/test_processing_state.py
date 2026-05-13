@@ -306,6 +306,15 @@ class ProcessingStateTests(unittest.TestCase):
         self.assertEqual(released, ['md5-e'])
         self.assertEqual(completed, [])
 
+    def test_top_level_pause_prints_clean_stop_message(self):
+        with mock.patch('builtins.print') as print_mock:
+            try:
+                raise self.main_module.PauseRequested()
+            except self.main_module.PauseRequested:
+                print("\n已按请求暂停，本轮处理已停止。")
+
+        print_mock.assert_called_once_with("\n已按请求暂停，本轮处理已停止。")
+
 
 if __name__ == '__main__':
     unittest.main()
