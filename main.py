@@ -2798,3 +2798,7 @@ if __name__ == "__main__":
                         print(f"已存在拼接图片，跳过处理: {video_path}")
     except PauseRequested:
         print("\n已按请求暂停，本轮处理已停止。")
+        raise SystemExit(0)
+    except KeyboardInterrupt:
+        print("\n已按请求停止，本轮处理已终止。")
+        raise SystemExit(130)
