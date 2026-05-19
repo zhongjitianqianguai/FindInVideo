@@ -171,7 +171,11 @@ class ProcessingStateTests(unittest.TestCase):
         with mock.patch.object(self_main.os, 'listdir', lambda path: ['video.mp4']), \
              mock.patch.object(self_main, 'is_video_file', lambda path: path.endswith('.mp4')), \
              mock.patch.object(self_main.cv2, 'VideoCapture', lambda path: FakeCapture()), \
-             mock.patch.object(self_main, 'should_process', lambda path: 'md5-c'), \
+             mock.patch.object(
+                 self_main,
+                 '_get_processing_decision',
+                 lambda path: ('md5-c', 'ready'),
+             ), \
              mock.patch.object(
                  self_main,
                  'detect_objects_in_video',
@@ -214,7 +218,11 @@ class ProcessingStateTests(unittest.TestCase):
         with mock.patch.object(self_main.os, 'listdir', lambda path: ['video.mp4']), \
              mock.patch.object(self_main, 'is_video_file', lambda path: path.endswith('.mp4')), \
              mock.patch.object(self_main.cv2, 'VideoCapture', lambda path: FakeCapture()), \
-             mock.patch.object(self_main, 'should_process', lambda path: 'md5-d'), \
+             mock.patch.object(
+                 self_main,
+                 '_get_processing_decision',
+                 lambda path: ('md5-d', 'ready'),
+             ), \
              mock.patch.object(
                  self_main,
                  'detect_objects_in_video',
@@ -229,6 +237,27 @@ class ProcessingStateTests(unittest.TestCase):
                 self_main.process_directory_videos('root', 'person')
 
         self.assertEqual(released, ['md5-d'])
+
+    def test_process_directory_videos_does_not_mark_directory_done_when_claimed_elsewhere(self):
+        marked_dirs = []
+
+        self_main = self.main_module
+        with mock.patch.object(self_main.os, 'listdir', lambda path: ['video.mp4']), \
+             mock.patch.object(self_main, 'is_video_file', lambda path: path.endswith('.mp4')), \
+             mock.patch.object(
+                 self_main,
+                 '_get_processing_decision',
+                 lambda path: (None, 'claimed_elsewhere'),
+             ), \
+             mock.patch.object(
+                 self_main,
+                 '_mark_directory_done',
+                 lambda dir_path, names: marked_dirs.append(dir_path),
+             ):
+            result = self_main.process_directory_videos('root', 'person')
+
+        self.assertEqual(result, 0)
+        self.assertEqual(marked_dirs, [])
 
     def test_detect_objects_in_video_reraises_pause_requested(self):
         class FakeCapture:
@@ -287,7 +316,11 @@ class ProcessingStateTests(unittest.TestCase):
         with mock.patch.object(self_main.os, 'listdir', lambda path: ['video.mp4']), \
              mock.patch.object(self_main, 'is_video_file', lambda path: path.endswith('.mp4')), \
              mock.patch.object(self_main.cv2, 'VideoCapture', lambda path: FakeCapture()), \
-             mock.patch.object(self_main, 'should_process', lambda path: 'md5-e'), \
+             mock.patch.object(
+                 self_main,
+                 '_get_processing_decision',
+                 lambda path: ('md5-e', 'ready'),
+             ), \
              mock.patch.object(self_main, 'detect_objects_in_video', lambda *args, **kwargs: [1.0]), \
              mock.patch.object(self_main, '_pause_requested', lambda pause_file=None: next(pause_checks)), \
              mock.patch.object(

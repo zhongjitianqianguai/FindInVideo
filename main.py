@@ -2289,14 +2289,14 @@ def append_yoloed_md5(md5, file_path=None):
         print(f"写入已识别MD5失败: {e}")
 
 
-def should_process(file_path):
-    """检查文件是否需要处理。
-    返回 MD5 字符串表示需要处理，返回 None 表示不需要处理。
+def _get_processing_decision(file_path):
+    """检查文件处理决策。
+    返回 (md5, reason)，其中 md5 为待处理文件的声明结果，reason 为跳过/就绪原因。
     """
     if has_existing_artifacts(file_path):
-        return None
+        return None, "has_artifacts"
     if is_path_already_yoloed(file_path):
-        return None
+        return None, "path_already_yoloed"
     basename_cache = _YOLOED_BASENAME_CACHE or {}
     if basename_cache:
         _fp = str(file_path).replace("\\", "/")
@@ -2306,21 +2306,29 @@ def should_process(file_path):
             _parent = _parts_list[-2].lower()
             parent_dirs = basename_cache.get(_fname)
             if parent_dirs and _parent in parent_dirs:
-                return None
+                return None, "basename_already_yoloed"
     md5 = get_file_md5_cached(file_path)
     if not md5:
-        return None
+        return None, "md5_unavailable"
     if DIRECTORY_INDEX.is_video_processed_by_md5(md5):
-        return None
+        return None, "already_processed_by_md5"
     yoloed_md5 = load_yoloed_md5(reload=False)
     if md5 in yoloed_md5:
-        return None
+        return None, "md5_already_yoloed"
     if DIRECTORY_INDEX.is_video_claimed(md5):
         print(f"视频已被其他机器声明，跳过: {file_path}")
-        return None
+        return None, "claimed_elsewhere"
     if not DIRECTORY_INDEX.try_claim_video(md5, file_path):
         print(f"无法声明视频，跳过: {file_path}")
-        return None
+        return None, "claim_failed"
+    return md5, "ready"
+
+
+def should_process(file_path):
+    """检查文件是否需要处理。
+    返回 MD5 字符串表示需要处理，返回 None 表示不需要处理。
+    """
+    md5, _reason = _get_processing_decision(file_path)
     return md5
 
 
@@ -2447,9 +2455,10 @@ def process_directory_videos(
 
     # 对未处理的视频逐一检查（should_process 包含MD5/数据库等更精确的判断）
     video_files = []
+    claim_blocked_videos = []
     for file in unprocessed_videos:
         file_path = os.path.join(dir_path, file)
-        md5 = should_process(file_path)
+        md5, reason = _get_processing_decision(file_path)
         if md5:
             # 检查视频时长
             cap = cv2.VideoCapture(file_path)
@@ -2466,8 +2475,16 @@ def process_directory_videos(
                 video_files.append((file_path, duration, md5))
             else:
                 print(f"视频时长 {duration:.2f}秒超过一小时，跳过处理: {file_path}")
+        elif reason in ("claimed_elsewhere", "claim_failed"):
+            claim_blocked_videos.append(file_path)
 
     if not video_files:
+        if claim_blocked_videos:
+            print(
+                f"目录中有 {len(claim_blocked_videos)} 个视频当前被其他机器占用，"
+                "本轮不标记目录完成"
+            )
+            return 0
         if unprocessed_videos:
             print(f"目录中剩余 {len(unprocessed_videos)} 个视频经精确检查后均无需处理")
         _mark_directory_done(dir_path, video_file_names)
