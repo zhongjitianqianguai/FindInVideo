@@ -2074,6 +2074,7 @@ def process_directory_videos(
     # 处理视频文件
     failed_videos = []
     completed_count = 0
+    pending_claim_md5s = {md5 for _, _, md5 in video_files}
     for video_file, duration, md5 in video_files:
         if duration == float("inf"):
             print(f"提示: 无法获取视频时长，仍尝试处理: {video_file}")
@@ -2092,14 +2093,17 @@ def process_directory_videos(
                 save_timestamps=save_timestamps_switch,
             )
         except (PauseRequested, KeyboardInterrupt):
-            _release_claim_safely(md5)
+            for pending_md5 in pending_claim_md5s:
+                _release_claim_safely(pending_md5)
             raise
         except Exception:
             _release_claim_safely(md5)
+            pending_claim_md5s.discard(md5)
             _LOGGER.error("Video failed: %s\n%s", video_file, traceback.format_exc())
             failed_videos.append(video_file)
             continue
         _mark_video_completed(video_file, detections, file_md5=md5)
+        pending_claim_md5s.discard(md5)
         completed_count += 1
         # 视频处理完成后强制垃圾回收
         gc.collect()

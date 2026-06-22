@@ -744,6 +744,24 @@ class DirectoryIndex:
                         "UPDATE directories SET parent_path=? WHERE path=?",
                         (parent_path, normalized),
                     )
+            # 即使 mtime 未变，也要快速扫描文件系统检查是否有新增子目录
+            # （Windows 上添加子目录不一定更新父目录 mtime）
+            stored_children = set(self._get_child_paths(normalized))
+            try:
+                with os.scandir(normalized) as iterator:
+                    for entry in iterator:
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                if entry.name not in _IGNORED_SUBDIRS:
+                                    entry_path = self._normalize_path(entry.path)
+                                    if entry_path and entry_path not in stored_children:
+                                        # 发现新子目录，需要完整刷新该子目录
+                                        self._refresh_directory(entry_path, exclusions, normalized)
+                        except (PermissionError, FileNotFoundError, OSError):
+                            continue
+            except (PermissionError, FileNotFoundError, OSError):
+                pass  # 无法扫描，退回到只遍历已知子目录
+            # 继续遍历已知子目录
             for child in self._get_child_paths(normalized):
                 self._refresh_directory(child, exclusions, normalized)
             return
@@ -1695,11 +1713,16 @@ def detect_objects_in_video(
         except Exception:
             pass
 
-    # 初始化进度条
+    # 初始化进度条（截断长文件名避免终端溢出导致进度条不显示）
+    _video_name = os.path.basename(video_path)
+    # tqdm 固定开销约 40 字符（百分比、时间、计数等），预留空间
+    _max_desc = max(20, (os.get_terminal_size().columns if os.isatty(1) else 80) - 50)
+    if len(_video_name) > _max_desc:
+        _video_name = _video_name[: _max_desc - 1] + "…"
     pbar = tqdm(
         total=total_frames,
         initial=min(start_frame, total_frames),
-        desc=f"处理视频: {os.path.basename(video_path)}",
+        desc=f"处理视频: {_video_name}",
     )
 
     frame_count = start_frame
@@ -2493,8 +2516,11 @@ def process_directory_videos(
     # 处理视频文件
     failed_videos = []
     completed_count = 0
+    pending_claim_md5s = {md5 for _, _, md5 in video_files}
     for video_file, duration, md5 in video_files:
         if _pause_requested():
+            for pending_md5 in pending_claim_md5s:
+                _release_claim_safely(pending_md5)
             raise PauseRequested()
         if duration == float("inf"):
             print(f"提示: 无法获取视频时长，仍尝试处理: {video_file}")
@@ -2514,14 +2540,17 @@ def process_directory_videos(
             if _pause_requested():
                 raise PauseRequested()
         except (PauseRequested, KeyboardInterrupt):
-            _release_claim_safely(md5)
+            for pending_md5 in pending_claim_md5s:
+                _release_claim_safely(pending_md5)
             raise
         except Exception:
             _release_claim_safely(md5)
+            pending_claim_md5s.discard(md5)
             _LOGGER.error("Video failed: %s\n%s", video_file, traceback.format_exc())
             failed_videos.append(video_file)
             continue
         _mark_video_completed(video_file, detections, file_md5=md5)
+        pending_claim_md5s.discard(md5)
         completed_count += 1
         # 视频处理完成后强制垃圾回收
         gc.collect()
