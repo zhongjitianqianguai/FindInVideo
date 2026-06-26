@@ -14,22 +14,23 @@ import re
 import time
 import hashlib
 import logging
-import signal
 import socket
-import threading
-import ctypes
-import errno
 import traceback
 import faulthandler
-import ntpath
-from ctypes import wintypes
 
-# 常见的视频文件扩展名
-VIDEO_EXTENSIONS = {
-    '.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.m4v',
-    '.mpg', '.mpeg', '.3gp', '.f4v', '.ts', '.vob', '.rmvb', '.rm',
-    '.asf', '.divx', '.xvid', '.m2ts', '.mts'
-}
+from utils import (
+    VIDEO_EXTENSIONS, DONE_SUFFIX, _IGNORED_SUBDIRS,
+    PauseRequested, _STOP_REQUESTED,
+    _read_frame_with_timeout, _READ_TIMEOUT_SEC,
+    _truthy_env, _get_pause_file_path, _pause_requested, _install_pause_signal_handler,
+    CHECKPOINT_SUFFIX, _checkpoint_path, _load_checkpoint, _save_checkpoint, _clear_checkpoint,
+    is_windows_style_path, windows_path_to_wsl, wsl_path_to_windows,
+    normalize_posix_path_with_fs, windows_path_to_unc, canonical_video_path,
+    safe_artifact_basename, _sanitize_basename, legacy_artifact_basename, _legacy_artifact_basename_v1,
+    _get_env_path, get_shared_state_dir, ensure_shared_state_dir,
+    _atomic_create_file, _with_lockfile,
+    is_video_file, is_leaf_directory, count_videos_in_directory,
+)
 
 # 需要排除的路径变量
 EXCLUDE_PATHS = [
@@ -40,146 +41,6 @@ EXCLUDE_PATHS = [
 
 _LOGGER = logging.getLogger("findinvideo_yolov5")
 _CRASH_LOG_FH = None
-
-
-class PauseRequested(Exception):
-    """Raised to request a graceful stop with checkpoint saved."""
-
-
-_STOP_REQUESTED = False
-
-# ---------- cap.read() 超时包装 ----------
-_READ_TIMEOUT_SEC = 30
-
-
-def _read_frame_with_timeout(cap, timeout=_READ_TIMEOUT_SEC):
-    """在子线程中调用 cap.read()，超时后返回 (False, None, True)。
-
-    返回 (success, frame, timed_out)。
-    """
-    result = [False, None]
-
-    def _reader():
-        try:
-            result[0], result[1] = cap.read()
-        except Exception:
-            result[0], result[1] = False, None
-
-    t = threading.Thread(target=_reader, daemon=True)
-    t.start()
-    t.join(timeout=timeout)
-    if t.is_alive():
-        return False, None, True
-    return result[0], result[1], False
-
-
-def _truthy_env(name, default=False):
-    val = os.environ.get(name)
-    if val is None:
-        return default
-    return str(val).strip().lower() in ('1', 'true', 'yes', 'y', 'on')
-
-
-def _get_pause_file_path():
-    """Return the pause flag path (best-effort)."""
-    explicit = os.environ.get('FINDINVIDEO_PAUSE_FILE')
-    if explicit:
-        return explicit
-    shared = get_shared_state_dir()
-    if shared:
-        return os.path.join(shared, 'pause.flag')
-    try:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-    except Exception:
-        base_dir = os.getcwd()
-    return os.path.join(base_dir, 'pause.flag')
-
-
-def _pause_requested(pause_file_path=None):
-    if _STOP_REQUESTED:
-        return True
-    path = pause_file_path or _get_pause_file_path()
-    try:
-        return bool(path) and os.path.exists(path)
-    except Exception:
-        return False
-
-
-def _install_pause_signal_handler():
-    """Make Ctrl+C request a graceful pause (not a hard abort)."""
-    def _handler(signum, frame):
-        global _STOP_REQUESTED
-        _STOP_REQUESTED = True
-        try:
-            print("\n收到 Ctrl+C：已请求暂停，当前帧结束后将保存进度并退出，不会继续处理后续视频。")
-        except Exception:
-            pass
-    try:
-        signal.signal(signal.SIGINT, _handler)
-    except Exception:
-        pass
-
-
-CHECKPOINT_SUFFIX = '.checkpoint.json'
-
-
-def _checkpoint_path(video_path):
-    video_dir = os.path.dirname(video_path) or '.'
-    base = safe_artifact_basename(video_path)
-    return os.path.join(video_dir, base + CHECKPOINT_SUFFIX)
-
-
-def _load_checkpoint(video_path):
-    path = _checkpoint_path(video_path)
-    try:
-        if not os.path.exists(path):
-            return None
-        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-            data = json.load(f)
-        try:
-            st = os.stat(video_path)
-            if data.get('size') not in (None, st.st_size):
-                return None
-            if data.get('mtime') is not None and abs(float(data.get('mtime')) - float(st.st_mtime)) > 2.0:
-                return None
-        except Exception:
-            pass
-        return data
-    except Exception:
-        return None
-
-
-def _save_checkpoint(video_path, next_frame, detections, last_detected):
-    path = _checkpoint_path(video_path)
-    payload = {
-        'version': 1,
-        'next_frame': int(max(0, next_frame or 0)),
-        'detections': detections or [],
-        'last_detected': float(last_detected) if last_detected is not None else -5.0,
-        'saved_at': time.time(),
-    }
-    try:
-        st = os.stat(video_path)
-        payload['size'] = st.st_size
-        payload['mtime'] = st.st_mtime
-    except Exception:
-        pass
-    try:
-        tmp = path + '.tmp'
-        with open(tmp, 'w', encoding='utf-8', errors='ignore') as f:
-            json.dump(payload, f, ensure_ascii=False)
-        os.replace(tmp, path)
-    except Exception:
-        pass
-
-
-def _clear_checkpoint(video_path):
-    path = _checkpoint_path(video_path)
-    try:
-        if os.path.exists(path):
-            os.remove(path)
-    except Exception:
-        pass
 
 
 def _setup_diagnostics():
@@ -221,194 +82,6 @@ def _setup_diagnostics():
         _LOGGER.info("Diagnostics enabled. Logs: %s", run_log_path)
     except Exception:
         pass
-
-
-def is_windows_style_path(path):
-    if not path or not isinstance(path, str):
-        return False
-    if len(path) < 2:
-        return False
-    drive, sep = path[0], path[1]
-    return drive.isalpha() and sep == ':'
-
-
-def windows_path_to_wsl(path):
-    if not path:
-        return None
-    try:
-        result = subprocess.run(['wslpath', '-a', path], check=True,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, encoding='utf-8', errors='ignore')
-        converted = result.stdout.strip()
-        return converted or None
-    except Exception:
-        if is_windows_style_path(path):
-            drive = path[0].lower()
-            remainder = path[2:].replace('\\', '/').lstrip('/')
-            return f"/mnt/{drive}/{remainder}" if remainder else f"/mnt/{drive}"
-        return None
-
-
-def wsl_path_to_windows(path):
-    if not path:
-        return None
-    try:
-        result = subprocess.run(['wslpath', '-w', path], check=True,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, encoding='utf-8', errors='ignore')
-        converted = result.stdout.strip()
-        return converted or None
-    except Exception:
-        prefix = '/mnt/'
-        if path.startswith(prefix) and len(path) > len(prefix):
-            drive = path[len(prefix)]
-            if drive.isalpha():
-                remainder = path[len(prefix) + 1:].lstrip('/')
-                return f"{drive.upper()}:\\{remainder.replace('/', '\\')}" if remainder else f"{drive.upper()}:\\"
-        return None
-
-
-def normalize_posix_path_with_fs(path):
-    if not path:
-        return None
-    try:
-        resolved = os.path.realpath(path)
-        return resolved
-    except OSError:
-        return os.path.normpath(path)
-
-
-def windows_path_to_unc(path):
-    if os.name != 'nt' or not path:
-        return None
-    try:
-        drive, tail = ntpath.splitdrive(str(path))
-        if not drive or len(drive) < 2 or drive[1] != ':':
-            return None
-        drive_root = drive[0].upper() + ':'
-
-        mpr = ctypes.WinDLL('mpr')
-        WNetGetConnectionW = mpr.WNetGetConnectionW
-        WNetGetConnectionW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
-        WNetGetConnectionW.restype = wintypes.DWORD
-
-        buf_len = wintypes.DWORD(1024)
-        buf = ctypes.create_unicode_buffer(buf_len.value)
-        rc = WNetGetConnectionW(drive_root, buf, ctypes.byref(buf_len))
-        if rc != 0:
-            return None
-        unc_root = buf.value
-        remainder = tail.lstrip('\\/')
-        return unc_root.rstrip('\\/') + ('\\' + remainder if remainder else '')
-    except Exception:
-        return None
-
-
-def canonical_video_path(path):
-    if not path:
-        return None
-    p = str(path)
-    if os.name == 'nt':
-        p_norm = ntpath.normpath(p)
-        unc = windows_path_to_unc(p_norm)
-        if unc:
-            return ntpath.normpath(unc)
-        return p_norm
-    return normalize_posix_path_with_fs(p)
-
-
-def safe_artifact_basename(video_path):
-    """当前格式: 直接使用原始文件名基础名, 在资源管理器中紧跟原视频排序。"""
-    return os.path.splitext(os.path.basename(video_path))[0]
-
-
-def _sanitize_basename(video_path):
-    base_name = os.path.basename(os.path.splitext(video_path)[0])
-    sanitized = ''.join(c if c.isalnum() or c in ('-', '_') else '_' for c in base_name)
-    return sanitized or 'video'
-
-
-def legacy_artifact_basename(video_path, max_length=80):
-    """旧格式 v2: sanitized + stat-hash."""
-    sanitized = _sanitize_basename(video_path)
-    try:
-        st = os.stat(video_path)
-        size = int(getattr(st, 'st_size', 0) or 0)
-        mtime = float(getattr(st, 'st_mtime', 0.0) or 0.0)
-        digest = hashlib.md5(f"{size}|{mtime}".encode('utf-8', 'ignore')).hexdigest()[:8]
-    except Exception:
-        digest = hashlib.md5(sanitized.encode('utf-8', 'ignore')).hexdigest()[:8]
-    limit = max(8, max_length - len(digest) - 1)
-    if len(sanitized) > limit:
-        sanitized = sanitized[:limit]
-    return f"{sanitized}_{digest}"
-
-
-def _legacy_artifact_basename_v1(video_path, max_length=80):
-    """旧格式 v1: sanitized + path-hash."""
-    sanitized = _sanitize_basename(video_path)
-    digest = hashlib.md5(str(video_path).encode('utf-8', 'ignore')).hexdigest()[:8]
-    limit = max(8, max_length - len(digest) - 1)
-    if len(sanitized) > limit:
-        sanitized = sanitized[:limit]
-    return f"{sanitized}_{digest}"
-
-
-def _get_env_path(name):
-    value = os.environ.get(name)
-    if value is None:
-        return None
-    value = str(value).strip()
-    return value or None
-
-
-def get_shared_state_dir():
-    shared = _get_env_path('FINDINVIDEO_SHARED_STATE_DIR')
-    if not shared:
-        return None
-    if os.name == 'posix' and is_windows_style_path(shared):
-        converted = windows_path_to_wsl(shared)
-        if converted:
-            shared = normalize_posix_path_with_fs(converted)
-    return shared
-
-
-def ensure_shared_state_dir():
-    shared = get_shared_state_dir()
-    if not shared:
-        return None
-    try:
-        os.makedirs(shared, exist_ok=True)
-        return shared
-    except Exception as e:
-        print(f"共享状态目录不可用: {shared}, 错误: {e}")
-        return None
-
-
-def _atomic_create_file(path, content):
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    try:
-        fd = os.open(path, flags)
-    except FileExistsError:
-        return False
-    except OSError as e:
-        if getattr(e, 'errno', None) == errno.EEXIST:
-            return False
-        raise
-    try:
-        with os.fdopen(fd, 'w', encoding='utf-8', errors='ignore') as f:
-            f.write(content)
-        return True
-    except Exception:
-        try:
-            os.close(fd)
-        except Exception:
-            pass
-        try:
-            os.unlink(path)
-        except Exception:
-            pass
-        raise
 
 
 def _read_json_file_best_effort(path):
@@ -486,36 +159,6 @@ def release_video_claim(claim_path):
         os.unlink(claim_path)
     except Exception:
         pass
-
-
-def _with_lockfile(lock_path, timeout_seconds=30, stale_seconds=3600):
-    start = time.time()
-    payload = f"host={socket.gethostname()} pid={os.getpid()} start={start}\n"
-    while True:
-        try:
-            created = _atomic_create_file(lock_path, payload)
-            if created:
-                def _release():
-                    try:
-                        os.unlink(lock_path)
-                    except Exception:
-                        pass
-                return _release
-        except Exception:
-            pass
-        try:
-            st = os.stat(lock_path)
-            age = time.time() - float(getattr(st, 'st_mtime', time.time()) or time.time())
-            if stale_seconds > 0 and age > stale_seconds:
-                try:
-                    os.unlink(lock_path)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        if time.time() - start >= timeout_seconds:
-            raise TimeoutError(f"等待锁超时: {lock_path}")
-        time.sleep(0.2)
 
 
 ARTIFACT_SUFFIXES = [
@@ -696,38 +339,6 @@ def is_path_already_yoloed(file_path):
     if canon:
         candidates.append(canon)
     return any(c in _YOLOED_PATH_CACHE for c in candidates)
-
-def is_video_file(file_path):
-    """检查文件是否为视频文件"""
-    _, ext = os.path.splitext(file_path.lower())
-    return ext in VIDEO_EXTENSIONS
-
-_IGNORED_SUBDIRS = {'_detected', 'yolov5_output', '__pycache__', '.git', '$RECYCLE.BIN', 'System Volume Information'}
-
-def is_leaf_directory(dir_path):
-    """检查目录是否为叶子节点（不包含子目录，忽略工具生成的输出目录）"""
-    try:
-        for item in os.listdir(dir_path):
-            if item in _IGNORED_SUBDIRS:
-                continue
-            item_path = os.path.join(dir_path, item)
-            if os.path.isdir(item_path):
-                return False
-        return True
-    except (PermissionError, FileNotFoundError, OSError):
-        return False
-
-def count_videos_in_directory(dir_path):
-    """统计目录中的视频文件数量"""
-    count = 0
-    try:
-        for file in os.listdir(dir_path):
-            file_path = os.path.join(dir_path, file)
-            if os.path.isfile(file_path) and is_video_file(file_path):
-                count += 1
-    except (PermissionError, FileNotFoundError, OSError):
-        pass
-    return count
 
 def find_leaf_directories_with_videos(root_path, exclusions=None):
     """

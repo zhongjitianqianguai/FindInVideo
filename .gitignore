@@ -1,4 +1,7 @@
 .venv/*
-__pycache__/*
+**/__pycache__/*
 logs/*
+*.pyc
 nul
+processed_files_md5.txt
+md5_list/yoloed.txt
