@@ -318,6 +318,36 @@ def is_video_file(file_path):
     return ext in VIDEO_EXTENSIONS
 
 
+def is_leaf_directory(dir_path):
+    """检查目录是否为叶子节点（不包含子目录，忽略工具生成的输出目录）"""
+    try:
+        for item in os.listdir(dir_path):
+            if item in _IGNORED_SUBDIRS:
+                continue
+            item_path = os.path.join(dir_path, item)
+            if os.path.isdir(item_path):
+                return False
+        return True
+    except (PermissionError, FileNotFoundError, OSError):
+        return False
+
+
+def count_videos_in_directory(dir_path):
+    """统计目录中的视频文件数量"""
+    cached = DIRECTORY_INDEX.get_video_count(dir_path)
+    if cached is not None:
+        return cached
+    count = 0
+    try:
+        for file in os.listdir(dir_path):
+            file_path = os.path.join(dir_path, file)
+            if os.path.isfile(file_path) and is_video_file(file_path):
+                count += 1
+    except (PermissionError, FileNotFoundError):
+        pass
+    return count
+
+
 def safe_artifact_basename(video_path):
     """返回用于创建衍生文件的基础名（= 原视频文件名去掉扩展名）。"""
     return os.path.splitext(os.path.basename(video_path))[0]
