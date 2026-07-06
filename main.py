@@ -1307,10 +1307,11 @@ if __name__ == "__main__":
 
                 print(f"\n开始按视频数量从多到少的顺序处理叶子节点目录...")
 
-                # 按顺序处理每个叶子目录
+                # 先筛出本轮未处理队列，避免增量处理时继续显示原始排序位置/总目录数
                 db_skipped = 0
                 fs_skipped = 0
                 yoloed_skipped = 0
+                pending_leaf_dirs = []
                 _diag_count = 0  # 诊断计数器：只对前几个未跳过的目录输出详细信息
                 _yoloed_path_count = len(_YOLOED_PATH_CACHE) if _YOLOED_PATH_CACHE else 0
                 _yoloed_basename_count = (
@@ -1346,6 +1347,24 @@ if __name__ == "__main__":
                     if _check_all_videos_done(dir_path):
                         yoloed_skipped += 1
                         continue
+
+                    pending_leaf_dirs.append(
+                        (dir_path, video_count, all_processed, relative_path, dir_info)
+                    )
+
+                pending_count = len(pending_leaf_dirs)
+                if pending_count == 0:
+                    print("\n所有目录均已处理完成，无需继续处理")
+
+                for queue_index, (
+                    dir_path,
+                    video_count,
+                    all_processed,
+                    relative_path,
+                    dir_info,
+                ) in enumerate(pending_leaf_dirs, 1):
+                    if _pause_requested():
+                        raise PauseRequested()
 
                     # 诊断输出：前3个未跳过的目录打印详细原因
                     if _diag_count < 3:
@@ -1388,7 +1407,7 @@ if __name__ == "__main__":
                             print(f"  诊断读取失败: {_de}")
 
                     print(
-                        f"\n=== [{i}/{len(leaf_dirs)}] {relative_path} ({video_count} 个视频) ==="
+                        f"\n=== [未处理队列 {queue_index}/{pending_count}] {relative_path} ({video_count} 个视频) ==="
                     )
                     actually_processed = process_directory_videos(
                         dir_path, target_item, all_objects_switch

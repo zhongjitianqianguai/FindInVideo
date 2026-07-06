@@ -1124,10 +1124,11 @@ if __name__ == "__main__":
 
                 print(f"\n开始按视频数量从多到少的顺序处理叶子节点目录...")
 
-                # 按顺序处理每个叶子目录
+                # 先筛出本轮未处理队列，避免增量处理时继续显示原始排序位置/总目录数
                 db_skipped = 0
                 processed_this_round = 0
-                for i, (dir_path, video_count, _) in enumerate(leaf_dirs, 1):
+                pending_leaf_dirs = []
+                for dir_path, video_count, _ in leaf_dirs:
                     relative_path = _safe_relpath(dir_path, video_path)
 
                     # 数据库快速跳过：has_artifact=True 且目录 mtime 未变 → 无需任何I/O
@@ -1143,8 +1144,14 @@ if __name__ == "__main__":
                             except (PermissionError, FileNotFoundError, OSError):
                                 pass  # 无法获取mtime，退回到正常处理流程
 
+                    pending_leaf_dirs.append((dir_path, video_count, relative_path))
+
+                pending_count = len(pending_leaf_dirs)
+                for queue_index, (dir_path, video_count, relative_path) in enumerate(
+                    pending_leaf_dirs, 1
+                ):
                     print(
-                        f"\n=== [{i}/{len(leaf_dirs)}] {relative_path} ({video_count} 个视频) ==="
+                        f"\n=== [未处理队列 {queue_index}/{pending_count}] {relative_path} ({video_count} 个视频) ==="
                     )
                     process_directory_videos(
                         dir_path, target_item, model, all_objects_switch
