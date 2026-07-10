@@ -17,6 +17,169 @@ import ntpath
 import ctypes
 from ctypes import wintypes
 import atexit
+import uuid
+
+
+def _get_process_started_at(pid):
+    """获取本机进程启动时间，用于识别 PID 复用；无法确认时返回 None。"""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+
+    if os.name == 'nt':
+        try:
+            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            open_process = kernel32.OpenProcess
+            open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            open_process.restype = wintypes.HANDLE
+            get_process_times = kernel32.GetProcessTimes
+            get_process_times.argtypes = [
+                wintypes.HANDLE,
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+            ]
+            get_process_times.restype = wintypes.BOOL
+            close_handle = kernel32.CloseHandle
+            close_handle.argtypes = [wintypes.HANDLE]
+            close_handle.restype = wintypes.BOOL
+
+            handle = open_process(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                return None
+            try:
+                creation = wintypes.FILETIME()
+                exit_time = wintypes.FILETIME()
+                kernel_time = wintypes.FILETIME()
+                user_time = wintypes.FILETIME()
+                if not get_process_times(
+                    handle,
+                    ctypes.byref(creation),
+                    ctypes.byref(exit_time),
+                    ctypes.byref(kernel_time),
+                    ctypes.byref(user_time),
+                ):
+                    return None
+                ticks = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+                return ticks / 10_000_000.0 - 11_644_473_600.0
+            finally:
+                close_handle(handle)
+        except Exception:
+            return None
+
+    try:
+        with open(f'/proc/{pid}/stat', 'r', encoding='utf-8', errors='ignore') as f:
+            stat_line = f.read()
+        right_paren = stat_line.rfind(')')
+        if right_paren < 0:
+            return None
+        fields = stat_line[right_paren + 2:].split()
+        start_ticks = int(fields[19])
+        clock_ticks = int(os.sysconf('SC_CLK_TCK'))
+        boot_time = None
+        with open('/proc/stat', 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                if line.startswith('btime '):
+                    boot_time = float(line.split()[1])
+                    break
+        if boot_time is None or clock_ticks <= 0:
+            return None
+        return boot_time + start_ticks / clock_ticks
+    except Exception:
+        return None
+
+
+def _is_process_alive(pid):
+    """判断本机 PID 是否仍存活；权限不足等未知情况返回 None。"""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+
+    if os.name == 'nt':
+        try:
+            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            open_process = kernel32.OpenProcess
+            open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            open_process.restype = wintypes.HANDLE
+            wait_for_single_object = kernel32.WaitForSingleObject
+            wait_for_single_object.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            wait_for_single_object.restype = wintypes.DWORD
+            close_handle = kernel32.CloseHandle
+            close_handle.argtypes = [wintypes.HANDLE]
+            close_handle.restype = wintypes.BOOL
+
+            handle = open_process(0x00100000 | 0x1000, False, pid)  # SYNCHRONIZE | QUERY
+            if not handle:
+                error = ctypes.get_last_error()
+                if error == 87:  # ERROR_INVALID_PARAMETER
+                    return False
+                return None
+            try:
+                status = wait_for_single_object(handle, 0)
+                if status == 0:  # WAIT_OBJECT_0
+                    return False
+                if status == 258:  # WAIT_TIMEOUT
+                    return True
+                return None
+            finally:
+                close_handle(handle)
+        except Exception:
+            return None
+
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return None
+    except OSError:
+        return False
+
+
+def _get_machine_id():
+    """获取稳定且脱敏的本机标识；无法确认时返回 None。"""
+    raw_id = None
+    source = None
+    if os.name == 'nt':
+        try:
+            import winreg
+
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r'SOFTWARE\Microsoft\Cryptography',
+            ) as key:
+                raw_id = str(winreg.QueryValueEx(key, 'MachineGuid')[0]).strip()
+                source = 'windows'
+        except Exception:
+            return None
+    else:
+        for path in ('/etc/machine-id', '/var/lib/dbus/machine-id'):
+            try:
+                with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                    raw_id = f.read().strip()
+                if raw_id:
+                    source = 'linux'
+                    break
+            except Exception:
+                continue
+    if not raw_id or not source:
+        return None
+    return hashlib.sha256(f'{source}:{raw_id}'.encode('utf-8')).hexdigest()
+
+
+_PROCESS_HOST_NAME = socket.gethostname()
+_PROCESS_HOST_ID = _get_machine_id()
+_PROCESS_PID = os.getpid()
+_PROCESS_STARTED_AT = _get_process_started_at(_PROCESS_PID)
+_PROCESS_OWNER_TOKEN = uuid.uuid4().hex
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +216,30 @@ _IGNORED_SUBDIRS = {
 
 CHECKPOINT_SUFFIX = '.checkpoint.json'
 
-CLAIM_HEARTBEAT_INTERVAL_FRAMES = 100
+CLAIM_TTL_DEFAULT_SECONDS = 86400
+CLAIM_TTL_MIN_SECONDS = 60
+CLAIM_HEARTBEAT_MAX_SECONDS = 60.0
+
+
+def get_claim_ttl_seconds():
+    """读取 claim TTL，并拒绝短于一分钟的不安全配置。"""
+    try:
+        configured = int(
+            os.environ.get(
+                'FINDINVIDEO_CLAIM_TTL_SECONDS', str(CLAIM_TTL_DEFAULT_SECONDS)
+            )
+        )
+    except (TypeError, ValueError):
+        configured = CLAIM_TTL_DEFAULT_SECONDS
+    return max(CLAIM_TTL_MIN_SECONDS, configured)
+
+
+def get_claim_heartbeat_interval_seconds():
+    """让心跳始终显著短于 TTL，避免活跃 claim 被误回收。"""
+    return max(
+        1.0,
+        min(CLAIM_HEARTBEAT_MAX_SECONDS, get_claim_ttl_seconds() / 3.0),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -419,8 +605,11 @@ def _load_checkpoint(video_path):
 def _checkpoint_owner_snapshot(claim_md5=None):
     """采样当前 checkpoint 写入者信息，便于恢复和排障。"""
     owner = {
-        'host_name': socket.gethostname(),
-        'pid': os.getpid(),
+        'host_name': _PROCESS_HOST_NAME,
+        'host_id': _PROCESS_HOST_ID,
+        'pid': _PROCESS_PID,
+        'owner_token': _PROCESS_OWNER_TOKEN,
+        'owner_started_at': _PROCESS_STARTED_AT,
     }
     if claim_md5:
         owner['claim_md5'] = claim_md5
@@ -463,6 +652,100 @@ def _clear_checkpoint(video_path):
         pass
 
 
+def has_completed_artifact(video_path, existing_names_lower=None):
+    """判断视频是否有可靠的完成产物。
+
+    所有命名版本都只认 ``.done``，避免异常退出留下的 ``_frames.mp4``、
+    ``.txt`` 等半成品被误判为完成。
+    """
+    try:
+        if os.path.exists(_checkpoint_path(video_path)):
+            return False
+    except Exception:
+        pass
+
+    video_dir = os.path.dirname(video_path) or '.'
+
+    def _exists(file_name):
+        if existing_names_lower is not None:
+            return file_name.lower() in existing_names_lower
+        return os.path.exists(os.path.join(video_dir, file_name))
+
+    for base in (
+        safe_artifact_basename(video_path),
+        legacy_artifact_basename(video_path),
+        _legacy_artifact_basename_v1(video_path),
+    ):
+        if _exists(base + DONE_SUFFIX):
+            return True
+    return False
+
+
+_CLAIM_MATCH_MD5_CACHE = {}
+
+
+def _claim_path_aliases(path):
+    """生成不依赖当前操作系统的路径别名，用于 Windows/WSL claim 对照。"""
+    aliases = set()
+
+    def _add(value):
+        if value is None:
+            return
+        normalized = str(value).strip().replace('\\', '/')
+        if normalized:
+            aliases.add(normalized.rstrip('/').casefold())
+
+    raw = str(path or '')
+    _add(raw)
+    try:
+        _add(canonical_video_path(raw))
+    except Exception:
+        pass
+
+    if is_windows_style_path(raw):
+        drive = raw[0].lower()
+        remainder = raw[2:].replace('\\', '/').lstrip('/')
+        _add(f'/mnt/{drive}/{remainder}' if remainder else f'/mnt/{drive}')
+    else:
+        normalized = raw.replace('\\', '/')
+        prefix = '/mnt/'
+        if normalized.casefold().startswith(prefix) and len(normalized) > len(prefix):
+            drive = normalized[len(prefix)]
+            if drive.isalpha():
+                remainder = normalized[len(prefix) + 1:].lstrip('/')
+                _add(f'{drive.upper()}:/{remainder}' if remainder else f'{drive.upper()}:/')
+    return aliases
+
+
+def _claim_path_basename(path):
+    normalized = str(path or '').replace('\\', '/').rstrip('/')
+    return normalized.rsplit('/', 1)[-1].casefold() if normalized else ''
+
+
+def _claim_match_file_md5(path):
+    """只在跨平台路径无法直接对应时计算 MD5，结果按文件状态缓存。"""
+    try:
+        stat_info = os.stat(path)
+        key = (str(path), int(stat_info.st_size), float(stat_info.st_mtime))
+        cached = _CLAIM_MATCH_MD5_CACHE.get(key)
+        if cached is not None:
+            return cached
+        digest = hashlib.md5()
+        with open(path, 'rb') as stream:
+            while True:
+                chunk = stream.read(4 * 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        value = digest.hexdigest()
+        if len(_CLAIM_MATCH_MD5_CACHE) > 2048:
+            _CLAIM_MATCH_MD5_CACHE.clear()
+        _CLAIM_MATCH_MD5_CACHE[key] = value
+        return value
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # 暂停系统
 # ---------------------------------------------------------------------------
@@ -472,6 +755,10 @@ _STOP_REQUESTED = False
 
 class PauseRequested(Exception):
     """Raised to request a graceful stop with checkpoint saved."""
+
+
+class ClaimLostError(RuntimeError):
+    """处理中的视频 claim 已被回收或转移。"""
 
 
 def _install_pause_signal_handler():
@@ -549,7 +836,27 @@ def _read_frame_with_timeout(cap, timeout=_READ_TIMEOUT_SEC):
 class DirectoryIndex:
     """SQLite-backed cache for directory metadata and video listings."""
 
-    def __init__(self, db_path=None):
+    def __init__(
+        self,
+        db_path=None,
+        owner_token=None,
+        host_name=None,
+        host_id=None,
+        pid=None,
+        process_started_at=None,
+    ):
+        self.owner_token = owner_token if owner_token is not None else _PROCESS_OWNER_TOKEN
+        self.host_name = host_name if host_name is not None else _PROCESS_HOST_NAME
+        self.host_id = host_id if host_id is not None else _PROCESS_HOST_ID
+        self.pid = int(pid if pid is not None else _PROCESS_PID)
+        started_at = (
+            process_started_at
+            if process_started_at is not None
+            else _PROCESS_STARTED_AT
+        )
+        self.process_started_at = (
+            float(started_at) if started_at is not None else None
+        )
         self.db_path = db_path or ':memory:'
         self.conn = sqlite3.connect(self.db_path, timeout=60)
         self.conn.row_factory = sqlite3.Row
@@ -631,11 +938,21 @@ class DirectoryIndex:
                             claimed_at REAL,
                             heartbeat_at REAL,
                             host_name TEXT,
-                            pid INTEGER
+                            host_id TEXT,
+                            pid INTEGER,
+                            owner_token TEXT,
+                            owner_started_at REAL
                         )
                         """
                     )
                     self._ensure_claim_schema_compat()
+                    self.conn.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_processing_claims_heartbeat
+                        ON processing_claims(heartbeat_at)
+                        """
+                    )
+                    self._ensure_completion_semantics_compat()
                 return
             except sqlite3.OperationalError as e:
                 if self._is_lock_error(e):
@@ -643,7 +960,7 @@ class DirectoryIndex:
                         print(f"创建表结构被锁，重试中({_attempt + 1}/3)...")
                         time.sleep(5)
                     else:
-                        print(f"创建表结构被锁，跳过（表可能已存在）: {e}")
+                        raise RuntimeError(f"创建必要表结构失败: {e}") from e
                 else:
                     raise
 
@@ -655,16 +972,68 @@ class DirectoryIndex:
 
     def _ensure_claim_schema_compat(self):
         """为旧数据库补齐 processing_claims 新字段。"""
-        try:
-            rows = self.conn.execute('PRAGMA table_info(processing_claims)').fetchall()
-        except sqlite3.DatabaseError:
+        additions = {
+            'heartbeat_at': 'REAL',
+            'host_id': 'TEXT',
+            'owner_token': 'TEXT',
+            'owner_started_at': 'REAL',
+        }
+        for column, column_type in additions.items():
+            try:
+                rows = self.conn.execute('PRAGMA table_info(processing_claims)').fetchall()
+                columns = {
+                    row['name'] if isinstance(row, sqlite3.Row) else row[1]
+                    for row in rows
+                }
+                if column in columns:
+                    continue
+                self.conn.execute(
+                    f'ALTER TABLE processing_claims ADD COLUMN {column} {column_type}'
+                )
+            except sqlite3.OperationalError as e:
+                # 多实例可能同时迁移；若另一实例已经补列，则视为成功。
+                rows = self.conn.execute('PRAGMA table_info(processing_claims)').fetchall()
+                columns = {
+                    row['name'] if isinstance(row, sqlite3.Row) else row[1]
+                    for row in rows
+                }
+                if column not in columns:
+                    raise e
+        rows = self.conn.execute('PRAGMA table_info(processing_claims)').fetchall()
+        columns = {
+            row['name'] if isinstance(row, sqlite3.Row) else row[1]
+            for row in rows
+        }
+        missing = set(additions) - columns
+        if missing:
+            raise RuntimeError(
+                f"processing_claims 缺少必要字段: {', '.join(sorted(missing))}"
+            )
+
+    def _ensure_completion_semantics_compat(self):
+        """完成产物改为只认 .done 时，使旧目录缓存强制重新扫描一次。"""
+        marker_key = 'completion_requires_done_v1'
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS index_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+            """
+        )
+        claimed = self.conn.execute(
+            'INSERT OR IGNORE INTO index_metadata (key, value) VALUES (?, ?)',
+            (marker_key, str(time.time())),
+        )
+        if claimed.rowcount != 1:
             return
-        columns = {row['name'] if isinstance(row, sqlite3.Row) else row[1] for row in rows}
-        if 'heartbeat_at' not in columns:
-            self.conn.execute('ALTER TABLE processing_claims ADD COLUMN heartbeat_at REAL')
+        self.conn.execute(
+            'UPDATE directories SET has_artifact=0, dir_mtime=NULL'
+        )
 
     def reopen(self, new_db_path):
         """关闭当前连接并在新路径重新打开数据库。"""
+        self.release_all_claims()
         self.close()
         self.db_path = new_db_path
         folder = os.path.dirname(new_db_path)
@@ -689,6 +1058,9 @@ class DirectoryIndex:
                 else:
                     raise
         self._ensure_schema()
+        cleaned = self.cleanup_stale_claims()
+        if cleaned:
+            print(f"已清理 {cleaned} 条失效视频声明")
         print(f"数据库已打开: {self.db_path}")
 
     def _check_integrity(self):
@@ -934,11 +1306,16 @@ class DirectoryIndex:
 
         if video_records:
             processed_count = 0
+            video_paths = []
             for v_name, _, _ in video_records:
-                v_base = os.path.splitext(v_name)[0].lower()
-                if any((v_base + s.lower()) in all_file_names_lower for s in ARTIFACT_SUFFIXES):
+                video_path = os.path.join(normalized, v_name)
+                video_paths.append(video_path)
+                if has_completed_artifact(video_path, all_file_names_lower):
                     processed_count += 1
-            has_artifact = processed_count == len(video_records)
+            has_artifact = (
+                processed_count == len(video_records)
+                and not self.has_active_claims_for_paths(video_paths)
+            )
         else:
             has_artifact = False
 
@@ -1113,6 +1490,99 @@ class DirectoryIndex:
         except Exception as e:
             print(f"标记目录已处理失败: {e}")
 
+    @staticmethod
+    def _directory_completion_snapshot(dir_path, video_paths):
+        """在写锁外用一次目录扫描取得稳定的视频/checkpoint 快照。"""
+        expected_videos = {
+            _claim_path_basename(path) for path in video_paths or []
+        }
+        try:
+            before = os.stat(dir_path)
+            names_lower = set()
+            actual_videos = set()
+            with os.scandir(dir_path) as iterator:
+                for entry in iterator:
+                    name_key = entry.name.casefold()
+                    names_lower.add(name_key)
+                    if is_video_file(entry.name):
+                        actual_videos.add(_claim_path_basename(entry.name))
+            after = os.stat(dir_path)
+        except (PermissionError, FileNotFoundError, OSError):
+            return None
+
+        before_token = (
+            int(getattr(before, 'st_mtime_ns', before.st_mtime * 1_000_000_000)),
+            int(getattr(before, 'st_size', 0)),
+        )
+        after_token = (
+            int(getattr(after, 'st_mtime_ns', after.st_mtime * 1_000_000_000)),
+            int(getattr(after, 'st_size', 0)),
+        )
+        if before_token != after_token or actual_videos != expected_videos:
+            return None
+        for video_name in actual_videos:
+            checkpoint_name = (
+                os.path.splitext(video_name)[0] + CHECKPOINT_SUFFIX
+            ).casefold()
+            if checkpoint_name in names_lower:
+                return None
+        return {
+            'mtime': float(after.st_mtime),
+            'token': after_token,
+        }
+
+    def mark_directory_processed_if_idle(self, dir_path, video_paths):
+        """在写锁内确认无 checkpoint/claim 后标记目录完成。
+
+        这里有意对整个共享索引中的 claim 保守：目录完成标记只是快速跳过优化，
+        宁可延后一轮写入，也不能在另一实例仍工作时制造完成态竞态。
+        """
+        normalized = self._normalize_path(dir_path)
+        if not normalized:
+            return False
+        snapshot = self._directory_completion_snapshot(normalized, video_paths)
+        if snapshot is None:
+            return False
+        self.cleanup_stale_claims()
+        try:
+            self.conn.execute('BEGIN IMMEDIATE')
+            if self.conn.execute(
+                'SELECT 1 FROM processing_claims LIMIT 1'
+            ).fetchone() is not None:
+                self.conn.rollback()
+                return False
+            try:
+                locked_stat = os.stat(normalized)
+            except (PermissionError, FileNotFoundError, OSError):
+                self.conn.rollback()
+                return False
+            locked_token = (
+                int(
+                    getattr(
+                        locked_stat,
+                        'st_mtime_ns',
+                        locked_stat.st_mtime * 1_000_000_000,
+                    )
+                ),
+                int(getattr(locked_stat, 'st_size', 0)),
+            )
+            if locked_token != snapshot['token']:
+                self.conn.rollback()
+                return False
+            self.conn.execute(
+                'UPDATE directories SET has_artifact=1, dir_mtime=? WHERE path=?',
+                (snapshot['mtime'], normalized),
+            )
+            self.conn.commit()
+            return True
+        except Exception as e:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            print(f"原子标记目录已处理失败: {e}")
+            return False
+
     def get_videos(self, dir_path):
         normalized = self._normalize_path(dir_path)
         if not normalized:
@@ -1130,61 +1600,312 @@ class DirectoryIndex:
             raise
         return [row['file_name'] for row in rows]
 
+    def _upsert_processed_video(
+        self, file_md5, video_path, detection_count=0, model_name=None
+    ):
+        self.conn.execute(
+            """
+            INSERT INTO processed_videos (
+                file_md5, video_path, processed_at, detection_count, model_name
+            )
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(file_md5) DO UPDATE SET
+                video_path=excluded.video_path,
+                processed_at=excluded.processed_at,
+                detection_count=excluded.detection_count,
+                model_name=excluded.model_name
+            """,
+            (
+                file_md5,
+                str(video_path) if video_path else None,
+                time.time(),
+                detection_count,
+                model_name,
+            ),
+        )
+
     def mark_video_processed(self, file_md5, video_path, detection_count=0, model_name=None):
-        """将视频标记为已处理（基于文件MD5，跨机器通用）。"""
+        """补录视频完成状态，不触碰可能属于其他进程的 claim。"""
         if not file_md5:
-            return
-        now = time.time()
+            return False
         try:
             with self.conn:
-                self.conn.execute(
+                cur = self.conn.execute(
                     """
-                    INSERT INTO processed_videos (file_md5, video_path, processed_at, detection_count, model_name)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO processed_videos (
+                        file_md5, video_path, processed_at, detection_count, model_name
+                    )
+                    SELECT ?, ?, ?, ?, ?
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM processing_claims WHERE file_md5=?
+                    )
                     ON CONFLICT(file_md5) DO UPDATE SET
                         video_path=excluded.video_path,
                         processed_at=excluded.processed_at,
                         detection_count=excluded.detection_count,
                         model_name=excluded.model_name
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM processing_claims
+                        WHERE file_md5=excluded.file_md5
+                    )
                     """,
-                    (file_md5, str(video_path) if video_path else None, now, detection_count, model_name))
-                self.conn.execute(
-                    'DELETE FROM processing_claims WHERE file_md5=?', (file_md5,))
+                    (
+                        file_md5,
+                        str(video_path) if video_path else None,
+                        time.time(),
+                        detection_count,
+                        model_name,
+                        file_md5,
+                    ),
+                )
+            return cur.rowcount == 1
         except Exception as e:
             print(f"标记视频已处理失败: {e}")
+            return False
 
-    def is_video_processed_by_md5(self, file_md5):
+    def complete_claimed_video(
+        self, file_md5, video_path, detection_count=0, model_name=None
+    ):
+        """仅允许当前 claim 持有者在同一事务中消费 claim 并写入完成态。"""
+        if not file_md5:
+            return False
+        try:
+            with self.conn:
+                cur = self.conn.execute(
+                    """
+                    DELETE FROM processing_claims
+                    WHERE file_md5=? AND owner_token=?
+                    """,
+                    (file_md5, self.owner_token),
+                )
+                if cur.rowcount != 1:
+                    return False
+                self._upsert_processed_video(
+                    file_md5, video_path, detection_count, model_name
+                )
+            return True
+        except Exception as e:
+            print(f"完成视频 claim 失败: {e}")
+            return False
+
+    def is_video_processed_by_md5(self, file_md5, include_directory_backfill=True):
         """根据文件MD5查询视频是否已处理过。"""
         if not file_md5:
             return False
         try:
             row = self.conn.execute(
-                'SELECT 1 FROM processed_videos WHERE file_md5=?', (file_md5,)).fetchone()
-            return row is not None
+                'SELECT detection_count FROM processed_videos WHERE file_md5=?',
+                (file_md5,),
+            ).fetchone()
+            if row is None:
+                return False
+            if not include_directory_backfill and row['detection_count'] == -1:
+                return False
+            return True
         except Exception:
             return False
 
+    @staticmethod
+    def _claim_ttl_seconds():
+        return get_claim_ttl_seconds()
+
+    def _get_claim_row(self, file_md5):
+        return self.conn.execute(
+            """
+            SELECT file_md5, video_path, claimed_at, heartbeat_at,
+                   host_name, host_id, pid, owner_token, owner_started_at
+            FROM processing_claims
+            WHERE file_md5=?
+            """,
+            (file_md5,),
+        ).fetchone()
+
+    @staticmethod
+    def _claim_snapshot_values(row):
+        return (
+            row['file_md5'],
+            row['video_path'],
+            row['claimed_at'],
+            row['heartbeat_at'],
+            row['host_name'],
+            row['host_id'],
+            row['pid'],
+            row['owner_token'],
+            row['owner_started_at'],
+        )
+
+    def _local_claim_owner_alive(self, row):
+        """返回本机 claim 持有者是否仍是原进程；无法确认时返回 None。"""
+        if row['owner_token'] and row['owner_token'] == self.owner_token:
+            return True
+        alive = _is_process_alive(row['pid'])
+        if alive is not True:
+            return alive
+
+        actual_started_at = _get_process_started_at(row['pid'])
+        expected_started_at = row['owner_started_at']
+        if actual_started_at is not None and expected_started_at is not None:
+            return float(actual_started_at) == float(expected_started_at)
+
+        # 兼容旧表：若当前 PID 的进程启动时间晚于 claim 创建时间，说明 PID 已复用。
+        if actual_started_at is not None and row['claimed_at'] is not None:
+            if float(actual_started_at) > float(row['claimed_at']):
+                return False
+        # PID 存活但无法核对启动身份时不能永久保留；返回 None 让 TTL 决定。
+        return None
+
+    def _claim_is_reclaimable(self, row, now=None):
+        now = time.time() if now is None else float(now)
+        same_machine = bool(row['host_id'] and self.host_id) and (
+            str(row['host_id']) == str(self.host_id)
+        )
+        legacy_same_machine = (
+            not row['host_id']
+            and not row['owner_token']
+            and bool(row['host_name'] and self.host_name)
+            and str(row['host_name']).casefold() == str(self.host_name).casefold()
+        )
+        if same_machine or legacy_same_machine:
+            alive = self._local_claim_owner_alive(row)
+            if alive is True:
+                return False
+            if alive is False:
+                return True
+
+        last_heartbeat = row['heartbeat_at'] or row['claimed_at'] or 0
+        return now - float(last_heartbeat) > self._claim_ttl_seconds()
+
+    def _invalidate_claim_directory(self, video_path):
+        """领取视频时撤销父目录完成标记；调用方必须位于同一写事务内。"""
+        if not video_path:
+            return
+        parent = self._normalize_path(os.path.dirname(str(video_path)))
+        if parent:
+            self.conn.execute(
+                'UPDATE directories SET has_artifact=0 WHERE path=?',
+                (parent,),
+            )
+
+    def _replace_claim_snapshot(self, row, video_path, now):
+        """仅在 claim 快照未变化时原子接管，避免误删或覆盖新持有者。"""
+        with self.conn:
+            cur = self.conn.execute(
+                """
+                UPDATE processing_claims
+                SET video_path=?, claimed_at=?, heartbeat_at=?, host_name=?, host_id=?,
+                    pid=?, owner_token=?, owner_started_at=?
+                WHERE file_md5=?
+                  AND video_path IS ?
+                  AND claimed_at IS ?
+                  AND heartbeat_at IS ?
+                  AND host_name IS ?
+                  AND host_id IS ?
+                  AND pid IS ?
+                  AND owner_token IS ?
+                  AND owner_started_at IS ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM processed_videos
+                      WHERE processed_videos.file_md5=processing_claims.file_md5
+                  )
+                """,
+                (
+                    str(video_path) if video_path else None,
+                    now,
+                    now,
+                    self.host_name,
+                    self.host_id,
+                    self.pid,
+                    self.owner_token,
+                    self.process_started_at,
+                    *self._claim_snapshot_values(row),
+                ),
+            )
+            if cur.rowcount == 1:
+                self._invalidate_claim_directory(video_path)
+        return cur.rowcount == 1
+
+    def _delete_claim_snapshot(self, row):
+        with self.conn:
+            cur = self.conn.execute(
+                """
+                DELETE FROM processing_claims
+                WHERE file_md5=?
+                  AND video_path IS ?
+                  AND claimed_at IS ?
+                  AND heartbeat_at IS ?
+                  AND host_name IS ?
+                  AND host_id IS ?
+                  AND pid IS ?
+                  AND owner_token IS ?
+                  AND owner_started_at IS ?
+                """,
+                self._claim_snapshot_values(row),
+            )
+        return cur.rowcount == 1
+
     def try_claim_video(self, file_md5, video_path):
-        """尝试声明视频为"正在处理"状态。"""
+        """在开工前原子领取视频；同机死进程可立即接管。"""
         if not file_md5:
             return False
-        now = time.time()
-        host_name = socket.gethostname()
-        pid = os.getpid()
         try:
-            self.conn.execute(
-                """
-                INSERT INTO processing_claims (file_md5, video_path, claimed_at, heartbeat_at, host_name, pid)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(file_md5) DO NOTHING
-                """,
-                (file_md5, str(video_path) if video_path else None, now, now, host_name, pid))
-            self.conn.commit()
-            row = self.conn.execute(
-                'SELECT host_name, pid FROM processing_claims WHERE file_md5=?',
-                (file_md5,)).fetchone()
-            if row and row['host_name'] == host_name and row['pid'] == pid:
-                return True
+            resume_incomplete = bool(video_path) and os.path.exists(
+                _checkpoint_path(video_path)
+            )
+        except Exception:
+            resume_incomplete = False
+        try:
+            for _attempt in range(3):
+                now = time.time()
+                with self.conn:
+                    if resume_incomplete:
+                        self.conn.execute(
+                            """
+                            DELETE FROM processed_videos
+                            WHERE file_md5=? AND detection_count=-1
+                            """,
+                            (file_md5,),
+                        )
+                    cur = self.conn.execute(
+                        """
+                        INSERT INTO processing_claims (
+                            file_md5, video_path, claimed_at, heartbeat_at,
+                            host_name, host_id, pid, owner_token, owner_started_at
+                        )
+                        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM processed_videos WHERE file_md5=?
+                        )
+                        ON CONFLICT(file_md5) DO NOTHING
+                        """,
+                        (
+                            file_md5,
+                            str(video_path) if video_path else None,
+                            now,
+                            now,
+                            self.host_name,
+                            self.host_id,
+                            self.pid,
+                            self.owner_token,
+                            self.process_started_at,
+                            file_md5,
+                        ),
+                    )
+                    if cur.rowcount == 1:
+                        self._invalidate_claim_directory(video_path)
+                if cur.rowcount == 1:
+                    return True
+
+                row = self._get_claim_row(file_md5)
+                if not row:
+                    continue
+                if self.is_video_processed_by_md5(file_md5):
+                    return False
+                if row['owner_token'] == self.owner_token:
+                    return self.refresh_claim(file_md5)
+                if not self._claim_is_reclaimable(row, now=now):
+                    return False
+                if self._replace_claim_snapshot(row, video_path, now):
+                    return True
             return False
         except Exception as e:
             print(f"声明视频处理失败: {e}")
@@ -1196,50 +1917,135 @@ class DirectoryIndex:
             return False
         try:
             now = time.time()
-            host_name = socket.gethostname()
-            pid = os.getpid()
             with self.conn:
                 cur = self.conn.execute(
                     """
                     UPDATE processing_claims
                     SET heartbeat_at=?
-                    WHERE file_md5=? AND host_name=? AND pid=?
+                    WHERE file_md5=? AND owner_token=?
                     """,
-                    (now, file_md5, host_name, pid))
+                    (now, file_md5, self.owner_token),
+                )
             return bool(cur.rowcount)
         except Exception as e:
             print(f"刷新视频声明心跳失败: {e}")
             return False
 
     def release_claim(self, file_md5):
-        """释放视频声明，允许其他机器处理。"""
+        """只释放当前进程会话持有的视频声明。"""
         if not file_md5:
-            return
+            return False
         try:
-            self.conn.execute(
-                'DELETE FROM processing_claims WHERE file_md5=?', (file_md5,))
-            self.conn.commit()
+            with self.conn:
+                cur = self.conn.execute(
+                    """
+                    DELETE FROM processing_claims
+                    WHERE file_md5=? AND owner_token=?
+                    """,
+                    (file_md5, self.owner_token),
+                )
+            return cur.rowcount == 1
         except Exception as e:
             print(f"释放视频声明失败: {e}")
+            return False
+
+    def release_all_claims(self):
+        """释放当前进程会话的全部 claim，用于正常退出和切换数据库。"""
+        try:
+            with self.conn:
+                cur = self.conn.execute(
+                    'DELETE FROM processing_claims WHERE owner_token=?',
+                    (self.owner_token,),
+                )
+            return max(0, int(cur.rowcount or 0))
+        except Exception:
+            return 0
+
+    def cleanup_stale_claims(self):
+        """清理异机过期 claim 和本机已死亡进程 claim。"""
+        cleaned = 0
+        try:
+            rows = self.conn.execute(
+                """
+                SELECT file_md5, video_path, claimed_at, heartbeat_at,
+                       host_name, host_id, pid, owner_token, owner_started_at
+                FROM processing_claims
+                """
+            ).fetchall()
+            now = time.time()
+            for row in rows:
+                if self._claim_is_reclaimable(row, now=now):
+                    cleaned += int(self._delete_claim_snapshot(row))
+        except Exception as e:
+            print(f"清理失效视频声明失败: {e}")
+        return cleaned
 
     def is_video_claimed(self, file_md5):
-        """检查视频是否已被其他机器声明。"""
+        """检查视频是否已有有效 claim，并安全清理确认失效的快照。"""
         if not file_md5:
             return False
         try:
-            row = self.conn.execute(
-                'SELECT host_name, pid, claimed_at, heartbeat_at FROM processing_claims WHERE file_md5=?',
-                (file_md5,)).fetchone()
-            if not row:
-                return False
-            claimed_at = row['heartbeat_at'] or row['claimed_at']
-            ttl = int(os.environ.get('FINDINVIDEO_CLAIM_TTL_SECONDS', '86400'))
-            if time.time() - claimed_at > ttl:
-                self.release_claim(file_md5)
-                return False
-            return True
-        except Exception:
+            for _attempt in range(2):
+                row = self._get_claim_row(file_md5)
+                if not row:
+                    return False
+                if not self._claim_is_reclaimable(row):
+                    return True
+                if self._delete_claim_snapshot(row):
+                    return False
+            return self._get_claim_row(file_md5) is not None
+        except Exception as e:
+            print(f"检查视频声明失败: {e}")
             return False
+
+    def has_active_claims_for_paths(self, video_paths):
+        """检查给定视频路径中是否存在有效 claim，兼容 Windows/WSL 别名。"""
+        target_records = []
+        target_aliases = set()
+        for path in video_paths or []:
+            aliases = _claim_path_aliases(path)
+            target_aliases.update(aliases)
+            target_records.append((path, _claim_path_basename(path)))
+        if not target_records:
+            return False
+        try:
+            rows = self.conn.execute(
+                """
+                SELECT file_md5, video_path, claimed_at, heartbeat_at,
+                       host_name, host_id, pid, owner_token, owner_started_at
+                FROM processing_claims
+                """
+            ).fetchall()
+            unmatched_active_rows = []
+            for row in rows:
+                if self._claim_is_reclaimable(row):
+                    if not self._delete_claim_snapshot(row):
+                        # 快照已变化，说明 claim 被刷新或接管；保守视为仍在使用。
+                        return True
+                    continue
+                if _claim_path_aliases(row['video_path']) & target_aliases:
+                    return True
+                unmatched_active_rows.append(row)
+
+            # UNC 与自定义 WSL 挂载无法仅靠字符串互转时，用 claim 的 MD5 核实。
+            for row in unmatched_active_rows:
+                claim_basename = _claim_path_basename(row['video_path'])
+                if not claim_basename:
+                    continue
+                for path, target_basename in target_records:
+                    if target_basename != claim_basename:
+                        continue
+                    digest = _claim_match_file_md5(path)
+                    if digest is None:
+                        # 同名候选无法核实时宁可延后目录完成，避免误标。
+                        return True
+                    if digest == row['file_md5']:
+                        return True
+            return False
+        except Exception as e:
+            print(f"检查目录视频声明失败: {e}")
+            # 无法确认时保守阻止目录完成，避免把在途视频误标完成。
+            return True
 
 
 # ---------------------------------------------------------------------------
@@ -1248,3 +2054,4 @@ class DirectoryIndex:
 
 DIRECTORY_INDEX = DirectoryIndex()
 atexit.register(DIRECTORY_INDEX.close)
+atexit.register(DIRECTORY_INDEX.release_all_claims)

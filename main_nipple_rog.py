@@ -14,14 +14,15 @@ import traceback
 import utils
 from utils import (
     VIDEO_EXTENSIONS, ARTIFACT_SUFFIXES, DONE_SUFFIX, DIR_ARTIFACT_SKIP_SUFFIXES,
-    _IGNORED_SUBDIRS, CHECKPOINT_SUFFIX, CLAIM_HEARTBEAT_INTERVAL_FRAMES,
-    PauseRequested, DIRECTORY_INDEX,
+    _IGNORED_SUBDIRS, CHECKPOINT_SUFFIX, get_claim_heartbeat_interval_seconds,
+    PauseRequested, ClaimLostError, DIRECTORY_INDEX,
     is_windows_style_path, windows_path_to_wsl, wsl_path_to_windows,
     normalize_posix_path_with_fs, windows_path_to_unc, unc_to_drive_letter,
     _safe_relpath, canonical_video_path,
     _get_env_path, get_shared_state_dir, ensure_shared_state_dir, _truthy_env,
     _atomic_create_file, _with_lockfile,
     safe_artifact_basename, _sanitize_basename, legacy_artifact_basename, _legacy_artifact_basename_v1,
+    has_completed_artifact,
     _checkpoint_path, _load_checkpoint, _save_checkpoint, _clear_checkpoint,
     _install_pause_signal_handler, _get_pause_file_path, _pause_requested,
     is_video_file,
@@ -63,27 +64,8 @@ def _init_processing_root(root_dir):
 
 
 def has_existing_artifacts(video_path):
-    """检查当前视频是否已生成同名衍生文件。"""
-    # 若存在 checkpoint，说明上次是“暂停/中断未完成”，不能当作已完成跳过
-    try:
-        if os.path.exists(_checkpoint_path(video_path)):
-            return False
-    except Exception:
-        pass
-    video_dir = os.path.dirname(video_path) or '.'
-    bases = [safe_artifact_basename(video_path),
-             legacy_artifact_basename(video_path),
-             _legacy_artifact_basename_v1(video_path)]
-    for base in bases:
-        # Fast marker first
-        done_path = os.path.join(video_dir, base + DONE_SUFFIX)
-        if os.path.exists(done_path):
-            return True
-        for suffix in ARTIFACT_SUFFIXES:
-            artifact_path = os.path.join(video_dir, base + suffix)
-            if os.path.exists(artifact_path):
-                return True
-    return False
+    """检查当前视频是否已有可靠完成标记。"""
+    return has_completed_artifact(video_path)
 
 
 def write_done_marker(video_path):
@@ -209,6 +191,10 @@ def detect_objects_in_video(video_path, target_class, model,
 
     pause_file = _get_pause_file_path()
     resume_enabled = _truthy_env('FINDINVIDEO_RESUME', default=True)
+    claim_heartbeat_interval = get_claim_heartbeat_interval_seconds()
+    if claim_md5 and not DIRECTORY_INDEX.refresh_claim(claim_md5):
+        raise ClaimLostError(f"视频声明已失效，无法开始处理: {video_path}")
+    last_claim_heartbeat = time.monotonic()
     imgsz_env = os.environ.get('FINDINVIDEO_IMGSZ')
     try:
         imgsz = int(imgsz_env) if imgsz_env else 1280
@@ -244,8 +230,7 @@ def detect_objects_in_video(video_path, target_class, model,
     # 视频处理初始化
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        print(f"无法打开视频: {video_path}")
-        return []
+        raise RuntimeError(f"无法打开视频: {video_path}")
         
     fps = cap.get(cv2.CAP_PROP_FPS)
     fps_safe = fps if fps and fps > 0 else 25
@@ -277,10 +262,18 @@ def detect_objects_in_video(video_path, target_class, model,
     video_writer = None
     frame_w, frame_h = 0, 0
     
-    paused = False
     last_success_frame = start_frame - 1
     try:
         while cap.isOpened():
+            if claim_md5 and (
+                time.monotonic() - last_claim_heartbeat
+                >= claim_heartbeat_interval
+            ):
+                if not DIRECTORY_INDEX.refresh_claim(claim_md5):
+                    raise ClaimLostError(
+                        f"视频声明已失效，停止处理以避免重复写入: {video_path}"
+                    )
+                last_claim_heartbeat = time.monotonic()
             if _pause_requested(pause_file):
                 _save_checkpoint(
                     video_path,
@@ -290,7 +283,6 @@ def detect_objects_in_video(video_path, target_class, model,
                     claim_md5=claim_md5,
                     last_success_frame=last_success_frame,
                 )
-                paused = True
                 raise PauseRequested()
             success, frame = cap.read()
             if not success:
@@ -398,8 +390,6 @@ def detect_objects_in_video(video_path, target_class, model,
             
             # 每100帧清理一次内存
             if frame_count % 100 == 0:
-                if claim_md5:
-                    DIRECTORY_INDEX.refresh_claim(claim_md5)
                 # 手动触发垃圾回收
                 gc.collect()
                 
@@ -420,7 +410,6 @@ def detect_objects_in_video(video_path, target_class, model,
             last_success_frame=last_success_frame,
         )
         print(f"\nCtrl+C 已保存检查点，正在退出...")
-        paused = True
         if video_writer is not None:
             video_writer.release()
         cap.release()
@@ -429,7 +418,6 @@ def detect_objects_in_video(video_path, target_class, model,
             cv2.destroyAllWindows()
         raise
     except PauseRequested:
-        paused = True
         print('\n已在当前帧结束后保存检查点，准备退出，不会继续处理后续视频。')
         raise
     except Exception as e:
@@ -445,9 +433,9 @@ def detect_objects_in_video(video_path, target_class, model,
         if show_window:
             cv2.destroyAllWindows()
 
-    if not paused and (frame_count >= total_frames or total_frames == 0):
-        _clear_checkpoint(video_path)
-    
+    if claim_md5 and not DIRECTORY_INDEX.refresh_claim(claim_md5):
+        raise ClaimLostError(f"视频声明已失效，放弃写入最终产物: {video_path}")
+
     # 处理剩余的裁剪图像
     if save_mosaic and save_crops and crops_batch:
         dir_name = os.path.dirname(video_path)
@@ -768,26 +756,50 @@ def append_yoloed_md5(md5, file_path=None):
         print(f"写入已识别MD5失败: {e}")
 
 
-def should_process(file_path):
+def _get_processing_decision(file_path, acquire_claim=True):
+    try:
+        checkpoint_exists = os.path.exists(_checkpoint_path(file_path))
+    except Exception:
+        checkpoint_exists = False
     if has_existing_artifacts(file_path):
-        return None
-    if is_path_already_yoloed(file_path):
-        return None
+        return None, 'has_artifacts'
+    if not checkpoint_exists and is_path_already_yoloed(file_path):
+        return None, 'path_already_yoloed'
     md5 = get_file_md5_cached(file_path)
     if not md5:
-        return None
+        return None, 'md5_unavailable'
     # 数据库查询：基于MD5判断是否已处理（跨机器通用）
-    if DIRECTORY_INDEX.is_video_processed_by_md5(md5):
-        return None
+    if checkpoint_exists:
+        processed = DIRECTORY_INDEX.is_video_processed_by_md5(
+            md5, include_directory_backfill=False
+        )
+    else:
+        processed = DIRECTORY_INDEX.is_video_processed_by_md5(md5)
+    if processed:
+        if checkpoint_exists:
+            _clear_checkpoint(file_path)
+        return None, 'already_processed_by_md5'
     yoloed_md5 = load_yoloed_md5(reload=False)
-    if md5 in yoloed_md5:
-        return None
-    if DIRECTORY_INDEX.is_video_claimed(md5):
-        print(f"视频已被其他机器声明，跳过: {file_path}")
-        return None
+    if not checkpoint_exists and md5 in yoloed_md5:
+        return None, 'md5_already_yoloed'
+    if not acquire_claim:
+        if DIRECTORY_INDEX.is_video_claimed(md5):
+            print(f"视频已被其他实例声明，跳过: {file_path}")
+            return None, 'claimed_elsewhere'
+        return md5, 'ready'
     if not DIRECTORY_INDEX.try_claim_video(md5, file_path):
+        if DIRECTORY_INDEX.is_video_claimed(md5):
+            print(f"视频已被其他实例抢先声明，跳过: {file_path}")
+            return None, 'claimed_elsewhere'
         print(f"无法声明视频，跳过: {file_path}")
-        return None
+        return None, 'claim_failed'
+    return md5, 'ready'
+
+
+def should_process(file_path, acquire_claim=True):
+    md5, _reason = _get_processing_decision(
+        file_path, acquire_claim=acquire_claim
+    )
     return md5
 
 
@@ -811,17 +823,23 @@ def _mark_video_completed(video_path, detections, file_md5=None):
         md5 = file_md5 or get_file_md5_cached(video_path)
         if md5:
             detection_count = len(detections) if detections else 0
-            DIRECTORY_INDEX.mark_video_processed(
+            completed = DIRECTORY_INDEX.complete_claimed_video(
                 file_md5=md5,
                 video_path=str(video_path),
                 detection_count=detection_count,
                 model_name='yolov11l-face'
             )
+            if not completed:
+                print(f'视频声明已失效，未写入完成状态: {video_path}')
+                return False
             append_yoloed_md5(md5, file_path=video_path)
             write_done_marker(video_path)
+            _clear_checkpoint(video_path)
             print(f'已写入完成状态（检测数={detection_count}）: {os.path.basename(video_path)}')
+            return True
     except Exception as e:
         print(f'写入视频完成状态失败: {e}')
+    return False
 
 
 def _release_claim_safely(file_md5):
@@ -836,7 +854,13 @@ def _release_claim_safely(file_md5):
 def _mark_directory_done(dir_path, video_file_names):
     """将目录标记为已全部处理，并将MD5缓存中已有的视频批量写入processed_videos表。"""
     try:
-        DIRECTORY_INDEX.mark_directory_processed(dir_path)
+        video_paths = [os.path.join(dir_path, vf) for vf in video_file_names]
+        if any(os.path.exists(_checkpoint_path(path)) for path in video_paths):
+            print('目录中仍有未完成检查点，本轮不标记目录完成')
+            return False
+        if DIRECTORY_INDEX.has_active_claims_for_paths(video_paths):
+            print('目录中仍有视频正在处理，本轮不标记目录完成')
+            return False
         # 批量记录MD5已缓存的视频（这些视频在 should_process() 中已计算过MD5，无额外I/O）
         # 注意: _FILE_MD5_CACHE 的键是 (path_str, size, mtime) 元组，需要按此格式查找
         batch_count = 0
@@ -851,17 +875,25 @@ def _mark_directory_done(dir_path, video_file_names):
                 cache_key = (str(vf_path), None, None)
             cached_md5 = _FILE_MD5_CACHE.get(cache_key)
             if cached_md5:
-                DIRECTORY_INDEX.mark_video_processed(
+                recorded = DIRECTORY_INDEX.mark_video_processed(
                     file_md5=cached_md5,
                     video_path=vf_path,
                     detection_count=-1,  # -1 表示"通过衍生文件/跳过逻辑确认已处理，非本次检测"
                     model_name=None
                 )
+                if not recorded:
+                    print(f'视频仍有有效声明，停止标记目录完成: {vf_path}')
+                    return False
                 batch_count += 1
+        if not DIRECTORY_INDEX.mark_directory_processed_if_idle(dir_path, video_paths):
+            print('目录完成状态在最终校验时发生变化，本轮不标记目录完成')
+            return False
         if batch_count > 0:
             print(f'已将 {batch_count} 个视频的处理记录写入数据库')
+        return True
     except Exception as e:
         print(f'标记目录完成状态失败: {e}')
+        return False
 
 
 def process_directory_videos(dir_path, target_item, model, all_objects_switch=False, skip_long_videos=True):
@@ -878,18 +910,16 @@ def process_directory_videos(dir_path, target_item, model, all_objects_switch=Fa
         print(f"警告: 无法访问目录 '{dir_path}': {e}")
         return
 
-    all_names_lower = set(f.lower() for f in all_files)
     video_file_names = [f for f in all_files if is_video_file(f)]
 
     if not video_file_names:
         return
 
-    # 快速目录级预检查：纯内存比对，判断所有视频是否都已有衍生文件（零额外I/O）
+    # 目录级预检查必须尊重 checkpoint，避免把暂停时的部分产物误判为完成。
     unprocessed_videos = []
     for vf in video_file_names:
-        v_base = os.path.splitext(vf)[0].lower()
-        if any((v_base + s.lower()) in all_names_lower for s in ARTIFACT_SUFFIXES):
-            continue  # 该视频已有衍生文件
+        if has_existing_artifacts(os.path.join(dir_path, vf)):
+            continue
         unprocessed_videos.append(vf)
 
     if not unprocessed_videos:
@@ -901,17 +931,19 @@ def process_directory_videos(dir_path, target_item, model, all_objects_switch=Fa
     if skipped_count > 0:
         print(f"跳过 {skipped_count}/{len(video_file_names)} 个已有衍生文件的视频")
 
-    # 对未处理的视频逐一检查（should_process 包含MD5/数据库等更精确的判断）
+    # 扫描阶段只收集候选，不提前 claim；真正开工前再原子领取当前视频。
     video_files = []
+    claim_blocked_videos = []
+    unresolved_videos = []
     for file in unprocessed_videos:
         file_path = os.path.join(dir_path, file)
-        md5 = should_process(file_path)
+        md5, reason = _get_processing_decision(file_path, acquire_claim=False)
         if md5:
             # 检查视频时长
             cap = cv2.VideoCapture(file_path)
             if not cap.isOpened():
                 print(f"无法打开视频: {file_path}")
-                _release_claim_safely(md5)
+                unresolved_videos.append(file_path)
                 continue
 
             fps = cap.get(cv2.CAP_PROP_FPS)
@@ -920,8 +952,24 @@ def process_directory_videos(dir_path, target_item, model, all_objects_switch=Fa
             duration = frame_count / fps if fps > 0 else float('inf')
 
             video_files.append((file_path, duration, md5))
+        elif reason in ('claimed_elsewhere', 'claim_failed'):
+            claim_blocked_videos.append(file_path)
+        elif reason == 'md5_unavailable':
+            unresolved_videos.append(file_path)
     
     if not video_files:
+        if claim_blocked_videos:
+            print(
+                f"目录中有 {len(claim_blocked_videos)} 个视频当前被其他实例占用，"
+                "本轮不标记目录完成"
+            )
+            return 0
+        if unresolved_videos:
+            print(
+                f"目录中有 {len(unresolved_videos)} 个视频尚未解决，"
+                "本轮不标记目录完成"
+            )
+            return 0
         if unprocessed_videos:
             print(f"目录中剩余 {len(unprocessed_videos)} 个视频经精确检查后均无需处理")
         _mark_directory_done(dir_path, video_file_names)
@@ -930,33 +978,39 @@ def process_directory_videos(dir_path, target_item, model, all_objects_switch=Fa
     # 处理视频文件
     failed_videos = []
     completed_count = 0
-    pending_claim_md5s = {md5 for _, _, md5 in video_files}
     for video_file, duration, md5 in video_files:
-        if duration == float('inf'):
-            print(f"提示: 无法获取视频时长，仍尝试处理: {video_file}")
-        print(f"开始处理视频文件: {video_file}")
+        if _pause_requested():
+            raise PauseRequested()
+        if not DIRECTORY_INDEX.try_claim_video(md5, video_file):
+            print(f"视频已被其他实例抢先声明，跳过: {video_file}")
+            claim_blocked_videos.append(video_file)
+            continue
         try:
+            if duration == float('inf'):
+                print(f"提示: 无法获取视频时长，仍尝试处理: {video_file}")
+            print(f"开始处理视频文件: {video_file}")
             detections = detect_objects_in_video(video_file, target_item, model,
                                     claim_md5=md5,
                                     show_window=False,
                                     save_crops=True,
                                     save_training_data=True,
                                     all_objects=all_objects_switch,
-                                    save_mosaic=save_mosaic_switch,
-                                    save_timestamps=save_timestamps_switch)
+                                     save_mosaic=save_mosaic_switch,
+                                     save_timestamps=save_timestamps_switch)
+            if not _mark_video_completed(video_file, detections, file_md5=md5):
+                failed_videos.append(video_file)
+                continue
+            completed_count += 1
+            if _pause_requested():
+                raise PauseRequested()
         except (PauseRequested, KeyboardInterrupt):
-            for pending_md5 in pending_claim_md5s:
-                _release_claim_safely(pending_md5)
             raise
         except Exception:
-            _release_claim_safely(md5)
-            pending_claim_md5s.discard(md5)
             _LOGGER.error("Video failed: %s\n%s", video_file, traceback.format_exc())
             failed_videos.append(video_file)
             continue
-        _mark_video_completed(video_file, detections, file_md5=md5)
-        pending_claim_md5s.discard(md5)
-        completed_count += 1
+        finally:
+            _release_claim_safely(md5)
         # 视频处理完成后强制垃圾回收
         gc.collect()
         # 短暂休眠，让系统有时间释放资源
@@ -965,12 +1019,25 @@ def process_directory_videos(dir_path, target_item, model, all_objects_switch=Fa
     if failed_videos:
         print(f"本轮有 {len(failed_videos)} 个视频处理失败，目录不会标记为已完成")
         return completed_count
+    if claim_blocked_videos:
+        print(
+            f"本轮有 {len(claim_blocked_videos)} 个视频被其他实例占用，"
+            "目录不会标记为已完成"
+        )
+        return completed_count
+    if unresolved_videos:
+        print(
+            f"本轮有 {len(unresolved_videos)} 个视频尚未解决，"
+            "目录不会标记为已完成"
+        )
+        return completed_count
 
     # 所有视频处理完成后，标记目录为已全部处理
     _mark_directory_done(dir_path, video_file_names)
     return completed_count
 
-if __name__ == "__main__":
+def _run_main():
+    global all_objects_switch, save_mosaic_switch, save_timestamps_switch
     utils._STOP_REQUESTED = False
     _install_pause_signal_handler()
     video_path = r"Z:\待检测"  # 可设置为视频文件或目录
@@ -1061,7 +1128,7 @@ if __name__ == "__main__":
                 ext = os.path.splitext(file)[1].lower()
                 if ext in video_extensions:
                     file_path = os.path.join(root, file)
-                    md5 = should_process(file_path)
+                    md5 = should_process(file_path, acquire_claim=False)
                     if md5:
                         # 获取视频时长
                         cap = cv2.VideoCapture(file_path)
@@ -1073,35 +1140,45 @@ if __name__ == "__main__":
                         fps = cap.get(cv2.CAP_PROP_FPS)
                         frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
                         cap.release()
-                        
-                        print(f"开始处理视频文件: {file_path}")
+
+                        if not DIRECTORY_INDEX.try_claim_video(md5, file_path):
+                            print(f"视频已被其他实例抢先声明，跳过: {file_path}")
+                            continue
                         try:
+                            print(f"开始处理视频文件: {file_path}")
                             detections = detect_objects_in_video(file_path, target_item, model,
                                                     claim_md5=md5,
                                                     show_window=False,
                                                     save_crops=True,
                                                     save_training_data=True,
                                                     all_objects=all_objects_switch,
-                                                    save_mosaic=save_mosaic_switch,
-                                                    save_timestamps=save_timestamps_switch)
+                                                     save_mosaic=save_mosaic_switch,
+                                                     save_timestamps=save_timestamps_switch)
+                            if not _mark_video_completed(
+                                file_path, detections, file_md5=md5
+                            ):
+                                raise ClaimLostError(
+                                    f"视频完成状态写入失败: {file_path}"
+                                )
+                            if _pause_requested():
+                                raise PauseRequested()
                         except (PauseRequested, KeyboardInterrupt):
-                            _release_claim_safely(md5)
                             raise
                         except Exception:
-                            _release_claim_safely(md5)
                             _LOGGER.error(
                                 "Video failed: %s\n%s",
                                 file_path,
                                 traceback.format_exc(),
                             )
                             continue
-                        _mark_video_completed(file_path, detections, file_md5=md5)
-                        
+                        finally:
+                            _release_claim_safely(md5)
+
                         # 强制垃圾回收
                         gc.collect()
                         time.sleep(1)
                     else:
-                        print(f"已存在拼接图片，跳过处理: {file_path}")
+                        print(f"视频无需处理或已被占用，跳过: {file_path}")
     else:
         # 处理单个视频文件
         cap = cv2.VideoCapture(video_path)
@@ -1109,29 +1186,49 @@ if __name__ == "__main__":
             print(f"无法打开视频: {video_path}")
         else:
             cap.release()
-            md5 = should_process(video_path)
+            md5 = should_process(video_path, acquire_claim=False)
             if md5:
-                print(f'开始处理视频文件: {video_path}')
-                try:
-                    detections = detect_objects_in_video(video_path, target_item, model,
-                                           claim_md5=md5,
-                                           show_window=False,
-                                           save_crops=True,
-                                           save_training_data=True,
-                                           all_objects=all_objects_switch,
-                                           save_mosaic=save_mosaic_switch,
-                                           save_timestamps=save_timestamps_switch)
-                except (PauseRequested, KeyboardInterrupt):
-                    _release_claim_safely(md5)
-                    raise
-                except Exception:
-                    _release_claim_safely(md5)
-                    _LOGGER.error(
-                        "Video failed: %s\n%s",
-                        video_path,
-                        traceback.format_exc(),
-                    )
+                if not DIRECTORY_INDEX.try_claim_video(md5, video_path):
+                    print(f"视频已被其他实例抢先声明，跳过: {video_path}")
                 else:
-                    _mark_video_completed(video_path, detections, file_md5=md5)
+                    try:
+                        print(f'开始处理视频文件: {video_path}')
+                        detections = detect_objects_in_video(video_path, target_item, model,
+                                               claim_md5=md5,
+                                               show_window=False,
+                                               save_crops=True,
+                                               save_training_data=True,
+                                               all_objects=all_objects_switch,
+                                               save_mosaic=save_mosaic_switch,
+                                               save_timestamps=save_timestamps_switch)
+                        if not _mark_video_completed(
+                            video_path, detections, file_md5=md5
+                        ):
+                            raise ClaimLostError(
+                                f"视频完成状态写入失败: {video_path}"
+                            )
+                        if _pause_requested():
+                            raise PauseRequested()
+                    except (PauseRequested, KeyboardInterrupt):
+                        raise
+                    except Exception:
+                        _LOGGER.error(
+                            "Video failed: %s\n%s",
+                            video_path,
+                            traceback.format_exc(),
+                        )
+                    finally:
+                        _release_claim_safely(md5)
             else:
-                print(f"已存在拼接图片，跳过处理: {video_path}")
+                print(f"视频无需处理或已被占用，跳过: {video_path}")
+
+
+if __name__ == "__main__":
+    try:
+        _run_main()
+    except PauseRequested:
+        print("\n已按请求暂停，本轮处理已停止。")
+        raise SystemExit(0)
+    except KeyboardInterrupt:
+        print("\n已按请求停止，本轮处理已终止。")
+        raise SystemExit(130)
