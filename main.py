@@ -391,16 +391,12 @@ def detect_objects_in_video(
         except Exception:
             pass
 
-    # 初始化进度条（截断长文件名避免终端溢出导致进度条不显示）
-    _video_name = os.path.basename(video_path)
-    # tqdm 固定开销约 40 字符（百分比、时间、计数等），预留空间
-    _max_desc = max(20, (os.get_terminal_size().columns if os.isatty(1) else 80) - 50)
-    if len(_video_name) > _max_desc:
-        _video_name = _video_name[: _max_desc - 1] + "…"
+    # 文件名已在上一行完整输出；进度条使用短描述，避免长文件名挤掉进度信息
     pbar = tqdm(
         total=total_frames,
         initial=min(start_frame, total_frames),
-        desc=f"处理视频: {_video_name}",
+        desc="处理视频",
+        dynamic_ncols=True,
     )
 
     frame_count = start_frame
@@ -1511,6 +1507,7 @@ if __name__ == "__main__":
                 else:
                     md5 = should_process(video_path)
                     if md5:
+                        print(f"开始处理视频文件: {video_path}")
                         try:
                             detections = detect_objects_in_video(
                                 video_path,

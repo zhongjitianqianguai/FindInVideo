@@ -495,8 +495,13 @@ def detect_objects_in_video_yolov5(video_path, target_class,
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
         except Exception:
             pass
-    # 初始化进度条
-    pbar = tqdm(total=total_frames, initial=min(start_frame, total_frames), desc=f"处理视频: {os.path.basename(video_path)}")
+    # 文件名已在上一行完整输出；进度条使用短描述，避免长文件名挤掉进度信息
+    pbar = tqdm(
+        total=total_frames,
+        initial=min(start_frame, total_frames),
+        desc='处理视频',
+        dynamic_ncols=True,
+    )
 
     frame_count = start_frame
     
@@ -804,7 +809,12 @@ def detect_objects_with_frame_analysis(video_path, target_class,
         labels_dir = os.path.join(results_dir, 'labels')
         
         print(f"分析视频帧以获取准确时间戳...")
-        pbar = tqdm(total=total_frames, initial=min(start_frame, total_frames), desc=f"分析视频: {os.path.basename(video_path)}")
+        pbar = tqdm(
+            total=total_frames,
+            initial=min(start_frame, total_frames),
+            desc='分析视频',
+            dynamic_ncols=True,
+        )
 
         frame_count = start_frame
         
@@ -1095,6 +1105,7 @@ if __name__ == "__main__":
     else:
         # 处理单个视频文件
         if should_process(video_path):
+            print(f'开始处理视频文件: {video_path}')
             detect_objects_in_video_yolov5(video_path, target_item,
                                           show_window=False,
                                           save_crops=True,

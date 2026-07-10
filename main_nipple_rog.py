@@ -256,8 +256,13 @@ def detect_objects_in_video(video_path, target_class, model,
         except Exception:
             pass
 
-    # 初始化进度条
-    pbar = tqdm(total=total_frames, initial=min(start_frame, total_frames), desc=f"处理视频: {os.path.basename(video_path)}")
+    # 文件名已在上一行完整输出；进度条使用短描述，避免长文件名挤掉进度信息
+    pbar = tqdm(
+        total=total_frames,
+        initial=min(start_frame, total_frames),
+        desc='处理视频',
+        dynamic_ncols=True,
+    )
 
     frame_count = start_frame
     
@@ -1106,6 +1111,7 @@ if __name__ == "__main__":
             cap.release()
             md5 = should_process(video_path)
             if md5:
+                print(f'开始处理视频文件: {video_path}')
                 try:
                     detections = detect_objects_in_video(video_path, target_item, model,
                                            claim_md5=md5,

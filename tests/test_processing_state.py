@@ -56,11 +56,15 @@ class ProcessingStateTests(unittest.TestCase):
         self.main_module._LOGGER = types.SimpleNamespace(error=lambda *args, **kwargs: None)
 
     def test_pause_requested_respects_stop_flag(self):
-        self.main_module._STOP_REQUESTED = True
-        self.assertTrue(self.main_module._pause_requested())
+        original_stop_requested = self.main_module.utils._STOP_REQUESTED
+        try:
+            self.main_module.utils._STOP_REQUESTED = True
+            self.assertTrue(self.main_module._pause_requested())
+        finally:
+            self.main_module.utils._STOP_REQUESTED = original_stop_requested
 
     def test_claim_heartbeat_prevents_stale_reclaim(self):
-        idx = self.main_module.DirectoryIndex(':memory:')
+        idx = self.main_module.utils.DirectoryIndex(':memory:')
         original_ttl = self.main_module.os.environ.get('FINDINVIDEO_CLAIM_TTL_SECONDS')
         self.main_module.os.environ['FINDINVIDEO_CLAIM_TTL_SECONDS'] = '5'
         try:
