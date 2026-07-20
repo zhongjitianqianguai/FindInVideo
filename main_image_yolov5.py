@@ -18,6 +18,11 @@ import torch
 import numpy as np
 from tqdm import tqdm
 
+from utils import (
+    build_pipeline_id, completion_marker_matches, pipeline_artifact_key,
+    write_completion_marker,
+)
+
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -159,12 +164,13 @@ def detect_and_annotate(image_path, model, target_class=None,
 # ---------------------------------------------------------------------------
 
 def process_directory_images(dir_path, model, target_class=None,
-                             all_objects=False, img_size=640):
+                             all_objects=False, img_size=640, pipeline_id=None):
     """处理一个目录中的所有图片文件。
 
     对每张图片执行检测:
     - 有检测结果 → 将带框图片保存到 _detected/ 子目录
     - 无检测结果 → 创建 .nodetect 标记文件，下次跳过
+    - 指定 pipeline_id 时，完成态会绑定流水线和图片源快照，避免配置或源图变化后误跳过
 
     Returns:
         (processed_count, detected_count)
@@ -179,8 +185,13 @@ def process_directory_images(dir_path, model, target_class=None,
     if not image_files:
         return 0, 0
 
-    # 输出目录
+    # 输出目录。新流水线使用独立子目录，避免不同模型互相复用结果。
     detected_dir = os.path.join(dir_path, DETECTED_DIR_NAME)
+    profile_dir = None
+    if pipeline_id is not None:
+        profile_dir = os.path.join(
+            detected_dir, pipeline_artifact_key(pipeline_id)
+        )
 
     # 快速跳过：检查 _detected/ 目录中已有的文件
     existing_lower = set()
@@ -193,6 +204,16 @@ def process_directory_images(dir_path, model, target_class=None,
     # 过滤出需要处理的图片
     to_process = []
     for f in image_files:
+        image_path = os.path.join(dir_path, f)
+        if pipeline_id is not None:
+            marker_path = os.path.join(profile_dir, f + '.done')
+            if completion_marker_matches(
+                marker_path, image_path, pipeline_id=pipeline_id
+            ):
+                continue
+            to_process.append(f)
+            continue
+
         f_lower = f.lower()
         # 带框图片已存在
         if f_lower in existing_lower:
@@ -212,39 +233,92 @@ def process_directory_images(dir_path, model, target_class=None,
         print(f'跳过 {skipped}/{len(image_files)} 张已处理的图片')
 
     # 确保输出目录存在
-    os.makedirs(detected_dir, exist_ok=True)
+    output_dir = profile_dir or detected_dir
+    os.makedirs(output_dir, exist_ok=True)
 
     detected_count = 0
+    processed_count = 0
+    attempted_count = 0
     for f in tqdm(to_process, desc='检测图片', unit='张'):
         image_path = os.path.join(dir_path, f)
-        annotated, count = detect_and_annotate(
-            image_path, model, target_class, all_objects, img_size
-        )
+        attempted_count += 1
+        annotated = None
+        try:
+            annotated, count = detect_and_annotate(
+                image_path, model, target_class, all_objects, img_size
+            )
+        except Exception as e:
+            print(f'图片检测失败，稍后可重试: {image_path} ({e})')
+            if attempted_count % 50 == 0:
+                gc.collect()
+            continue
 
         if annotated is not None:
             # 有检测结果 → 保存带框图片
-            output_path = os.path.join(detected_dir, f)
-            cv2.imwrite(output_path, annotated)
-            detected_count += 1
-        else:
-            # 无检测结果 → 创建标记文件，下次跳过
-            nodetect_path = os.path.join(
-                detected_dir, os.path.splitext(f)[0] + '.nodetect'
-            )
+            output_path = os.path.join(output_dir, f)
             try:
-                with open(nodetect_path, 'w') as nf:
-                    nf.write('')
-            except Exception:
-                pass
+                output_written = bool(cv2.imwrite(output_path, annotated))
+            except Exception as e:
+                output_written = False
+                print(f'带框图片保存失败，稍后可重试: {output_path} ({e})')
+            if not output_written:
+                print(f'带框图片保存失败，稍后可重试: {output_path}')
+            elif pipeline_id is not None:
+                marker_path = os.path.join(profile_dir, f + '.done')
+                marker_written = write_completion_marker(
+                    marker_path,
+                    image_path,
+                    pipeline_id=pipeline_id,
+                    extra={
+                        'detection_count': int(count or 0),
+                        'has_detection': True,
+                        'output_file': f,
+                    },
+                )
+                if marker_written:
+                    processed_count += 1
+                    detected_count += 1
+                else:
+                    print(f'图片完成标记写入失败，稍后可重试: {image_path}')
+            else:
+                processed_count += 1
+                detected_count += 1
+        else:
+            if pipeline_id is not None:
+                marker_path = os.path.join(profile_dir, f + '.done')
+                marker_written = write_completion_marker(
+                    marker_path,
+                    image_path,
+                    pipeline_id=pipeline_id,
+                    extra={
+                        'detection_count': 0,
+                        'has_detection': False,
+                    },
+                )
+                if marker_written:
+                    processed_count += 1
+                else:
+                    print(f'图片完成标记写入失败，稍后可重试: {image_path}')
+            else:
+                # 无检测结果 → 创建标记文件，下次跳过
+                nodetect_path = os.path.join(
+                    detected_dir, os.path.splitext(f)[0] + '.nodetect'
+                )
+                try:
+                    with open(nodetect_path, 'w') as nf:
+                        nf.write('')
+                    processed_count += 1
+                except OSError as e:
+                    print(f'无目标标记写入失败，稍后可重试: {nodetect_path} ({e})')
 
         # 释放内存
         del annotated
-        if detected_count % 50 == 0:
+        if attempted_count % 50 == 0:
             gc.collect()
 
-    print(f'检测完成: {detected_count}/{len(to_process)} 张图片含有目标'
+    print(f'检测完成: {processed_count}/{len(to_process)} 张图片已完成，其中 {detected_count} 张含有目标'
           f'，已保存到 {DETECTED_DIR_NAME}/')
-    return len(to_process), detected_count
+    return processed_count, detected_count
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +370,15 @@ if __name__ == '__main__':
     model = load_yolov5_model(model_path, conf=confidence, iou=iou_threshold)
 
     target_class = [target_item] if isinstance(target_item, str) else target_item
+    pipeline_id = build_pipeline_id(
+        'yolov5-image',
+        model_path,
+        target_class=target_class,
+        all_objects=all_objects_switch,
+        confidence=confidence,
+        image_size=img_size,
+        extra={'iou': iou_threshold, 'mode': 'image'},
+    )
 
     if os.path.isdir(image_root):
         print(f'正在扫描目录: {image_root}')
@@ -318,7 +401,7 @@ if __name__ == '__main__':
                 print(f'\n=== [{i}/{len(dirs)}] {rel} ({count} 张图片) ===')
                 processed, detected = process_directory_images(
                     dp, model, target_class,
-                    all_objects_switch, img_size
+                    all_objects_switch, img_size, pipeline_id=pipeline_id,
                 )
                 total_processed += processed
                 total_detected += detected

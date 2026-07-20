@@ -10,6 +10,7 @@ import gc  # 导入垃圾回收模块
 import time
 import logging
 import traceback
+import ntpath
 
 import utils
 from utils import (
@@ -22,10 +23,11 @@ from utils import (
     _get_env_path, get_shared_state_dir, ensure_shared_state_dir, _truthy_env,
     _atomic_create_file, _with_lockfile,
     safe_artifact_basename, _sanitize_basename, legacy_artifact_basename, _legacy_artifact_basename_v1,
-    has_completed_artifact,
+    has_completed_artifact, build_pipeline_id, _source_snapshot,
+    write_done_marker as _write_done_marker_state,
     _checkpoint_path, _load_checkpoint, _save_checkpoint, _clear_checkpoint,
     _install_pause_signal_handler, _get_pause_file_path, _pause_requested,
-    is_video_file,
+    record_resume_seek, is_video_file,
 )
 
 _PROCESSING_ROOT_DIR = None
@@ -33,7 +35,12 @@ _YOLOED_MD5_CACHE = None
 _YOLOED_MD5_CACHE_MTIME = None
 _YOLOED_PATH_CACHE = None
 _FILE_MD5_CACHE = {}
+_FILE_SOURCE_SNAPSHOT_CACHE = {}
+_ACTIVE_PIPELINE_ID = None
+_ACTIVE_MODEL_PATH = None
 _LOGGER = logging.getLogger(__name__)
+MODEL_CONFIDENCE = 0.5
+DEFAULT_IMAGE_SIZE = 1280
 # 需要排除的路径变量
 _EXCLUDE_PATHS_RAW = [
     os.path.abspath(r"D:\$RECYCLE.BIN"),
@@ -63,26 +70,145 @@ def _init_processing_root(root_dir):
     print(f'数据库已打开: {db_path}')
 
 
-def has_existing_artifacts(video_path):
-    """检查当前视频是否已有可靠完成标记。"""
-    return has_completed_artifact(video_path)
+def _resolve_pipeline_id(pipeline_id=None):
+    return pipeline_id if pipeline_id is not None else _ACTIVE_PIPELINE_ID
 
 
-def write_done_marker(video_path):
-    """Write a small marker file so future runs can skip without hashing."""
+def _get_image_size():
     try:
-        video_dir = os.path.dirname(video_path) or '.'
-        base = safe_artifact_basename(video_path)
-        marker = os.path.join(video_dir, base + DONE_SUFFIX)
-        if os.path.exists(marker):
-            return
-        with open(marker, 'w', encoding='utf-8', errors='ignore') as f:
-            f.write(f"done\n")
-    except Exception:
-        pass
+        return int(os.environ.get('FINDINVIDEO_IMGSZ', DEFAULT_IMAGE_SIZE))
+    except (TypeError, ValueError):
+        return DEFAULT_IMAGE_SIZE
+
+
+def _activate_pipeline(model_path, target_class, all_objects=False):
+    """根据真实权重摘要和推理配置启用独立完成态。"""
+    global _ACTIVE_PIPELINE_ID, _ACTIVE_MODEL_PATH
+    _ACTIVE_MODEL_PATH = model_path
+    _ACTIVE_PIPELINE_ID = build_pipeline_id(
+        engine='ultralytics-yolov11-video',
+        model_path=model_path,
+        target_class=target_class,
+        all_objects=all_objects,
+        confidence=MODEL_CONFIDENCE,
+        image_size=_get_image_size(),
+        extra={'entrypoint': 'main_nipple_rog'},
+    )
+    return _ACTIVE_PIPELINE_ID
+
+
+def _pipeline_checkpoint_path(video_path):
+    pipeline = _resolve_pipeline_id()
+    if pipeline is None:
+        return _checkpoint_path(video_path)
+    return _checkpoint_path(video_path, pipeline_id=pipeline)
+
+
+def _load_pipeline_checkpoint(video_path):
+    pipeline = _resolve_pipeline_id()
+    if pipeline is None:
+        return _load_checkpoint(video_path)
+    return _load_checkpoint(video_path, pipeline_id=pipeline)
+
+
+def _save_pipeline_checkpoint(video_path, **kwargs):
+    pipeline = _resolve_pipeline_id()
+    if pipeline is not None:
+        kwargs['pipeline_id'] = pipeline
+    return _save_checkpoint(video_path, **kwargs)
+
+
+def _clear_pipeline_checkpoint(video_path):
+    pipeline = _resolve_pipeline_id()
+    if pipeline is None:
+        return _clear_checkpoint(video_path)
+    return _clear_checkpoint(video_path, pipeline_id=pipeline)
+
+
+def _refresh_claim(file_md5):
+    pipeline = _resolve_pipeline_id()
+    if pipeline is None:
+        return DIRECTORY_INDEX.refresh_claim(file_md5)
+    return DIRECTORY_INDEX.refresh_claim(file_md5, pipeline_id=pipeline)
+
+
+def _source_cache_key(video_path, file_md5):
+    return (str(video_path), str(file_md5), _resolve_pipeline_id())
+
+
+def _minimum_source_age_seconds():
+    try:
+        return max(
+            0.0,
+            float(os.environ.get('FINDINVIDEO_SOURCE_STABLE_SECONDS', '5')),
+        )
+    except (TypeError, ValueError):
+        return 5.0
+
+
+def _hash_stable_source(video_path):
+    """在 MD5 前后核对源文件，拒绝刚写入或处理中变化的视频。"""
+    try:
+        before = _source_snapshot(video_path)
+    except OSError:
+        return None, None, 'source_unstable'
+    if time.time() - before['mtime_ns'] / 1_000_000_000 < _minimum_source_age_seconds():
+        return None, None, 'source_unstable'
+    md5 = get_file_md5_cached(video_path)
+    if not md5:
+        return None, None, 'md5_unavailable'
+    try:
+        after = _source_snapshot(video_path)
+    except OSError:
+        return None, None, 'source_unstable'
+    if before != after:
+        return None, None, 'source_unstable'
+    _FILE_SOURCE_SNAPSHOT_CACHE[_source_cache_key(video_path, md5)] = after
+    return md5, after, 'ready'
+
+
+def _source_snapshot_for(video_path, file_md5):
+    return _FILE_SOURCE_SNAPSHOT_CACHE.get(_source_cache_key(video_path, file_md5))
+
+
+def _try_claim_video(file_md5, video_path):
+    pipeline = _resolve_pipeline_id()
+    if pipeline is None:
+        return DIRECTORY_INDEX.try_claim_video(file_md5, video_path)
+    return DIRECTORY_INDEX.try_claim_video(
+        file_md5,
+        video_path,
+        pipeline_id=pipeline,
+        source_snapshot=_source_snapshot_for(video_path, file_md5),
+    )
+
+
+def has_existing_artifacts(video_path, pipeline_id=None):
+    """检查当前视频是否已有可靠完成标记。"""
+    return has_completed_artifact(
+        video_path,
+        pipeline_id=_resolve_pipeline_id(pipeline_id),
+    )
+
+
+def write_done_marker(
+    video_path,
+    pipeline_id=None,
+    file_md5=None,
+    source_snapshot=None,
+):
+    """写入绑定源文件指纹和处理流水线的完成标记。"""
+    return _write_done_marker_state(
+        video_path,
+        pipeline_id=_resolve_pipeline_id(pipeline_id),
+        file_md5=file_md5,
+        source_snapshot=source_snapshot,
+    )
 
 
 def directory_has_artifact_outputs(dir_path):
+    if _resolve_pipeline_id() is not None:
+        return False
     try:
         for name in os.listdir(dir_path):
             lower = name.lower()
@@ -128,6 +254,8 @@ def find_leaf_directories_with_videos(root_path, exclusions=None, refresh_index=
         if refresh_index:
             DIRECTORY_INDEX.refresh(root_path, exclusions)
         leaf_dirs = DIRECTORY_INDEX.get_leaf_directories(root_path)
+        if _resolve_pipeline_id() is not None:
+            leaf_dirs = [(path, count, False) for path, count, _done in leaf_dirs]
     except Exception as exc:
         print(f"索引查找叶子目录失败，退回遍历模式: {exc}")
         leaf_dirs = []
@@ -201,8 +329,9 @@ def detect_objects_in_video(video_path, target_class, model,
     except Exception:
         imgsz = 1280
 
+    pipeline = _resolve_pipeline_id()
     video_dir = os.path.dirname(video_path)
-    artifact_base = safe_artifact_basename(video_path)
+    artifact_base = safe_artifact_basename(video_path, pipeline_id=pipeline)
     txt_save_path = os.path.join(video_dir, artifact_base + '.txt')
     mosaic_path = os.path.join(video_dir, artifact_base + '_mosaic.jpg')
     video_save_path = os.path.join(video_dir, artifact_base + '_frames.mp4')
@@ -222,7 +351,7 @@ def detect_objects_in_video(video_path, target_class, model,
                     for cls in target_class:
                         f.write(cls + "\n")
     
-    ckpt = _load_checkpoint(video_path) if resume_enabled else None
+    ckpt = _load_pipeline_checkpoint(video_path) if resume_enabled else None
     start_frame = int(ckpt.get('next_frame', 0)) if ckpt else 0
     detections = list(ckpt.get('detections', [])) if ckpt else []
     last_detected = float(ckpt.get('last_detected', detections[-1] if detections else -5.0)) if ckpt else -5
@@ -237,9 +366,26 @@ def detect_objects_in_video(video_path, target_class, model,
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     if start_frame > 0:
         try:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-        except Exception:
-            pass
+            seek_ok = cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            reported_frame = cap.get(cv2.CAP_PROP_POS_FRAMES)
+        except Exception as exc:
+            record_resume_seek(
+                video_path, start_frame, False, error=exc,
+                file_md5=claim_md5, pipeline_id=pipeline,
+            )
+            cap.release()
+            raise RuntimeError(f"无法恢复视频断点到第 {start_frame} 帧") from exc
+        if not seek_ok:
+            record_resume_seek(
+                video_path, start_frame, False, file_md5=claim_md5,
+                pipeline_id=pipeline,
+            )
+            cap.release()
+            raise RuntimeError(f"无法恢复视频断点到第 {start_frame} 帧")
+        record_resume_seek(
+            video_path, start_frame, True, reported_frame=reported_frame,
+            file_md5=claim_md5, pipeline_id=pipeline,
+        )
 
     # 文件名已在上一行完整输出；进度条使用短描述，避免长文件名挤掉进度信息
     pbar = tqdm(
@@ -263,29 +409,33 @@ def detect_objects_in_video(video_path, target_class, model,
     frame_w, frame_h = 0, 0
     
     last_success_frame = start_frame - 1
+    reached_eof = False
     try:
         while cap.isOpened():
             if claim_md5 and (
                 time.monotonic() - last_claim_heartbeat
                 >= claim_heartbeat_interval
             ):
-                if not DIRECTORY_INDEX.refresh_claim(claim_md5):
+                if not _refresh_claim(claim_md5):
                     raise ClaimLostError(
                         f"视频声明已失效，停止处理以避免重复写入: {video_path}"
                     )
                 last_claim_heartbeat = time.monotonic()
             if _pause_requested(pause_file):
-                _save_checkpoint(
+                _save_pipeline_checkpoint(
                     video_path,
                     next_frame=frame_count,
                     detections=detections,
                     last_detected=last_detected,
                     claim_md5=claim_md5,
                     last_success_frame=last_success_frame,
+                    reason='pause_requested',
                 )
                 raise PauseRequested()
             success, frame = cap.read()
             if not success:
+                if total_frames <= 0 or frame_count >= total_frames:
+                    reached_eof = True
                 break
             
             # 更新进度条
@@ -401,13 +551,14 @@ def detect_objects_in_video(video_path, target_class, model,
             del frame
     
     except KeyboardInterrupt:
-        _save_checkpoint(
+        _save_pipeline_checkpoint(
             video_path,
             next_frame=frame_count,
             detections=detections,
             last_detected=last_detected,
             claim_md5=claim_md5,
             last_success_frame=last_success_frame,
+            reason='keyboard_interrupt',
         )
         print(f"\nCtrl+C 已保存检查点，正在退出...")
         if video_writer is not None:
@@ -433,7 +584,23 @@ def detect_objects_in_video(video_path, target_class, model,
         if show_window:
             cv2.destroyAllWindows()
 
-    if claim_md5 and not DIRECTORY_INDEX.refresh_claim(claim_md5):
+    if not reached_eof:
+        if total_frames > 0 and frame_count < total_frames:
+            _save_pipeline_checkpoint(
+                video_path,
+                next_frame=frame_count,
+                detections=detections,
+                last_detected=last_detected,
+                claim_md5=claim_md5,
+                last_success_frame=last_success_frame,
+                reason='unexpected_early_eof',
+            )
+            raise RuntimeError(
+                f"视频读取提前结束: 已处理 {frame_count}/{total_frames} 帧"
+            )
+        reached_eof = True
+
+    if claim_md5 and not _refresh_claim(claim_md5):
         raise ClaimLostError(f"视频声明已失效，放弃写入最终产物: {video_path}")
 
     # 处理剩余的裁剪图像
@@ -758,36 +925,43 @@ def append_yoloed_md5(md5, file_path=None):
 
 def _get_processing_decision(file_path, acquire_claim=True):
     try:
-        checkpoint_exists = os.path.exists(_checkpoint_path(file_path))
+        checkpoint_exists = os.path.exists(_pipeline_checkpoint_path(file_path))
     except Exception:
         checkpoint_exists = False
     if has_existing_artifacts(file_path):
         return None, 'has_artifacts'
-    if not checkpoint_exists and is_path_already_yoloed(file_path):
+    pipeline = _resolve_pipeline_id()
+    legacy_pipeline = pipeline is None
+    if legacy_pipeline and not checkpoint_exists and is_path_already_yoloed(file_path):
         return None, 'path_already_yoloed'
-    md5 = get_file_md5_cached(file_path)
-    if not md5:
-        return None, 'md5_unavailable'
-    # 数据库查询：基于MD5判断是否已处理（跨机器通用）
-    if checkpoint_exists:
-        processed = DIRECTORY_INDEX.is_video_processed_by_md5(
-            md5, include_directory_backfill=False
-        )
+    if legacy_pipeline:
+        md5 = get_file_md5_cached(file_path)
+        if not md5:
+            return None, 'md5_unavailable'
     else:
-        processed = DIRECTORY_INDEX.is_video_processed_by_md5(md5)
+        md5, _snapshot, hash_reason = _hash_stable_source(file_path)
+        if hash_reason != 'ready':
+            return None, hash_reason
+    if checkpoint_exists:
+        processed_kwargs = {'include_directory_backfill': False}
+    else:
+        processed_kwargs = {}
+    if pipeline is not None:
+        processed_kwargs['pipeline_id'] = pipeline
+    processed = DIRECTORY_INDEX.is_video_processed_by_md5(md5, **processed_kwargs)
     if processed:
         if checkpoint_exists:
-            _clear_checkpoint(file_path)
+            _clear_pipeline_checkpoint(file_path)
         return None, 'already_processed_by_md5'
-    yoloed_md5 = load_yoloed_md5(reload=False)
-    if not checkpoint_exists and md5 in yoloed_md5:
+    yoloed_md5 = load_yoloed_md5(reload=False) if legacy_pipeline else set()
+    if legacy_pipeline and not checkpoint_exists and md5 in yoloed_md5:
         return None, 'md5_already_yoloed'
     if not acquire_claim:
         if DIRECTORY_INDEX.is_video_claimed(md5):
             print(f"视频已被其他实例声明，跳过: {file_path}")
             return None, 'claimed_elsewhere'
         return md5, 'ready'
-    if not DIRECTORY_INDEX.try_claim_video(md5, file_path):
+    if not _try_claim_video(md5, file_path):
         if DIRECTORY_INDEX.is_video_claimed(md5):
             print(f"视频已被其他实例抢先声明，跳过: {file_path}")
             return None, 'claimed_elsewhere'
@@ -817,24 +991,58 @@ def is_path_already_yoloed(file_path):
         candidates.append(canon)
     return any(c in _YOLOED_PATH_CACHE for c in candidates)
 
-def _mark_video_completed(video_path, detections, file_md5=None):
+def _mark_video_completed(
+    video_path,
+    detections,
+    file_md5=None,
+    source_snapshot=None,
+):
     """统一写入视频完成态，避免 completed/processed/done 多处漂移。"""
     try:
         md5 = file_md5 or get_file_md5_cached(video_path)
         if md5:
             detection_count = len(detections) if detections else 0
-            completed = DIRECTORY_INDEX.complete_claimed_video(
-                file_md5=md5,
-                video_path=str(video_path),
-                detection_count=detection_count,
-                model_name='yolov11l-face'
-            )
+            pipeline = _resolve_pipeline_id()
+            completion_kwargs = {
+                'file_md5': md5,
+                'video_path': str(video_path),
+                'detection_count': detection_count,
+                'model_name': os.path.basename(
+                    _ACTIVE_MODEL_PATH or 'models/nipples-0224.pt'
+                ),
+            }
+            final_snapshot = source_snapshot
+            if pipeline is not None:
+                final_snapshot = final_snapshot or _source_snapshot_for(video_path, md5)
+                if final_snapshot is None:
+                    print(f'缺少源文件快照，未写入完成状态: {video_path}')
+                    return False
+                completion_kwargs['pipeline_id'] = pipeline
+                completion_kwargs['source_snapshot'] = final_snapshot
+            completed = DIRECTORY_INDEX.complete_claimed_video(**completion_kwargs)
             if not completed:
                 print(f'视频声明已失效，未写入完成状态: {video_path}')
                 return False
-            append_yoloed_md5(md5, file_path=video_path)
-            write_done_marker(video_path)
-            _clear_checkpoint(video_path)
+            marker_ok = write_done_marker(
+                video_path,
+                pipeline_id=pipeline,
+                file_md5=md5,
+                source_snapshot=final_snapshot,
+            ) if pipeline is not None else write_done_marker(video_path)
+            marker_failed = marker_ok is False if pipeline is None else not marker_ok
+            if marker_failed:
+                rollback_kwargs = {'pipeline_id': pipeline} if pipeline is not None else {}
+                rolled_back = DIRECTORY_INDEX.rollback_video_completion(
+                    md5, **rollback_kwargs
+                )
+                if not rolled_back:
+                    print(f'完成标记写入失败且数据库回滚失败: {video_path}')
+                else:
+                    print(f'完成标记写入失败，已撤销数据库完成态: {video_path}')
+                return False
+            if pipeline is None:
+                append_yoloed_md5(md5, file_path=video_path)
+            _clear_pipeline_checkpoint(video_path)
             print(f'已写入完成状态（检测数={detection_count}）: {os.path.basename(video_path)}')
             return True
     except Exception as e:
@@ -847,15 +1055,27 @@ def _release_claim_safely(file_md5):
     if not file_md5:
         return
     try:
-        DIRECTORY_INDEX.release_claim(file_md5)
+        pipeline = _resolve_pipeline_id()
+        if pipeline is None:
+            DIRECTORY_INDEX.release_claim(file_md5)
+        else:
+            DIRECTORY_INDEX.release_claim(file_md5, pipeline_id=pipeline)
     except Exception as e:
         print(f'释放视频声明失败: {e}')
 
-def _mark_directory_done(dir_path, video_file_names):
+def _mark_directory_done(dir_path, video_file_names, pipeline_id=None):
     """将目录标记为已全部处理，并将MD5缓存中已有的视频批量写入processed_videos表。"""
+    pipeline = _resolve_pipeline_id(pipeline_id)
     try:
         video_paths = [os.path.join(dir_path, vf) for vf in video_file_names]
-        if any(os.path.exists(_checkpoint_path(path)) for path in video_paths):
+        if any(
+            os.path.exists(
+                _checkpoint_path(path)
+                if pipeline is None
+                else _checkpoint_path(path, pipeline_id=pipeline)
+            )
+            for path in video_paths
+        ):
             print('目录中仍有未完成检查点，本轮不标记目录完成')
             return False
         if DIRECTORY_INDEX.has_active_claims_for_paths(video_paths):
@@ -875,16 +1095,25 @@ def _mark_directory_done(dir_path, video_file_names):
                 cache_key = (str(vf_path), None, None)
             cached_md5 = _FILE_MD5_CACHE.get(cache_key)
             if cached_md5:
-                recorded = DIRECTORY_INDEX.mark_video_processed(
-                    file_md5=cached_md5,
-                    video_path=vf_path,
-                    detection_count=-1,  # -1 表示"通过衍生文件/跳过逻辑确认已处理，非本次检测"
-                    model_name=None
-                )
+                mark_kwargs = {
+                    'file_md5': cached_md5,
+                    'video_path': vf_path,
+                    'detection_count': -1,
+                    'model_name': None,
+                }
+                if pipeline is not None:
+                    mark_kwargs['pipeline_id'] = pipeline
+                    try:
+                        mark_kwargs['source_snapshot'] = _source_snapshot(vf_path)
+                    except OSError:
+                        return False
+                recorded = DIRECTORY_INDEX.mark_video_processed(**mark_kwargs)
                 if not recorded:
                     print(f'视频仍有有效声明，停止标记目录完成: {vf_path}')
                     return False
                 batch_count += 1
+        if pipeline is not None:
+            return True
         if not DIRECTORY_INDEX.mark_directory_processed_if_idle(dir_path, video_paths):
             print('目录完成状态在最终校验时发生变化，本轮不标记目录完成')
             return False
@@ -954,7 +1183,7 @@ def process_directory_videos(dir_path, target_item, model, all_objects_switch=Fa
             video_files.append((file_path, duration, md5))
         elif reason in ('claimed_elsewhere', 'claim_failed'):
             claim_blocked_videos.append(file_path)
-        elif reason == 'md5_unavailable':
+        elif reason in ('md5_unavailable', 'source_unstable'):
             unresolved_videos.append(file_path)
     
     if not video_files:
@@ -981,7 +1210,7 @@ def process_directory_videos(dir_path, target_item, model, all_objects_switch=Fa
     for video_file, duration, md5 in video_files:
         if _pause_requested():
             raise PauseRequested()
-        if not DIRECTORY_INDEX.try_claim_video(md5, video_file):
+        if not _try_claim_video(md5, video_file):
             print(f"视频已被其他实例抢先声明，跳过: {video_file}")
             claim_blocked_videos.append(video_file)
             continue
@@ -1046,7 +1275,14 @@ def _run_main():
     all_objects_switch = False  # 设置为 True 表示显示所有检测对象
     save_mosaic_switch = False  # 设置为 True 启用拼接图片保存
     save_timestamps_switch = False  # 设置为 True 启用检测时间戳txt保存
-    model_path = 'models/nipples-0224.pt'  # YOLO 模型路径
+    model_path = os.environ.get(
+        'FINDINVIDEO_NIPPLE_ROG_MODEL', 'models/nipples-0224.pt'
+    )
+    _activate_pipeline(
+        model_path,
+        target_item,
+        all_objects=all_objects_switch,
+    )
 
     # 加载模型（全局一次，所有视频共用）
     print(f'加载模型: {model_path}')
@@ -1141,7 +1377,7 @@ def _run_main():
                         frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
                         cap.release()
 
-                        if not DIRECTORY_INDEX.try_claim_video(md5, file_path):
+                        if not _try_claim_video(md5, file_path):
                             print(f"视频已被其他实例抢先声明，跳过: {file_path}")
                             continue
                         try:
@@ -1188,7 +1424,7 @@ def _run_main():
             cap.release()
             md5 = should_process(video_path, acquire_claim=False)
             if md5:
-                if not DIRECTORY_INDEX.try_claim_video(md5, video_path):
+                if not _try_claim_video(md5, video_path):
                     print(f"视频已被其他实例抢先声明，跳过: {video_path}")
                 else:
                     try:

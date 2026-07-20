@@ -4,94 +4,19 @@ import os
 import sys
 import subprocess
 
-# ffmpeg 路径
-FFMPEG_BIN = r'C:\project\DouyinLiveRecorder\ffmpeg-7.0-essentials_build\bin'
-FFMPEG = os.path.join(FFMPEG_BIN, 'ffmpeg.exe')
+from media_tool_utils import (
+    clean_path,
+    looks_like_path,
+    parse_position,
+    resolve_media_binary,
+    seconds_to_display,
+    seconds_to_ffmpeg_time,
+    time_to_filename_safe,
+    validate_time_range,
+)
 
 
-def clean_path(raw_path):
-    """清理拖拽到终端时路径可能带有的引号和空白"""
-    p = raw_path.strip()
-    if (p.startswith('"') and p.endswith('"')) or \
-       (p.startswith("'") and p.endswith("'")):
-        p = p[1:-1]
-    return p.strip()
-
-
-def looks_like_path(text):
-    """判断输入是否像一个文件路径（拖入的视频）"""
-    cleaned = clean_path(text)
-    if os.path.isfile(cleaned):
-        return True
-    if ('\\' in cleaned or '/' in cleaned) and '.' in cleaned:
-        return True
-    if len(cleaned) >= 2 and cleaned[1] == ':':
-        return True
-    return False
-
-
-def parse_position(user_input):
-    """
-    解析用户输入的时间定位，返回秒数。
-
-    支持格式：
-      1) 时间格式  HH:MM:SS.mmm   例如 01:30:11.467
-         兼容 MM:SS.mmm 和 SS.mmm
-      2) 帧格式    帧数,帧率       例如 110632,20.444
-    """
-    text = user_input.strip()
-
-    if ',' in text:
-        parts = text.split(',')
-        if len(parts) != 2:
-            raise ValueError(f'帧格式应为 帧数,帧率，收到: {text}')
-        frame_num = int(parts[0].strip())
-        fps = float(parts[1].strip())
-        if fps <= 0:
-            raise ValueError(f'帧率必须大于0，收到: {fps}')
-        return frame_num / fps
-
-    if ':' in text:
-        parts = text.split(':')
-        if len(parts) == 3:
-            h, m, s = int(parts[0]), int(parts[1]), float(parts[2])
-            return h * 3600 + m * 60 + s
-        elif len(parts) == 2:
-            m, s = int(parts[0]), float(parts[1])
-            return m * 60 + s
-        else:
-            raise ValueError(f'时间格式应为 HH:MM:SS.mmm 或 MM:SS.mmm，收到: {text}')
-
-    return float(text)
-
-
-def seconds_to_display(seconds):
-    """将秒数转换为 HH:MM:SS.mmm 的可读字符串"""
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = seconds % 60
-    return f'{h:02d}:{m:02d}:{s:06.3f}'
-
-
-def seconds_to_ffmpeg_time(seconds):
-    """将秒数转换为 ffmpeg 时间参数格式"""
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = seconds % 60
-    return f'{h:02d}:{m:02d}:{s:06.3f}'
-
-
-def time_to_filename_safe(seconds):
-    """将秒数转换为可用于文件名的字符串，如 01h30m11.467s"""
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = seconds % 60
-    if h > 0:
-        return f'{h:02d}h{m:02d}m{s:06.3f}s'
-    elif m > 0:
-        return f'{m:02d}m{s:06.3f}s'
-    else:
-        return f'{s:06.3f}s'
+FFMPEG = resolve_media_binary('ffmpeg')
 
 
 def clip_video_silence(video_path, start_seconds, end_seconds):
@@ -103,8 +28,12 @@ def clip_video_silence(video_path, start_seconds, end_seconds):
         print(f'错误：文件不存在 → {video_path}')
         return
 
-    if end_seconds <= start_seconds:
-        print(f'错误：结束时间 {seconds_to_display(end_seconds)} 必须大于开始时间 {seconds_to_display(start_seconds)}')
+    try:
+        start_seconds, end_seconds = validate_time_range(
+            start_seconds, end_seconds
+        )
+    except ValueError as exc:
+        print(f'错误：{exc}')
         return
 
     duration = end_seconds - start_seconds
@@ -160,9 +89,9 @@ def main():
     print('从视频中剪出指定时间范围的静音片段，仅保留画面')
     print()
 
-    if not os.path.isfile(FFMPEG):
+    if not FFMPEG or not os.path.isfile(FFMPEG):
         print(f'错误：找不到 ffmpeg → {FFMPEG}')
-        print('请修改脚本顶部的 FFMPEG_BIN 路径')
+        print('请配置 FINDINVIDEO_FFMPEG_BIN 或将 ffmpeg 加入 PATH')
         return
 
     if len(sys.argv) > 1:

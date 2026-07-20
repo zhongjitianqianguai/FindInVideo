@@ -202,6 +202,8 @@ ARTIFACT_SUFFIXES = [
 ]
 
 DONE_SUFFIX = '.done'
+DONE_MARKER_VERSION = 2
+LEGACY_PIPELINE_ID = 'legacy-v1'
 
 DIR_ARTIFACT_SKIP_SUFFIXES = (
     '_mosaic.jpg',
@@ -216,9 +218,94 @@ _IGNORED_SUBDIRS = {
 
 CHECKPOINT_SUFFIX = '.checkpoint.json'
 
+# 处理审计事件与声明、检查点共用同一份 SQLite 状态库，便于跨进程追踪。
+PROCESSING_EVENT_TABLE = 'processing_events'
+
 CLAIM_TTL_DEFAULT_SECONDS = 86400
 CLAIM_TTL_MIN_SECONDS = 60
 CLAIM_HEARTBEAT_MAX_SECONDS = 60.0
+
+
+def normalize_pipeline_id(pipeline_id=None):
+    """规范化处理流水线标识；旧调用统一归入 legacy-v1。"""
+    value = str(pipeline_id or '').strip()
+    return value or LEGACY_PIPELINE_ID
+
+
+_MODEL_FINGERPRINT_CACHE = {}
+
+
+def _model_fingerprint(model_path):
+    """计算并缓存模型权重摘要，避免同一进程重复读取大文件。"""
+    path = os.path.abspath(str(model_path))
+    st = os.stat(path)
+    cache_key = (path, int(st.st_size), int(st.st_mtime_ns))
+    cached = _MODEL_FINGERPRINT_CACHE.get(cache_key)
+    if cached:
+        return cached
+    digest = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(4 * 1024 * 1024), b''):
+            digest.update(chunk)
+    value = digest.hexdigest()
+    _MODEL_FINGERPRINT_CACHE.clear()
+    _MODEL_FINGERPRINT_CACHE[cache_key] = value
+    return value
+
+
+def build_pipeline_id(
+    engine,
+    model_path,
+    target_class=None,
+    all_objects=False,
+    confidence=0.5,
+    image_size=None,
+    extra=None,
+):
+    """根据模型内容和推理配置生成稳定流水线标识。"""
+    targets = target_class
+    if isinstance(targets, str):
+        targets = [targets]
+    payload = {
+        'engine': str(engine),
+        'model_name': os.path.basename(str(model_path)),
+        'model_sha256': _model_fingerprint(model_path),
+        'target_class': sorted(str(item) for item in (targets or [])),
+        'all_objects': bool(all_objects),
+        'confidence': float(confidence),
+        'image_size': int(image_size) if image_size is not None else None,
+        'extra': extra or {},
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(',', ':')
+    ).encode('utf-8')
+    digest = hashlib.sha256(encoded).hexdigest()
+    return f"{payload['engine']}:{payload['model_name']}:{digest}"
+
+
+def _source_snapshot(video_path):
+    """读取用于完成态校验的稳定源文件快照。"""
+    st = os.stat(video_path)
+    return {
+        'size': int(st.st_size),
+        'mtime_ns': int(
+            getattr(st, 'st_mtime_ns', int(float(st.st_mtime) * 1_000_000_000))
+        ),
+    }
+
+
+def _source_snapshot_matches(video_path, snapshot):
+    """确认源文件仍与之前记录的大小和修改时间一致。"""
+    if not isinstance(snapshot, dict):
+        return False
+    try:
+        current = _source_snapshot(video_path)
+        return (
+            int(snapshot.get('size')) == current['size']
+            and int(snapshot.get('mtime_ns')) == current['mtime_ns']
+        )
+    except (OSError, TypeError, ValueError):
+        return False
 
 
 def get_claim_ttl_seconds():
@@ -534,9 +621,23 @@ def count_videos_in_directory(dir_path):
     return count
 
 
-def safe_artifact_basename(video_path):
-    """返回用于创建衍生文件的基础名（= 原视频文件名去掉扩展名）。"""
-    return os.path.splitext(os.path.basename(video_path))[0]
+def safe_artifact_basename(video_path, pipeline_id=None):
+    """返回不会跨源文件或处理流水线碰撞的衍生文件基础名。
+
+    未传 ``pipeline_id`` 的旧调用保留原 stem 命名，仅用于兼容旧状态；
+    新入口必须显式传入流水线标识。
+    """
+    if pipeline_id is None:
+        return os.path.splitext(os.path.basename(video_path))[0]
+    file_name = os.path.basename(str(video_path)) or 'video'
+    digest = pipeline_artifact_key(pipeline_id)
+    return f'{file_name}.findinvideo-{digest}'
+
+
+def pipeline_artifact_key(pipeline_id):
+    """返回适合目录名和文件名使用的短流水线键。"""
+    pipeline = normalize_pipeline_id(pipeline_id)
+    return hashlib.sha256(pipeline.encode('utf-8')).hexdigest()[:12]
 
 
 def _sanitize_basename(video_path):
@@ -576,29 +677,127 @@ def _legacy_artifact_basename_v1(video_path, max_length=80):
 # Checkpoint 系统
 # ---------------------------------------------------------------------------
 
-def _checkpoint_path(video_path):
+def _checkpoint_path(video_path, pipeline_id=None):
     video_dir = os.path.dirname(video_path) or '.'
-    base = safe_artifact_basename(video_path)
+    base = safe_artifact_basename(video_path, pipeline_id=pipeline_id)
     return os.path.join(video_dir, base + CHECKPOINT_SUFFIX)
 
 
-def _load_checkpoint(video_path):
-    path = _checkpoint_path(video_path)
+def record_processing_event(
+    event_type,
+    video_path=None,
+    file_md5=None,
+    pipeline_id=None,
+    **details,
+):
+    """尽力写入持久化处理审计事件，不影响主处理流程。"""
+    index = globals().get('DIRECTORY_INDEX')
+    writer = getattr(index, 'record_processing_event', None)
+    if not callable(writer):
+        return False
+    try:
+        return bool(writer(
+            event_type,
+            video_path=video_path,
+            file_md5=file_md5,
+            pipeline_id=pipeline_id,
+            details=details,
+        ))
+    except Exception:
+        return False
+
+
+def record_resume_seek(
+    video_path,
+    requested_frame,
+    seek_ok,
+    reported_frame=None,
+    error=None,
+    file_md5=None,
+    pipeline_id=None,
+):
+    """记录检查点恢复时视频定位的实际结果。"""
+    requested = int(max(0, requested_frame or 0))
+    reported = None
+    try:
+        if reported_frame is not None:
+            reported = int(reported_frame)
+    except (TypeError, ValueError):
+        reported = None
+    position_verified = (
+        reported is not None and abs(reported - requested) <= 1
+    )
+    return record_processing_event(
+        'resume_seek_applied' if seek_ok else 'resume_seek_failed',
+        video_path=video_path,
+        file_md5=file_md5,
+        pipeline_id=pipeline_id,
+        requested_frame=requested,
+        reported_frame=reported,
+        position_verified=position_verified,
+        error=str(error) if error else None,
+    )
+
+
+def _load_checkpoint(video_path, pipeline_id=None):
+    path = _checkpoint_path(video_path, pipeline_id=pipeline_id)
     try:
         if not os.path.exists(path):
             return None
         with open(path, 'r', encoding='utf-8', errors='ignore') as f:
             data = json.load(f)
+        expected_pipeline = normalize_pipeline_id(pipeline_id)
+        stored_pipeline = normalize_pipeline_id(data.get('pipeline_id'))
+        if stored_pipeline != expected_pipeline:
+            record_processing_event(
+                'checkpoint_ignored',
+                video_path=video_path,
+                file_md5=(data.get('checkpoint_owner') or {}).get('claim_md5'),
+                pipeline_id=expected_pipeline,
+                reason='pipeline_mismatch',
+                stored_pipeline=stored_pipeline,
+            )
+            return None
         try:
             st = os.stat(video_path)
             if data.get('size') not in (None, st.st_size):
+                record_processing_event(
+                    'checkpoint_ignored',
+                    video_path=video_path,
+                    file_md5=(data.get('checkpoint_owner') or {}).get('claim_md5'),
+                    pipeline_id=expected_pipeline,
+                    reason='source_size_changed',
+                )
                 return None
             if data.get('mtime') is not None and abs(float(data.get('mtime')) - float(st.st_mtime)) > 2.0:
+                record_processing_event(
+                    'checkpoint_ignored',
+                    video_path=video_path,
+                    file_md5=(data.get('checkpoint_owner') or {}).get('claim_md5'),
+                    pipeline_id=expected_pipeline,
+                    reason='source_mtime_changed',
+                )
                 return None
         except Exception:
             pass
+        record_processing_event(
+            'checkpoint_loaded_for_resume',
+            video_path=video_path,
+            file_md5=(data.get('checkpoint_owner') or {}).get('claim_md5'),
+            pipeline_id=expected_pipeline,
+            next_frame=data.get('next_frame'),
+            last_success_frame=data.get('last_success_frame'),
+            detection_count=len(data.get('detections') or []),
+            checkpoint_reason=data.get('reason'),
+        )
         return data
-    except Exception:
+    except Exception as e:
+        record_processing_event(
+            'checkpoint_load_failed',
+            video_path=video_path,
+            pipeline_id=pipeline_id,
+            error=str(e),
+        )
         return None
 
 
@@ -616,10 +815,20 @@ def _checkpoint_owner_snapshot(claim_md5=None):
     return owner
 
 
-def _save_checkpoint(video_path, next_frame, detections, last_detected, claim_md5=None, last_success_frame=None):
-    path = _checkpoint_path(video_path)
+def _save_checkpoint(
+    video_path,
+    next_frame,
+    detections,
+    last_detected,
+    claim_md5=None,
+    last_success_frame=None,
+    pipeline_id=None,
+    reason=None,
+):
+    path = _checkpoint_path(video_path, pipeline_id=pipeline_id)
     payload = {
         'version': 1,
+        'pipeline_id': normalize_pipeline_id(pipeline_id),
         'next_frame': int(max(0, next_frame or 0)),
         'detections': detections or [],
         'last_detected': float(last_detected) if last_detected is not None else -5.0,
@@ -627,6 +836,7 @@ def _save_checkpoint(video_path, next_frame, detections, last_detected, claim_md
         'last_success_frame': int(last_success_frame) if last_success_frame is not None else int(max(-1, (next_frame or 0) - 1)),
         'checkpoint_owner': _checkpoint_owner_snapshot(claim_md5),
         'claim_heartbeat_at': time.time() if claim_md5 else None,
+        'reason': str(reason or 'unspecified'),
     }
     try:
         st = os.stat(video_path)
@@ -638,45 +848,196 @@ def _save_checkpoint(video_path, next_frame, detections, last_detected, claim_md
         tmp = path + '.tmp'
         with open(tmp, 'w', encoding='utf-8', errors='ignore') as f:
             json.dump(payload, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
-    except Exception:
-        pass
+    except Exception as e:
+        record_processing_event(
+            'checkpoint_save_failed',
+            video_path=video_path,
+            file_md5=claim_md5,
+            pipeline_id=payload['pipeline_id'],
+            next_frame=payload['next_frame'],
+            reason=payload['reason'],
+            error=str(e),
+        )
+        return False
+    record_processing_event(
+        'checkpoint_saved',
+        video_path=video_path,
+        file_md5=claim_md5,
+        pipeline_id=payload['pipeline_id'],
+        next_frame=payload['next_frame'],
+        last_success_frame=payload['last_success_frame'],
+        detection_count=len(payload['detections']),
+        reason=payload['reason'],
+    )
+    return True
 
 
-def _clear_checkpoint(video_path):
-    path = _checkpoint_path(video_path)
+def _clear_checkpoint(video_path, pipeline_id=None):
+    path = _checkpoint_path(video_path, pipeline_id=pipeline_id)
     try:
         if os.path.exists(path):
             os.remove(path)
-    except Exception:
-        pass
+            record_processing_event(
+                'checkpoint_cleared',
+                video_path=video_path,
+                pipeline_id=pipeline_id,
+            )
+            return True
+    except Exception as e:
+        record_processing_event(
+            'checkpoint_clear_failed',
+            video_path=video_path,
+            pipeline_id=pipeline_id,
+            error=str(e),
+        )
+        return False
+    return False
 
 
-def has_completed_artifact(video_path, existing_names_lower=None):
+def _done_marker_matches(
+    marker_path,
+    video_path,
+    pipeline_id,
+    existing_names_lower=None,
+):
+    marker_name = os.path.basename(marker_path)
+    if existing_names_lower is not None and marker_name.casefold() not in existing_names_lower:
+        return False
+    if not os.path.exists(marker_path):
+        return False
+    try:
+        with open(marker_path, 'r', encoding='utf-8', errors='strict') as f:
+            payload = json.load(f)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        # 旧纯文本 marker 只属于 legacy-v1，不能满足任何新流水线。
+        return pipeline_id is None
+    if not isinstance(payload, dict):
+        return False
+    if int(payload.get('version', 0) or 0) < DONE_MARKER_VERSION:
+        return False
+    if normalize_pipeline_id(payload.get('pipeline_id')) != normalize_pipeline_id(
+        pipeline_id
+    ):
+        return False
+    return _source_snapshot_matches(
+        video_path,
+        {
+            'size': payload.get('source_size'),
+            'mtime_ns': payload.get('source_mtime_ns'),
+        },
+    )
+
+
+def write_completion_marker(
+    marker_path,
+    source_path,
+    pipeline_id=None,
+    file_md5=None,
+    source_snapshot=None,
+    extra=None,
+):
+    """原子写入绑定源文件和流水线的 JSON 完成标记。"""
+    try:
+        snapshot = source_snapshot or _source_snapshot(source_path)
+        if not _source_snapshot_matches(source_path, snapshot):
+            return False
+        payload = {
+            'version': DONE_MARKER_VERSION,
+            'pipeline_id': normalize_pipeline_id(pipeline_id),
+            'file_md5': file_md5,
+            'source_size': int(snapshot['size']),
+            'source_mtime_ns': int(snapshot['mtime_ns']),
+            'completed_at': time.time(),
+        }
+        if extra:
+            payload['extra'] = dict(extra)
+        marker_dir = os.path.dirname(marker_path) or '.'
+        os.makedirs(marker_dir, exist_ok=True)
+        tmp_path = f'{marker_path}.{os.getpid()}.{uuid.uuid4().hex}.tmp'
+        try:
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, ensure_ascii=False, sort_keys=True)
+                f.write('\n')
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, marker_path)
+        finally:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def write_done_marker(
+    video_path,
+    pipeline_id=None,
+    file_md5=None,
+    source_snapshot=None,
+):
+    """在源视频旁写入 profile 感知的完成标记。"""
+    video_dir = os.path.dirname(video_path) or '.'
+    base = safe_artifact_basename(video_path, pipeline_id=pipeline_id)
+    marker_path = os.path.join(video_dir, base + DONE_SUFFIX)
+    return write_completion_marker(
+        marker_path,
+        video_path,
+        pipeline_id=pipeline_id,
+        file_md5=file_md5,
+        source_snapshot=source_snapshot,
+    )
+
+
+def completion_marker_matches(marker_path, source_path, pipeline_id=None):
+    """校验任意位置的完成标记是否仍匹配源文件和流水线。"""
+    return _done_marker_matches(marker_path, source_path, pipeline_id)
+
+
+def has_completed_artifact(
+    video_path,
+    existing_names_lower=None,
+    pipeline_id=None,
+):
     """判断视频是否有可靠的完成产物。
 
     所有命名版本都只认 ``.done``，避免异常退出留下的 ``_frames.mp4``、
     ``.txt`` 等半成品被误判为完成。
     """
     try:
-        if os.path.exists(_checkpoint_path(video_path)):
+        if os.path.exists(_checkpoint_path(video_path, pipeline_id=pipeline_id)):
             return False
     except Exception:
         pass
 
     video_dir = os.path.dirname(video_path) or '.'
 
-    def _exists(file_name):
-        if existing_names_lower is not None:
-            return file_name.lower() in existing_names_lower
-        return os.path.exists(os.path.join(video_dir, file_name))
+    if pipeline_id is not None:
+        base = safe_artifact_basename(video_path, pipeline_id=pipeline_id)
+        return _done_marker_matches(
+            os.path.join(video_dir, base + DONE_SUFFIX),
+            video_path,
+            pipeline_id,
+            existing_names_lower=existing_names_lower,
+        )
 
     for base in (
         safe_artifact_basename(video_path),
         legacy_artifact_basename(video_path),
         _legacy_artifact_basename_v1(video_path),
     ):
-        if _exists(base + DONE_SUFFIX):
+        marker_path = os.path.join(video_dir, base + DONE_SUFFIX)
+        if _done_marker_matches(
+            marker_path,
+            video_path,
+            None,
+            existing_names_lower=existing_names_lower,
+        ):
             return True
     return False
 
@@ -751,6 +1112,7 @@ def _claim_match_file_md5(path):
 # ---------------------------------------------------------------------------
 
 _STOP_REQUESTED = False
+_PAUSE_EVENT_RECORDED = False
 
 
 class PauseRequested(Exception):
@@ -792,13 +1154,25 @@ def _get_pause_file_path():
 
 
 def _pause_requested(pause_file_path=None):
+    global _PAUSE_EVENT_RECORDED
     if _STOP_REQUESTED:
+        if not _PAUSE_EVENT_RECORDED:
+            record_processing_event(
+                'pause_requested', source='sigint', pause_file=None,
+            )
+            _PAUSE_EVENT_RECORDED = True
         return True
     path = pause_file_path or _get_pause_file_path()
     try:
-        return bool(path) and os.path.exists(path)
+        requested = bool(path) and os.path.exists(path)
     except Exception:
         return False
+    if requested and not _PAUSE_EVENT_RECORDED:
+        record_processing_event(
+            'pause_requested', source='pause_file', pause_file=path,
+        )
+        _PAUSE_EVENT_RECORDED = True
+    return requested
 
 
 # ---------------------------------------------------------------------------
@@ -862,15 +1236,19 @@ class DirectoryIndex:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute('PRAGMA busy_timeout = 30000;')
         self.conn.execute('PRAGMA foreign_keys = ON;')
-        # 网络共享上 WAL 模式不安全，使用 DELETE 模式
         try:
-            self.conn.execute('PRAGMA journal_mode = DELETE;')
-        except sqlite3.OperationalError as e:
-            if self._is_lock_error(e):
-                print(f"设置journal_mode被锁，跳过: {e}")
-            else:
-                raise
-        self._ensure_schema()
+            # 网络共享上 WAL 模式不安全，使用 DELETE 模式
+            try:
+                self.conn.execute('PRAGMA journal_mode = DELETE;')
+            except sqlite3.OperationalError as e:
+                if self._is_lock_error(e):
+                    print(f"设置journal_mode被锁，跳过: {e}")
+                else:
+                    raise
+            self._ensure_schema()
+        except Exception:
+            self.conn.close()
+            raise
 
     def _ensure_schema(self):
         """创建所需表和索引（如果不存在）。"""
@@ -917,17 +1295,16 @@ class DirectoryIndex:
                     self.conn.execute(
                         """
                         CREATE TABLE IF NOT EXISTS processed_videos (
-                            file_md5 TEXT PRIMARY KEY,
+                            file_md5 TEXT NOT NULL,
+                            pipeline_id TEXT NOT NULL DEFAULT 'legacy-v1',
                             video_path TEXT,
                             processed_at REAL,
                             detection_count INTEGER,
-                            model_name TEXT
+                            model_name TEXT,
+                            source_size INTEGER,
+                            source_mtime_ns INTEGER,
+                            PRIMARY KEY (file_md5, pipeline_id)
                         )
-                        """
-                    )
-                    self.conn.execute(
-                        """
-                        CREATE INDEX IF NOT EXISTS idx_processed_videos_path ON processed_videos(video_path)
                         """
                     )
                     self.conn.execute(
@@ -941,7 +1318,28 @@ class DirectoryIndex:
                             host_id TEXT,
                             pid INTEGER,
                             owner_token TEXT,
-                            owner_started_at REAL
+                            owner_started_at REAL,
+                            pipeline_id TEXT NOT NULL DEFAULT 'legacy-v1',
+                            source_path_key TEXT,
+                            source_size INTEGER,
+                            source_mtime_ns INTEGER
+                        )
+                        """
+                    )
+                    self.conn.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS processing_events (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            occurred_at REAL NOT NULL,
+                            event_type TEXT NOT NULL,
+                            file_md5 TEXT,
+                            pipeline_id TEXT NOT NULL DEFAULT 'legacy-v1',
+                            video_path TEXT,
+                            host_name TEXT,
+                            host_id TEXT,
+                            pid INTEGER,
+                            owner_token TEXT,
+                            details_json TEXT NOT NULL DEFAULT '{}'
                         )
                         """
                     )
@@ -953,6 +1351,33 @@ class DirectoryIndex:
                         """
                     )
                     self._ensure_completion_semantics_compat()
+                self._ensure_processed_schema_compat()
+                with self.conn:
+                    self.conn.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_processed_videos_path
+                        ON processed_videos(video_path)
+                        """
+                    )
+                    self.conn.execute(
+                        """
+                        CREATE UNIQUE INDEX IF NOT EXISTS idx_processing_claims_source_path
+                        ON processing_claims(source_path_key)
+                        WHERE source_path_key IS NOT NULL
+                        """
+                    )
+                    self.conn.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_processing_events_video
+                        ON processing_events(file_md5, pipeline_id, id DESC)
+                        """
+                    )
+                    self.conn.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_processing_events_time
+                        ON processing_events(occurred_at DESC)
+                        """
+                    )
                 return
             except sqlite3.OperationalError as e:
                 if self._is_lock_error(e):
@@ -970,6 +1395,229 @@ class DirectoryIndex:
         except sqlite3.Error:
             pass
 
+    def record_processing_event(
+        self,
+        event_type,
+        video_path=None,
+        file_md5=None,
+        pipeline_id=None,
+        details=None,
+    ):
+        """将处理审计事件持久化到共享状态库。"""
+        try:
+            details_json = json.dumps(
+                details or {}, ensure_ascii=False, sort_keys=True, default=str,
+            )
+        except (TypeError, ValueError):
+            return False
+        for attempt in range(3):
+            try:
+                with self.conn:
+                    self.conn.execute(
+                        """
+                        INSERT INTO processing_events (
+                            occurred_at, event_type, file_md5, pipeline_id, video_path,
+                            host_name, host_id, pid, owner_token, details_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            time.time(),
+                            str(event_type),
+                            str(file_md5) if file_md5 else None,
+                            normalize_pipeline_id(pipeline_id),
+                            str(video_path) if video_path else None,
+                            self.host_name,
+                            self.host_id,
+                            self.pid,
+                            self.owner_token,
+                            details_json,
+                        ),
+                    )
+                return True
+            except sqlite3.OperationalError as e:
+                if self._is_lock_error(e) and attempt < 2:
+                    time.sleep(0.1 * (attempt + 1))
+                    continue
+                return False
+            except sqlite3.Error:
+                return False
+        return False
+
+    def list_processing_events(
+        self,
+        limit=100,
+        file_md5=None,
+        pipeline_id=None,
+        video_path=None,
+    ):
+        """读取最近的处理审计事件，供状态诊断和回归测试使用。"""
+        try:
+            final_limit = max(1, min(int(limit or 100), 10000))
+        except (TypeError, ValueError):
+            final_limit = 100
+        clauses = []
+        params = []
+        if file_md5:
+            clauses.append('file_md5=?')
+            params.append(str(file_md5))
+        if pipeline_id is not None:
+            clauses.append('pipeline_id=?')
+            params.append(normalize_pipeline_id(pipeline_id))
+        if video_path:
+            clauses.append('video_path=?')
+            params.append(str(video_path))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ''
+        rows = self.conn.execute(
+            f"""
+            SELECT id, occurred_at, event_type, file_md5, pipeline_id, video_path,
+                   host_name, host_id, pid, owner_token, details_json
+            FROM {PROCESSING_EVENT_TABLE}{where}
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (*params, final_limit),
+        ).fetchall()
+        events = []
+        for row in reversed(rows):
+            item = dict(row)
+            try:
+                item['details'] = json.loads(item.pop('details_json') or '{}')
+            except (TypeError, ValueError, json.JSONDecodeError):
+                item['details'] = {}
+                item.pop('details_json', None)
+            events.append(item)
+        return events
+
+    def _processed_schema_is_current(self):
+        rows = self.conn.execute('PRAGMA table_info(processed_videos)').fetchall()
+        columns = {
+            row['name'] if isinstance(row, sqlite3.Row) else row[1]: row
+            for row in rows
+        }
+        if not {'file_md5', 'pipeline_id'} <= set(columns):
+            return False
+        pk_order = {
+            name: int(row['pk'] if isinstance(row, sqlite3.Row) else row[5])
+            for name, row in columns.items()
+            if int(row['pk'] if isinstance(row, sqlite3.Row) else row[5]) > 0
+        }
+        return pk_order == {'file_md5': 1, 'pipeline_id': 2}
+
+    def _ensure_processed_schema_compat(self):
+        """原子迁移完成记录，使不同处理流水线拥有独立状态。"""
+        if self._processed_schema_is_current():
+            rows = self.conn.execute('PRAGMA table_info(processed_videos)').fetchall()
+            columns = {
+                row['name'] if isinstance(row, sqlite3.Row) else row[1]
+                for row in rows
+            }
+            additions = {
+                'source_size': 'INTEGER',
+                'source_mtime_ns': 'INTEGER',
+            }
+            with self.conn:
+                for column, column_type in additions.items():
+                    if column not in columns:
+                        self.conn.execute(
+                            f'ALTER TABLE processed_videos ADD COLUMN {column} {column_type}'
+                        )
+            return
+
+        for attempt in range(3):
+            try:
+                self.conn.execute('BEGIN IMMEDIATE')
+                if self._processed_schema_is_current():
+                    self.conn.commit()
+                    return
+                active_claims = self.conn.execute(
+                    'SELECT COUNT(*) FROM processing_claims'
+                ).fetchone()[0]
+                if active_claims:
+                    self.conn.rollback()
+                    raise RuntimeError(
+                        '检测到旧实例仍持有处理声明，暂不能迁移完成态数据库；'
+                        '请先停止旧实例后重试'
+                    )
+
+                rows = self.conn.execute(
+                    'PRAGMA table_info(processed_videos)'
+                ).fetchall()
+                old_columns = {
+                    row['name'] if isinstance(row, sqlite3.Row) else row[1]
+                    for row in rows
+                }
+                self.conn.execute('DROP TABLE IF EXISTS processed_videos_profile_migration')
+                self.conn.execute(
+                    """
+                    CREATE TABLE processed_videos_profile_migration (
+                        file_md5 TEXT NOT NULL,
+                        pipeline_id TEXT NOT NULL DEFAULT 'legacy-v1',
+                        video_path TEXT,
+                        processed_at REAL,
+                        detection_count INTEGER,
+                        model_name TEXT,
+                        source_size INTEGER,
+                        source_mtime_ns INTEGER,
+                        PRIMARY KEY (file_md5, pipeline_id)
+                    )
+                    """
+                )
+                pipeline_expr = (
+                    "COALESCE(NULLIF(TRIM(pipeline_id), ''), 'legacy-v1')"
+                    if 'pipeline_id' in old_columns
+                    else "'legacy-v1'"
+                )
+                source_size_expr = (
+                    'source_size' if 'source_size' in old_columns else 'NULL'
+                )
+                source_mtime_expr = (
+                    'source_mtime_ns'
+                    if 'source_mtime_ns' in old_columns
+                    else 'NULL'
+                )
+                self.conn.execute(
+                    f"""
+                    INSERT OR IGNORE INTO processed_videos_profile_migration (
+                        file_md5, pipeline_id, video_path, processed_at,
+                        detection_count, model_name, source_size, source_mtime_ns
+                    )
+                    SELECT file_md5, {pipeline_expr}, video_path, processed_at,
+                           detection_count, model_name,
+                           {source_size_expr}, {source_mtime_expr}
+                    FROM processed_videos
+                    """
+                )
+                self.conn.execute('DROP TABLE processed_videos')
+                self.conn.execute(
+                    'ALTER TABLE processed_videos_profile_migration RENAME TO processed_videos'
+                )
+                self.conn.execute(
+                    """
+                    INSERT OR REPLACE INTO index_metadata (key, value)
+                    VALUES ('processed_profiles_v2', ?)
+                    """,
+                    (str(time.time()),),
+                )
+                self.conn.commit()
+                if not self._processed_schema_is_current():
+                    raise RuntimeError('processed_videos 流水线迁移后结构校验失败')
+                return
+            except sqlite3.OperationalError as e:
+                try:
+                    self.conn.rollback()
+                except sqlite3.Error:
+                    pass
+                if self._is_lock_error(e) and attempt < 2:
+                    time.sleep(5)
+                    continue
+                raise
+            except Exception:
+                try:
+                    self.conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+
     def _ensure_claim_schema_compat(self):
         """为旧数据库补齐 processing_claims 新字段。"""
         additions = {
@@ -977,6 +1625,10 @@ class DirectoryIndex:
             'host_id': 'TEXT',
             'owner_token': 'TEXT',
             'owner_started_at': 'REAL',
+            'pipeline_id': "TEXT NOT NULL DEFAULT 'legacy-v1'",
+            'source_path_key': 'TEXT',
+            'source_size': 'INTEGER',
+            'source_mtime_ns': 'INTEGER',
         }
         for column, column_type in additions.items():
             try:
@@ -1113,16 +1765,8 @@ class DirectoryIndex:
         return main_db_cleared
 
     def _fallback_to_memory_db(self, reason):
-        """回退到内存数据库。"""
-        print(f"回退到内存数据库（{reason}）")
-        try:
-            self.conn.close()
-        except Exception:
-            pass
-        self.conn = sqlite3.connect(':memory:')
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute('PRAGMA foreign_keys = ON;')
-        self._ensure_schema()
+        """协调数据库不可用时拒绝降级，避免多实例重复处理。"""
+        raise RuntimeError(f"协调数据库不可用，已停止处理（{reason}）")
 
     def _safe_reconnect(self, context_msg):
         """安全地重新连接到文件数据库。"""
@@ -1139,7 +1783,6 @@ class DirectoryIndex:
         except Exception as e:
             print(f"{context_msg}重连数据库失败: {e}")
             self._fallback_to_memory_db(f"{context_msg}重连失败")
-            return True
 
     def _rebuild_if_corrupt(self):
         """检测到数据库操作异常时的恢复策略。"""
@@ -1173,7 +1816,6 @@ class DirectoryIndex:
             db_cleared = self._remove_db_files(self.db_path)
             if not db_cleared:
                 self._fallback_to_memory_db('损坏的数据库文件被锁定，无法删除')
-                return True
             try:
                 self.conn = sqlite3.connect(self.db_path, timeout=60)
                 self.conn.row_factory = sqlite3.Row
@@ -1198,6 +1840,26 @@ class DirectoryIndex:
             return normalize_posix_path_with_fs(path)
         except Exception:
             return os.path.normpath(path)
+
+    def _source_path_key(self, video_path):
+        """生成跨入口稳定的源路径键，用于阻止增长文件被重复领取。"""
+        normalized = self._normalize_path(video_path)
+        if not normalized:
+            return None
+        candidate = str(normalized)
+        if self.db_path and self.db_path != ':memory:':
+            try:
+                db_dir = os.path.dirname(os.path.abspath(self.db_path))
+                processing_root = os.path.dirname(db_dir)
+                relative = os.path.relpath(candidate, processing_root)
+                if relative != '..' and not relative.startswith('..' + os.sep):
+                    candidate = relative
+            except (OSError, TypeError, ValueError):
+                pass
+        normalized_key = candidate.replace('\\', '/').casefold()
+        if not normalized_key:
+            return None
+        return hashlib.sha256(normalized_key.encode('utf-8')).hexdigest()
 
     def _build_exclusion_set(self, exclusions):
         normalized = set()
@@ -1601,49 +2263,94 @@ class DirectoryIndex:
         return [row['file_name'] for row in rows]
 
     def _upsert_processed_video(
-        self, file_md5, video_path, detection_count=0, model_name=None
+        self,
+        file_md5,
+        video_path,
+        detection_count=0,
+        model_name=None,
+        pipeline_id=None,
+        source_snapshot=None,
     ):
+        pipeline = normalize_pipeline_id(pipeline_id)
+        snapshot = source_snapshot or {}
         self.conn.execute(
             """
             INSERT INTO processed_videos (
-                file_md5, video_path, processed_at, detection_count, model_name
+                file_md5, pipeline_id, video_path, processed_at,
+                detection_count, model_name, source_size, source_mtime_ns
             )
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(file_md5) DO UPDATE SET
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(file_md5, pipeline_id) DO UPDATE SET
                 video_path=excluded.video_path,
                 processed_at=excluded.processed_at,
                 detection_count=excluded.detection_count,
-                model_name=excluded.model_name
+                model_name=excluded.model_name,
+                source_size=excluded.source_size,
+                source_mtime_ns=excluded.source_mtime_ns
             """,
             (
                 file_md5,
+                pipeline,
                 str(video_path) if video_path else None,
                 time.time(),
                 detection_count,
                 model_name,
+                snapshot.get('size'),
+                snapshot.get('mtime_ns'),
             ),
         )
 
-    def mark_video_processed(self, file_md5, video_path, detection_count=0, model_name=None):
+    def mark_video_processed(
+        self,
+        file_md5,
+        video_path,
+        detection_count=0,
+        model_name=None,
+        pipeline_id=None,
+        source_snapshot=None,
+    ):
         """补录视频完成状态，不触碰可能属于其他进程的 claim。"""
         if not file_md5:
             return False
+        pipeline = normalize_pipeline_id(pipeline_id)
+        snapshot = source_snapshot or {}
         try:
             with self.conn:
                 cur = self.conn.execute(
                     """
                     INSERT INTO processed_videos (
-                        file_md5, video_path, processed_at, detection_count, model_name
+                        file_md5, pipeline_id, video_path, processed_at,
+                        detection_count, model_name, source_size, source_mtime_ns
                     )
-                    SELECT ?, ?, ?, ?, ?
+                    SELECT ?, ?, ?, ?, ?, ?, ?, ?
                     WHERE NOT EXISTS (
                         SELECT 1 FROM processing_claims WHERE file_md5=?
                     )
-                    ON CONFLICT(file_md5) DO UPDATE SET
+                    ON CONFLICT(file_md5, pipeline_id) DO UPDATE SET
                         video_path=excluded.video_path,
-                        processed_at=excluded.processed_at,
-                        detection_count=excluded.detection_count,
-                        model_name=excluded.model_name
+                        processed_at=CASE
+                            WHEN excluded.detection_count=-1
+                                 AND processed_videos.detection_count>=0
+                            THEN processed_videos.processed_at
+                            ELSE excluded.processed_at
+                        END,
+                        detection_count=CASE
+                            WHEN excluded.detection_count=-1
+                                 AND processed_videos.detection_count>=0
+                            THEN processed_videos.detection_count
+                            ELSE excluded.detection_count
+                        END,
+                        model_name=CASE
+                            WHEN excluded.detection_count=-1
+                                 AND processed_videos.detection_count>=0
+                            THEN processed_videos.model_name
+                            ELSE COALESCE(excluded.model_name, processed_videos.model_name)
+                        END,
+                        source_size=COALESCE(excluded.source_size, processed_videos.source_size),
+                        source_mtime_ns=COALESCE(
+                            excluded.source_mtime_ns,
+                            processed_videos.source_mtime_ns
+                        )
                     WHERE NOT EXISTS (
                         SELECT 1 FROM processing_claims
                         WHERE file_md5=excluded.file_md5
@@ -1651,10 +2358,13 @@ class DirectoryIndex:
                     """,
                     (
                         file_md5,
+                        pipeline,
                         str(video_path) if video_path else None,
                         time.time(),
                         detection_count,
                         model_name,
+                        snapshot.get('size'),
+                        snapshot.get('mtime_ns'),
                         file_md5,
                     ),
                 )
@@ -1664,38 +2374,88 @@ class DirectoryIndex:
             return False
 
     def complete_claimed_video(
-        self, file_md5, video_path, detection_count=0, model_name=None
+        self,
+        file_md5,
+        video_path,
+        detection_count=0,
+        model_name=None,
+        pipeline_id=None,
+        source_snapshot=None,
     ):
         """仅允许当前 claim 持有者在同一事务中消费 claim 并写入完成态。"""
         if not file_md5:
             return False
+        pipeline = normalize_pipeline_id(pipeline_id)
         try:
             with self.conn:
+                claim = self.conn.execute(
+                    """
+                    SELECT source_size, source_mtime_ns
+                    FROM processing_claims
+                    WHERE file_md5=? AND pipeline_id=? AND owner_token=?
+                    """,
+                    (file_md5, pipeline, self.owner_token),
+                ).fetchone()
+                if claim is None:
+                    return False
+                claim_snapshot = None
+                if claim['source_size'] is not None:
+                    claim_snapshot = {
+                        'size': claim['source_size'],
+                        'mtime_ns': claim['source_mtime_ns'],
+                    }
+                if source_snapshot is not None and claim_snapshot is not None:
+                    if (
+                        int(source_snapshot.get('size', -1))
+                        != int(claim_snapshot.get('size', -2))
+                        or int(source_snapshot.get('mtime_ns', -1))
+                        != int(claim_snapshot.get('mtime_ns', -2))
+                    ):
+                        return False
+                expected_snapshot = claim_snapshot or source_snapshot
+                if expected_snapshot is not None and not _source_snapshot_matches(
+                    video_path, expected_snapshot
+                ):
+                    return False
                 cur = self.conn.execute(
                     """
                     DELETE FROM processing_claims
-                    WHERE file_md5=? AND owner_token=?
+                    WHERE file_md5=? AND pipeline_id=? AND owner_token=?
                     """,
-                    (file_md5, self.owner_token),
+                    (file_md5, pipeline, self.owner_token),
                 )
                 if cur.rowcount != 1:
                     return False
                 self._upsert_processed_video(
-                    file_md5, video_path, detection_count, model_name
+                    file_md5,
+                    video_path,
+                    detection_count,
+                    model_name,
+                    pipeline_id=pipeline,
+                    source_snapshot=expected_snapshot,
                 )
             return True
         except Exception as e:
             print(f"完成视频 claim 失败: {e}")
             return False
 
-    def is_video_processed_by_md5(self, file_md5, include_directory_backfill=True):
+    def is_video_processed_by_md5(
+        self,
+        file_md5,
+        include_directory_backfill=True,
+        pipeline_id=None,
+    ):
         """根据文件MD5查询视频是否已处理过。"""
         if not file_md5:
             return False
+        pipeline = normalize_pipeline_id(pipeline_id)
         try:
             row = self.conn.execute(
-                'SELECT detection_count FROM processed_videos WHERE file_md5=?',
-                (file_md5,),
+                """
+                SELECT detection_count FROM processed_videos
+                WHERE file_md5=? AND pipeline_id=?
+                """,
+                (file_md5, pipeline),
             ).fetchone()
             if row is None:
                 return False
@@ -1705,19 +2465,41 @@ class DirectoryIndex:
         except Exception:
             return False
 
+    def rollback_video_completion(self, file_md5, pipeline_id=None):
+        """最终 marker 写入失败时撤销本流水线完成记录。"""
+        if not file_md5:
+            return False
+        pipeline = normalize_pipeline_id(pipeline_id)
+        try:
+            with self.conn:
+                cur = self.conn.execute(
+                    """
+                    DELETE FROM processed_videos
+                    WHERE file_md5=? AND pipeline_id=?
+                    """,
+                    (file_md5, pipeline),
+                )
+            return cur.rowcount == 1
+        except sqlite3.Error as e:
+            print(f"撤销视频完成状态失败: {e}")
+            return False
+
     @staticmethod
     def _claim_ttl_seconds():
         return get_claim_ttl_seconds()
 
-    def _get_claim_row(self, file_md5):
+    def _get_claim_row(self, file_md5, source_path_key=None):
         return self.conn.execute(
             """
             SELECT file_md5, video_path, claimed_at, heartbeat_at,
-                   host_name, host_id, pid, owner_token, owner_started_at
+                   host_name, host_id, pid, owner_token, owner_started_at,
+                   pipeline_id, source_path_key, source_size, source_mtime_ns
             FROM processing_claims
             WHERE file_md5=?
+               OR (? IS NOT NULL AND source_path_key=?)
+            LIMIT 1
             """,
-            (file_md5,),
+            (file_md5, source_path_key, source_path_key),
         ).fetchone()
 
     @staticmethod
@@ -1732,6 +2514,10 @@ class DirectoryIndex:
             row['pid'],
             row['owner_token'],
             row['owner_started_at'],
+            row['pipeline_id'],
+            row['source_path_key'],
+            row['source_size'],
+            row['source_mtime_ns'],
         )
 
     def _local_claim_owner_alive(self, row):
@@ -1788,12 +2574,20 @@ class DirectoryIndex:
 
     def _replace_claim_snapshot(self, row, video_path, now):
         """仅在 claim 快照未变化时原子接管，避免误删或覆盖新持有者。"""
+        context = getattr(self, '_claim_replacement_context', None) or {}
+        file_md5 = context.get('file_md5') or row['file_md5']
+        pipeline_id = normalize_pipeline_id(
+            context.get('pipeline_id') or row['pipeline_id']
+        )
+        source_path_key = context.get('source_path_key')
+        source_snapshot = context.get('source_snapshot') or {}
         with self.conn:
             cur = self.conn.execute(
                 """
                 UPDATE processing_claims
-                SET video_path=?, claimed_at=?, heartbeat_at=?, host_name=?, host_id=?,
-                    pid=?, owner_token=?, owner_started_at=?
+                SET file_md5=?, video_path=?, claimed_at=?, heartbeat_at=?,
+                    host_name=?, host_id=?, pid=?, owner_token=?, owner_started_at=?,
+                    pipeline_id=?, source_path_key=?, source_size=?, source_mtime_ns=?
                 WHERE file_md5=?
                   AND video_path IS ?
                   AND claimed_at IS ?
@@ -1803,12 +2597,17 @@ class DirectoryIndex:
                   AND pid IS ?
                   AND owner_token IS ?
                   AND owner_started_at IS ?
+                  AND pipeline_id IS ?
+                  AND source_path_key IS ?
+                  AND source_size IS ?
+                  AND source_mtime_ns IS ?
                   AND NOT EXISTS (
                       SELECT 1 FROM processed_videos
-                      WHERE processed_videos.file_md5=processing_claims.file_md5
+                      WHERE file_md5=? AND pipeline_id=?
                   )
                 """,
                 (
+                    file_md5,
                     str(video_path) if video_path else None,
                     now,
                     now,
@@ -1817,7 +2616,13 @@ class DirectoryIndex:
                     self.pid,
                     self.owner_token,
                     self.process_started_at,
+                    pipeline_id,
+                    source_path_key,
+                    source_snapshot.get('size'),
+                    source_snapshot.get('mtime_ns'),
                     *self._claim_snapshot_values(row),
+                    file_md5,
+                    pipeline_id,
                 ),
             )
             if cur.rowcount == 1:
@@ -1838,18 +2643,45 @@ class DirectoryIndex:
                   AND pid IS ?
                   AND owner_token IS ?
                   AND owner_started_at IS ?
+                  AND pipeline_id IS ?
+                  AND source_path_key IS ?
+                  AND source_size IS ?
+                  AND source_mtime_ns IS ?
                 """,
                 self._claim_snapshot_values(row),
             )
         return cur.rowcount == 1
 
-    def try_claim_video(self, file_md5, video_path):
+    def try_claim_video(
+        self,
+        file_md5,
+        video_path,
+        pipeline_id=None,
+        source_snapshot=None,
+    ):
         """在开工前原子领取视频；同机死进程可立即接管。"""
         if not file_md5:
             return False
+        pipeline = normalize_pipeline_id(pipeline_id)
+        explicit_pipeline = pipeline_id is not None
+        source_key = self._source_path_key(video_path) if explicit_pipeline else None
+        try:
+            snapshot = source_snapshot or (
+                _source_snapshot(video_path) if explicit_pipeline else {}
+            )
+        except OSError:
+            return False
+        if explicit_pipeline and (
+            not source_key
+            or snapshot.get('size') is None
+            or snapshot.get('mtime_ns') is None
+        ):
+            return False
+        if explicit_pipeline and not _source_snapshot_matches(video_path, snapshot):
+            return False
         try:
             resume_incomplete = bool(video_path) and os.path.exists(
-                _checkpoint_path(video_path)
+                _checkpoint_path(video_path, pipeline_id=pipeline_id)
             )
         except Exception:
             resume_incomplete = False
@@ -1861,21 +2693,22 @@ class DirectoryIndex:
                         self.conn.execute(
                             """
                             DELETE FROM processed_videos
-                            WHERE file_md5=? AND detection_count=-1
+                            WHERE file_md5=? AND pipeline_id=? AND detection_count=-1
                             """,
-                            (file_md5,),
+                            (file_md5, pipeline),
                         )
                     cur = self.conn.execute(
                         """
-                        INSERT INTO processing_claims (
+                        INSERT OR IGNORE INTO processing_claims (
                             file_md5, video_path, claimed_at, heartbeat_at,
-                            host_name, host_id, pid, owner_token, owner_started_at
+                            host_name, host_id, pid, owner_token, owner_started_at,
+                            pipeline_id, source_path_key, source_size, source_mtime_ns
                         )
-                        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+                        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                         WHERE NOT EXISTS (
-                            SELECT 1 FROM processed_videos WHERE file_md5=?
+                            SELECT 1 FROM processed_videos
+                            WHERE file_md5=? AND pipeline_id=?
                         )
-                        ON CONFLICT(file_md5) DO NOTHING
                         """,
                         (
                             file_md5,
@@ -1887,34 +2720,119 @@ class DirectoryIndex:
                             self.pid,
                             self.owner_token,
                             self.process_started_at,
+                            pipeline,
+                            source_key,
+                            snapshot.get('size'),
+                            snapshot.get('mtime_ns'),
                             file_md5,
+                            pipeline,
                         ),
                     )
                     if cur.rowcount == 1:
                         self._invalidate_claim_directory(video_path)
                 if cur.rowcount == 1:
+                    self.record_processing_event(
+                        'claim_acquired',
+                        video_path=video_path,
+                        file_md5=file_md5,
+                        pipeline_id=pipeline,
+                        details={
+                            'acquisition': 'new',
+                            'checkpoint_present': resume_incomplete,
+                        },
+                    )
                     return True
 
-                row = self._get_claim_row(file_md5)
+                row = self._get_claim_row(file_md5, source_path_key=source_key)
                 if not row:
                     continue
-                if self.is_video_processed_by_md5(file_md5):
+                if self.is_video_processed_by_md5(
+                    file_md5, pipeline_id=pipeline
+                ):
+                    self.record_processing_event(
+                        'claim_not_acquired',
+                        video_path=video_path,
+                        file_md5=file_md5,
+                        pipeline_id=pipeline,
+                        details={'reason': 'already_completed'},
+                    )
                     return False
-                if row['owner_token'] == self.owner_token:
-                    return self.refresh_claim(file_md5)
+                if (
+                    row['owner_token'] == self.owner_token
+                    and normalize_pipeline_id(row['pipeline_id']) == pipeline
+                ):
+                    refreshed = self.refresh_claim(file_md5, pipeline_id=pipeline)
+                    self.record_processing_event(
+                        'claim_reaffirmed' if refreshed else 'claim_not_acquired',
+                        video_path=video_path,
+                        file_md5=file_md5,
+                        pipeline_id=pipeline,
+                        details={
+                            'reason': 'already_owned' if refreshed else 'refresh_failed',
+                        },
+                    )
+                    return refreshed
                 if not self._claim_is_reclaimable(row, now=now):
+                    self.record_processing_event(
+                        'claim_not_acquired',
+                        video_path=video_path,
+                        file_md5=file_md5,
+                        pipeline_id=pipeline,
+                        details={
+                            'reason': 'owned_elsewhere',
+                            'owner_host': row['host_name'],
+                            'owner_pid': row['pid'],
+                            'owner_pipeline': row['pipeline_id'],
+                        },
+                    )
                     return False
-                if self._replace_claim_snapshot(row, video_path, now):
-                    return True
+                self._claim_replacement_context = {
+                    'file_md5': file_md5,
+                    'pipeline_id': pipeline,
+                    'source_path_key': source_key,
+                    'source_snapshot': snapshot,
+                }
+                try:
+                    if self._replace_claim_snapshot(row, video_path, now):
+                        self.record_processing_event(
+                            'claim_acquired',
+                            video_path=video_path,
+                            file_md5=file_md5,
+                            pipeline_id=pipeline,
+                            details={
+                                'acquisition': 'reclaimed',
+                                'previous_owner_host': row['host_name'],
+                                'previous_owner_pid': row['pid'],
+                                'checkpoint_present': resume_incomplete,
+                            },
+                        )
+                        return True
+                finally:
+                    self._claim_replacement_context = None
+            self.record_processing_event(
+                'claim_not_acquired',
+                video_path=video_path,
+                file_md5=file_md5,
+                pipeline_id=pipeline,
+                details={'reason': 'contention'},
+            )
             return False
         except Exception as e:
             print(f"声明视频处理失败: {e}")
+            self.record_processing_event(
+                'claim_error',
+                video_path=video_path,
+                file_md5=file_md5,
+                pipeline_id=pipeline,
+                details={'error': str(e)},
+            )
             return False
 
-    def refresh_claim(self, file_md5):
+    def refresh_claim(self, file_md5, pipeline_id=None):
         """刷新当前进程持有的 claim 心跳。"""
         if not file_md5:
             return False
+        pipeline = normalize_pipeline_id(pipeline_id)
         try:
             now = time.time()
             with self.conn:
@@ -1922,31 +2840,47 @@ class DirectoryIndex:
                     """
                     UPDATE processing_claims
                     SET heartbeat_at=?
-                    WHERE file_md5=? AND owner_token=?
+                    WHERE file_md5=? AND pipeline_id=? AND owner_token=?
                     """,
-                    (now, file_md5, self.owner_token),
+                    (now, file_md5, pipeline, self.owner_token),
                 )
             return bool(cur.rowcount)
         except Exception as e:
             print(f"刷新视频声明心跳失败: {e}")
             return False
 
-    def release_claim(self, file_md5):
+    def release_claim(self, file_md5, pipeline_id=None):
         """只释放当前进程会话持有的视频声明。"""
         if not file_md5:
             return False
+        pipeline = normalize_pipeline_id(pipeline_id)
         try:
             with self.conn:
                 cur = self.conn.execute(
                     """
                     DELETE FROM processing_claims
-                    WHERE file_md5=? AND owner_token=?
+                    WHERE file_md5=? AND pipeline_id=? AND owner_token=?
                     """,
-                    (file_md5, self.owner_token),
+                    (file_md5, pipeline, self.owner_token),
                 )
-            return cur.rowcount == 1
+            released = cur.rowcount == 1
+            self.record_processing_event(
+                'claim_released' if released else 'claim_release_not_owned',
+                file_md5=file_md5,
+                pipeline_id=pipeline,
+                details={
+                    'reason': 'released' if released else 'missing_or_foreign_owner',
+                },
+            )
+            return released
         except Exception as e:
             print(f"释放视频声明失败: {e}")
+            self.record_processing_event(
+                'claim_release_failed',
+                file_md5=file_md5,
+                pipeline_id=pipeline,
+                details={'error': str(e)},
+            )
             return False
 
     def release_all_claims(self):
@@ -1957,7 +2891,13 @@ class DirectoryIndex:
                     'DELETE FROM processing_claims WHERE owner_token=?',
                     (self.owner_token,),
                 )
-            return max(0, int(cur.rowcount or 0))
+            released = max(0, int(cur.rowcount or 0))
+            if released:
+                self.record_processing_event(
+                    'session_claims_released',
+                    details={'count': released},
+                )
+            return released
         except Exception:
             return 0
 
@@ -1968,14 +2908,27 @@ class DirectoryIndex:
             rows = self.conn.execute(
                 """
                 SELECT file_md5, video_path, claimed_at, heartbeat_at,
-                       host_name, host_id, pid, owner_token, owner_started_at
+                       host_name, host_id, pid, owner_token, owner_started_at,
+                       pipeline_id, source_path_key, source_size, source_mtime_ns
                 FROM processing_claims
                 """
             ).fetchall()
             now = time.time()
             for row in rows:
                 if self._claim_is_reclaimable(row, now=now):
-                    cleaned += int(self._delete_claim_snapshot(row))
+                    deleted = self._delete_claim_snapshot(row)
+                    cleaned += int(deleted)
+                    if deleted:
+                        self.record_processing_event(
+                            'claim_reclaimed_stale',
+                            video_path=row['video_path'],
+                            file_md5=row['file_md5'],
+                            pipeline_id=row['pipeline_id'],
+                            details={
+                                'previous_owner_host': row['host_name'],
+                                'previous_owner_pid': row['pid'],
+                            },
+                        )
         except Exception as e:
             print(f"清理失效视频声明失败: {e}")
         return cleaned
@@ -2012,7 +2965,8 @@ class DirectoryIndex:
             rows = self.conn.execute(
                 """
                 SELECT file_md5, video_path, claimed_at, heartbeat_at,
-                       host_name, host_id, pid, owner_token, owner_started_at
+                       host_name, host_id, pid, owner_token, owner_started_at,
+                       pipeline_id, source_path_key, source_size, source_mtime_ns
                 FROM processing_claims
                 """
             ).fetchall()

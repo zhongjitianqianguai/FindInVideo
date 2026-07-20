@@ -4,103 +4,23 @@ import os
 import sys
 import json
 import subprocess
+import hashlib
+import math
 
-# ffmpeg / ffprobe 路径
-FFMPEG_BIN = r'C:\project\DouyinLiveRecorder\ffmpeg-7.0-essentials_build\bin'
-FFMPEG = os.path.join(FFMPEG_BIN, 'ffmpeg.exe')
-FFPROBE = os.path.join(FFMPEG_BIN, 'ffprobe.exe')
-
-
-def clean_path(raw_path):
-    """清理拖拽到终端时路径可能带有的引号和空白"""
-    p = raw_path.strip()
-    if (p.startswith('"') and p.endswith('"')) or \
-       (p.startswith("'") and p.endswith("'")):
-        p = p[1:-1]
-    return p.strip()
-
-
-def looks_like_path(text):
-    """判断输入是否像一个文件路径（拖入的视频）"""
-    cleaned = clean_path(text)
-    # 包含路径分隔符或盘符，且文件确实存在
-    if os.path.isfile(cleaned):
-        return True
-    # 包含典型路径特征（盘符或反斜杠/正斜杠+扩展名）
-    if ('\\' in cleaned or '/' in cleaned) and '.' in cleaned:
-        return True
-    # 盘符开头 如 D:
-    if len(cleaned) >= 2 and cleaned[1] == ':':
-        return True
-    return False
+from media_tool_utils import (
+    clean_path,
+    looks_like_path,
+    parse_position,
+    resolve_media_binary,
+    seconds_to_display,
+    seconds_to_ffmpeg_time,
+    time_to_filename_safe,
+    validate_time_range,
+)
 
 
-def parse_position(user_input):
-    """
-    解析用户输入的时间定位，返回秒数。
-
-    支持格式：
-      1) 时间格式  HH:MM:SS.mmm   例如 01:30:11.467
-         兼容 MM:SS.mmm 和 SS.mmm
-      2) 帧格式    帧数,帧率       例如 110632,20.444
-      3) 纯数字    当作秒数         例如 90.5
-    """
-    text = user_input.strip()
-
-    # 帧格式：包含逗号 → 帧数,帧率
-    if ',' in text:
-        parts = text.split(',')
-        if len(parts) != 2:
-            raise ValueError(f'帧格式应为 帧数,帧率，收到: {text}')
-        frame_num = int(parts[0].strip())
-        fps = float(parts[1].strip())
-        if fps <= 0:
-            raise ValueError(f'帧率必须大于0，收到: {fps}')
-        return frame_num / fps
-
-    # 时间格式：包含冒号 → HH:MM:SS.mmm
-    if ':' in text:
-        parts = text.split(':')
-        if len(parts) == 3:
-            h, m, s = int(parts[0]), int(parts[1]), float(parts[2])
-            return h * 3600 + m * 60 + s
-        elif len(parts) == 2:
-            m, s = int(parts[0]), float(parts[1])
-            return m * 60 + s
-        else:
-            raise ValueError(f'时间格式应为 HH:MM:SS.mmm 或 MM:SS.mmm，收到: {text}')
-
-    # 纯数字：直接当作秒数
-    return float(text)
-
-
-def seconds_to_display(seconds):
-    """将秒数转换为 HH:MM:SS.mmm 的可读字符串"""
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = seconds % 60
-    return f'{h:02d}:{m:02d}:{s:06.3f}'
-
-
-def seconds_to_ffmpeg_time(seconds):
-    """将秒数转换为 ffmpeg 时间参数格式"""
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = seconds % 60
-    return f'{h:02d}:{m:02d}:{s:06.3f}'
-
-
-def time_to_filename_safe(seconds):
-    """将秒数转换为可用于文件名的字符串，如 01h30m11.467s"""
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = seconds % 60
-    if h > 0:
-        return f'{h:02d}h{m:02d}m{s:06.3f}s'
-    elif m > 0:
-        return f'{m:02d}m{s:06.3f}s'
-    else:
-        return f'{s:06.3f}s'
+FFMPEG = resolve_media_binary('ffmpeg')
+FFPROBE = resolve_media_binary('ffprobe')
 
 
 def probe_video(video_path):
@@ -114,33 +34,97 @@ def probe_video(video_path):
         video_path
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8')
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, encoding='utf-8'
+        )
         if result.returncode != 0:
             print(f'ffprobe 出错：{result.stderr}')
             return None, None, None
         info = json.loads(result.stdout)
-    except Exception as e:
-        print(f'ffprobe 执行失败：{e}')
-        return None, None, None
+        if not isinstance(info, dict):
+            raise ValueError('ffprobe 返回的 JSON 根节点不是对象')
 
-    for stream in info.get('streams', []):
-        if stream.get('codec_type') == 'video':
-            fps_str = stream.get('r_frame_rate', stream.get('avg_frame_rate', '0/1'))
-            num, den = fps_str.split('/')
-            fps = float(num) / float(den) if float(den) != 0 else 0
+        streams = info.get('streams', [])
+        if not isinstance(streams, list):
+            raise ValueError('ffprobe streams 字段不是数组')
+        format_info = info.get('format', {})
+        if not isinstance(format_info, dict):
+            format_info = {}
 
-            total_frames = int(stream.get('nb_frames', 0)) if stream.get('nb_frames') else 0
+        for stream in streams:
+            if not isinstance(stream, dict) or stream.get('codec_type') != 'video':
+                continue
 
-            duration = float(stream.get('duration', 0)) if stream.get('duration') else 0
-            if duration <= 0:
-                duration = float(info.get('format', {}).get('duration', 0))
+            fps = None
+            for rate_key in ('r_frame_rate', 'avg_frame_rate'):
+                rate_text = str(stream.get(rate_key, '')).strip()
+                try:
+                    numerator, denominator = rate_text.split('/', 1)
+                    numerator = float(numerator)
+                    denominator = float(denominator)
+                    candidate = numerator / denominator
+                except (TypeError, ValueError, ZeroDivisionError, OverflowError):
+                    continue
+                if math.isfinite(candidate) and candidate > 0:
+                    fps = candidate
+                    break
+            if fps is None:
+                raise ValueError('视频帧率字段无效')
 
-            if total_frames <= 0 and fps > 0 and duration > 0:
+            duration = None
+            for raw_duration in (
+                stream.get('duration'),
+                format_info.get('duration'),
+            ):
+                try:
+                    candidate = float(raw_duration)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if math.isfinite(candidate) and candidate > 0:
+                    duration = candidate
+                    break
+            if duration is None:
+                raise ValueError('视频时长字段无效')
+
+            try:
+                total_frames = int(stream.get('nb_frames', 0))
+            except (TypeError, ValueError, OverflowError):
+                total_frames = 0
+            if total_frames <= 0:
                 total_frames = int(duration * fps)
+            if total_frames <= 0:
+                raise ValueError('视频总帧数字段无效')
 
             return fps, total_frames, duration
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        print(f'ffprobe 信息解析失败：{exc}')
+        return None, None, None
 
     return None, None, None
+
+
+def build_frame_output_dir(video_path, start_seconds, end_seconds):
+    """按源文件身份和提取区间生成独立输出目录。"""
+    start_seconds, end_seconds = validate_time_range(
+        start_seconds, end_seconds
+    )
+    absolute_path = os.path.abspath(video_path)
+    normalized_path = os.path.normcase(os.path.realpath(absolute_path))
+    try:
+        source_stat = os.stat(absolute_path)
+        identity_source = (
+            f'{normalized_path}\0{source_stat.st_size}\0{source_stat.st_mtime_ns}'
+        )
+    except OSError:
+        identity_source = normalized_path
+    source_id = hashlib.sha256(identity_source.encode('utf-8')).hexdigest()[:12]
+    source_name = os.path.basename(video_path)
+    start_tag = time_to_filename_safe(start_seconds)
+    end_tag = time_to_filename_safe(end_seconds)
+    directory_name = (
+        f'{source_name}_{source_id}_{start_tag}-{end_tag}_frames'
+    )
+    return os.path.join(os.path.dirname(absolute_path), directory_name)
 
 
 def parse_end_input(user_input, start_seconds):
@@ -150,14 +134,12 @@ def parse_end_input(user_input, start_seconds):
     自动判断：如果解析结果 > start_seconds，当作结束时间点；否则当作时长。
     直接回车默认2秒。
     """
+    start_seconds = parse_position(str(start_seconds))
     text = user_input.strip()
     if not text:
         return start_seconds + 2.0
 
-    try:
-        value = parse_position(text)
-    except ValueError:
-        raise
+    value = parse_position(text)
 
     # 智能判断：值大于开始时间 → 当作结束时间点；否则当作时长
     if value > start_seconds:
@@ -171,6 +153,14 @@ def clip_video(video_path, start_seconds, end_seconds):
     用 ffmpeg 剪辑视频片段，-c copy 不重编码。
     输出文件在视频同目录下，文件名追加起止时间。
     """
+    try:
+        start_seconds, end_seconds = validate_time_range(
+            start_seconds, end_seconds
+        )
+    except ValueError as exc:
+        print(f'剪辑参数错误：{exc}')
+        return
+
     duration = end_seconds - start_seconds
     video_dir = os.path.dirname(os.path.abspath(video_path))
     video_stem = os.path.splitext(os.path.basename(video_path))[0]
@@ -220,6 +210,14 @@ def extract_frames(video_path, start_seconds, end_seconds):
         print(f'错误：文件不存在 → {video_path}')
         return
 
+    try:
+        start_seconds, end_seconds = validate_time_range(
+            start_seconds, end_seconds
+        )
+    except ValueError as exc:
+        print(f'错误：{exc}')
+        return
+
     # 获取视频信息
     fps, total_frames, total_duration = probe_video(video_path)
     if not fps or fps <= 0:
@@ -249,14 +247,29 @@ def extract_frames(video_path, start_seconds, end_seconds):
     print(f'预计帧数：{frames_to_extract} (帧 {start_frame} → {end_frame - 1})')
     print()
 
-    # 在视频所在目录下创建输出文件夹
-    video_dir = os.path.dirname(os.path.abspath(video_path))
-    video_stem = os.path.splitext(os.path.basename(video_path))[0]
-    output_dir = os.path.join(video_dir, video_stem)
+    # 按源文件身份和区间隔离，避免同 stem 或不同提取任务互相污染。
+    output_dir = build_frame_output_dir(
+        video_path, start_seconds, end_seconds
+    )
     os.makedirs(output_dir, exist_ok=True)
     print(f'输出目录：{output_dir}')
 
     # --- 提取帧 ---
+    # 上次失败可能残留纯序号临时帧；必须先清理，避免计入本轮。
+    pending_frames = [
+        name
+        for name in os.listdir(output_dir)
+        if name.lower().endswith('.png')
+        and os.path.splitext(name)[0].isdigit()
+    ]
+    for pending_name in pending_frames:
+        pending_path = os.path.join(output_dir, pending_name)
+        try:
+            os.remove(pending_path)
+        except OSError as exc:
+            print(f'错误：无法清理旧临时帧 {pending_path}：{exc}')
+            return
+
     temp_pattern = os.path.join(output_dir, '%08d.png')
 
     cmd = [
@@ -300,8 +313,9 @@ def extract_frames(video_path, start_seconds, end_seconds):
         new_path = os.path.join(output_dir, new_name)
         try:
             os.rename(old_path, new_path)
-        except OSError:
-            pass
+        except OSError as exc:
+            print(f'重命名失败：{old_path} → {new_path}：{exc}')
+            continue
         saved_count += 1
 
     print(f'帧提取完成！共保存 {saved_count} 帧')
@@ -318,13 +332,13 @@ def main():
     print()
 
     # 检查 ffmpeg
-    if not os.path.isfile(FFMPEG):
+    if not FFMPEG or not os.path.isfile(FFMPEG):
         print(f'错误：找不到 ffmpeg → {FFMPEG}')
-        print('请修改脚本顶部的 FFMPEG_BIN 路径')
+        print('请配置 FINDINVIDEO_FFMPEG_BIN 或将 ffmpeg 加入 PATH')
         return
-    if not os.path.isfile(FFPROBE):
+    if not FFPROBE or not os.path.isfile(FFPROBE):
         print(f'错误：找不到 ffprobe → {FFPROBE}')
-        print('请修改脚本顶部的 FFMPEG_BIN 路径')
+        print('请配置 FINDINVIDEO_FFMPEG_BIN 或将 ffprobe 加入 PATH')
         return
 
     # 获取视频路径

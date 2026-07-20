@@ -17,18 +17,24 @@ import logging
 import socket
 import traceback
 import faulthandler
+import ntpath
+from dataclasses import dataclass
 
 from utils import (
     VIDEO_EXTENSIONS, DONE_SUFFIX, _IGNORED_SUBDIRS,
-    PauseRequested, _STOP_REQUESTED,
+    PauseRequested, ClaimLostError, DIRECTORY_INDEX, _STOP_REQUESTED,
+    get_claim_heartbeat_interval_seconds,
     _read_frame_with_timeout, _READ_TIMEOUT_SEC,
     _truthy_env, _get_pause_file_path, _pause_requested, _install_pause_signal_handler,
     CHECKPOINT_SUFFIX, _checkpoint_path, _load_checkpoint, _save_checkpoint, _clear_checkpoint,
+    record_resume_seek,
     is_windows_style_path, windows_path_to_wsl, wsl_path_to_windows,
     normalize_posix_path_with_fs, windows_path_to_unc, canonical_video_path,
     safe_artifact_basename, _sanitize_basename, legacy_artifact_basename, _legacy_artifact_basename_v1,
     _get_env_path, get_shared_state_dir, ensure_shared_state_dir,
     _atomic_create_file, _with_lockfile,
+    has_completed_artifact, build_pipeline_id, _source_snapshot,
+    write_done_marker as _write_done_marker_state,
     is_video_file, is_leaf_directory, count_videos_in_directory,
 )
 
@@ -41,6 +47,67 @@ EXCLUDE_PATHS = [
 
 _LOGGER = logging.getLogger("findinvideo_yolov5")
 _CRASH_LOG_FH = None
+_PROCESSING_ROOT_DIR = None
+PIPELINE_ID = None
+
+
+@dataclass(frozen=True)
+class VideoProcessingResult:
+    """区分成功零检测与处理失败，避免失败视频被写入完成态。"""
+
+    success: bool
+    detections: list
+    error: str = None
+
+    @classmethod
+    def succeeded(cls, detections):
+        return cls(True, list(detections or []), None)
+
+    @classmethod
+    def failed(cls, error):
+        return cls(False, [], str(error))
+
+
+def _release_detection_resources(resources):
+    """统一释放检测函数持有的视频与进度条资源。"""
+    pbar = resources.get('pbar')
+    if pbar is not None:
+        try:
+            pbar.close()
+        except Exception:
+            pass
+    cap = resources.get('cap')
+    if cap is not None:
+        try:
+            cap.release()
+        except Exception:
+            pass
+    try:
+        cv2.destroyAllWindows()
+    except Exception:
+        pass
+
+
+def _init_processing_root(root_dir):
+    """把共享处理状态放到处理根目录，确保多实例使用同一个 claim 数据库。"""
+    global _PROCESSING_ROOT_DIR
+    if not root_dir or not os.path.isdir(root_dir):
+        return
+    _PROCESSING_ROOT_DIR = root_dir
+    db_dir = os.path.join(root_dir, 'md5_list')
+    os.makedirs(db_dir, exist_ok=True)
+    DIRECTORY_INDEX.reopen(os.path.join(db_dir, 'directory_index.db'))
+
+
+def _resolve_pipeline_id(pipeline_id=None):
+    return pipeline_id if pipeline_id is not None else PIPELINE_ID
+
+
+def _call_directory_index(method_name, *args, pipeline_id=None, **kwargs):
+    """显式流水线使用新接口；无活动流水线时保持旧测试/调用兼容。"""
+    if pipeline_id is not None:
+        kwargs['pipeline_id'] = pipeline_id
+    return getattr(DIRECTORY_INDEX, method_name)(*args, **kwargs)
 
 
 def _setup_diagnostics():
@@ -170,38 +237,27 @@ ARTIFACT_SUFFIXES = [
 DONE_SUFFIX = '.done'
 
 
-def has_existing_artifacts(video_path):
-    try:
-        if os.path.exists(_checkpoint_path(video_path)):
-            return False
-    except Exception:
-        pass
-    video_dir = os.path.dirname(video_path) or '.'
-    bases = [safe_artifact_basename(video_path),
-             legacy_artifact_basename(video_path),
-             _legacy_artifact_basename_v1(video_path)]
-    for base in bases:
-        done_path = os.path.join(video_dir, base + DONE_SUFFIX)
-        if os.path.exists(done_path):
-            return True
-        for suffix in ARTIFACT_SUFFIXES:
-            path = os.path.join(video_dir, base + suffix)
-            if os.path.exists(path):
-                return True
-    return False
+def has_existing_artifacts(video_path, pipeline_id=None):
+    """只把可靠的 ``.done`` 标记视为已完成。"""
+    return has_completed_artifact(
+        video_path,
+        pipeline_id=_resolve_pipeline_id(pipeline_id),
+    )
 
 
-def write_done_marker(video_path):
-    try:
-        video_dir = os.path.dirname(video_path) or '.'
-        base = safe_artifact_basename(video_path)
-        marker = os.path.join(video_dir, base + DONE_SUFFIX)
-        if os.path.exists(marker):
-            return
-        with open(marker, 'w', encoding='utf-8', errors='ignore') as f:
-            f.write('done\n')
-    except Exception:
-        pass
+def write_done_marker(
+    video_path,
+    pipeline_id=None,
+    file_md5=None,
+    source_snapshot=None,
+):
+    """写入绑定源文件指纹和处理流水线的完成标记。"""
+    return _write_done_marker_state(
+        video_path,
+        pipeline_id=_resolve_pipeline_id(pipeline_id),
+        file_md5=file_md5,
+        source_snapshot=source_snapshot,
+    )
 
 
 _YOLOED_MD5_CACHE = None
@@ -429,16 +485,31 @@ def load_yolov5_model(model_path, device='cpu'):
         print(f"加载YOLOv5模型失败: {e}")
         raise e
 
-def detect_objects_in_video_yolov5(video_path, target_class,
-                                   show_window=False, save_crops=False,
-                                   save_training_data=False,
-                                   all_objects=False,
-                                   model_path='models/breast.pt'):
+def _detect_objects_in_video_yolov5_impl(
+    video_path,
+    target_class,
+    claim_md5=None,
+    pipeline_id=None,
+    show_window=False,
+    save_crops=False,
+    save_training_data=False,
+    all_objects=False,
+    model_path='models/breast.pt',
+    _resources=None,
+):
     """使用YOLOv5进行视频目标检测"""
     
     # 如果不开启全量检测，则保证 target_class 为列表
     if not all_objects and isinstance(target_class, str):
         target_class = [target_class]
+
+    pipeline = _resolve_pipeline_id(pipeline_id)
+    claim_heartbeat_interval = get_claim_heartbeat_interval_seconds()
+    if claim_md5 and not _call_directory_index(
+        'refresh_claim', claim_md5, pipeline_id=pipeline
+    ):
+        raise ClaimLostError(f"视频声明已失效，无法开始处理: {video_path}")
+    last_claim_heartbeat = time.monotonic()
 
     # 加载YOLOv5模型
     try:
@@ -446,7 +517,13 @@ def detect_objects_in_video_yolov5(video_path, target_class,
         print(f"成功加载YOLOv5模型: {model_path}")
     except Exception as e:
         print(f"加载模型失败: {e}")
-        return []
+        return VideoProcessingResult.failed(f"加载模型失败: {e}")
+
+    if claim_md5 and not _call_directory_index(
+        'refresh_claim', claim_md5, pipeline_id=pipeline
+    ):
+        raise ClaimLostError(f"视频声明已失效，停止处理: {video_path}")
+    last_claim_heartbeat = time.monotonic()
 
     # 获取类别名称
     if hasattr(model, 'names'):
@@ -463,6 +540,11 @@ def detect_objects_in_video_yolov5(video_path, target_class,
     # 若需要生成训练数据，则构造保存目录及生成 classes.txt 文件
     if save_training_data:
         training_folder = os.path.join(os.path.dirname(video_path), "training_data")
+        if pipeline is not None:
+            training_folder = os.path.join(
+                training_folder,
+                safe_artifact_basename(video_path, pipeline_id=pipeline),
+            )
         os.makedirs(training_folder, exist_ok=True)
         classes_txt = os.path.join(training_folder, "classes.txt")
         if not os.path.exists(classes_txt):
@@ -477,24 +559,47 @@ def detect_objects_in_video_yolov5(video_path, target_class,
 
     pause_file = _get_pause_file_path()
     resume_enabled = _truthy_env('FINDINVIDEO_RESUME', default=True)
-    ckpt = _load_checkpoint(video_path) if resume_enabled else None
+    ckpt = _load_checkpoint(video_path, pipeline_id=pipeline) if resume_enabled else None
     start_frame = int(ckpt.get('next_frame', 0)) if ckpt else 0
     detections = list(ckpt.get('detections', [])) if ckpt else []
     last_detected = float(ckpt.get('last_detected', detections[-1] if detections else -5.0)) if ckpt else -5
     
     # 视频处理初始化
     cap = cv2.VideoCapture(video_path)
+    if _resources is not None:
+        _resources['cap'] = cap
     if not cap.isOpened():
         print(f"警告: 无法打开视频: {video_path}")
-        return []
+        return VideoProcessingResult.failed(f"无法打开视频: {video_path}")
     fps = cap.get(cv2.CAP_PROP_FPS)
     fps_safe = fps if fps and fps > 0 else 25
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     if start_frame > 0:
         try:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-        except Exception:
-            pass
+            seek_ok = cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            reported_frame = cap.get(cv2.CAP_PROP_POS_FRAMES)
+        except Exception as exc:
+            record_resume_seek(
+                video_path, start_frame, False, error=exc,
+                file_md5=claim_md5, pipeline_id=pipeline,
+            )
+            cap.release()
+            return VideoProcessingResult.failed(
+                f"无法恢复视频断点到第 {start_frame} 帧: {exc}"
+            )
+        if not seek_ok:
+            record_resume_seek(
+                video_path, start_frame, False, file_md5=claim_md5,
+                pipeline_id=pipeline,
+            )
+            cap.release()
+            return VideoProcessingResult.failed(
+                f"无法恢复视频断点到第 {start_frame} 帧"
+            )
+        record_resume_seek(
+            video_path, start_frame, True, reported_frame=reported_frame,
+            file_md5=claim_md5, pipeline_id=pipeline,
+        )
     # 文件名已在上一行完整输出；进度条使用短描述，避免长文件名挤掉进度信息
     pbar = tqdm(
         total=total_frames,
@@ -502,6 +607,8 @@ def detect_objects_in_video_yolov5(video_path, target_class,
         desc='处理视频',
         dynamic_ncols=True,
     )
+    if _resources is not None:
+        _resources['pbar'] = pbar
 
     frame_count = start_frame
     
@@ -512,10 +619,31 @@ def detect_objects_in_video_yolov5(video_path, target_class,
     
     # 输入尺寸
     img_size = 640
+    processing_error = None
     
     while cap.isOpened():
+        if claim_md5 and (
+            time.monotonic() - last_claim_heartbeat
+            >= claim_heartbeat_interval
+        ):
+            if not _call_directory_index(
+                'refresh_claim', claim_md5, pipeline_id=pipeline
+            ):
+                raise ClaimLostError(
+                    f"视频声明已失效，停止处理以避免重复写入: {video_path}"
+                )
+            last_claim_heartbeat = time.monotonic()
         if _pause_requested(pause_file):
-            _save_checkpoint(video_path, next_frame=frame_count, detections=detections, last_detected=last_detected)
+            _save_checkpoint(
+                video_path,
+                next_frame=frame_count,
+                detections=detections,
+                last_detected=last_detected,
+                claim_md5=claim_md5,
+                last_success_frame=frame_count - 1,
+                pipeline_id=pipeline,
+                reason='pause_requested',
+            )
             print('\n已在当前帧结束后保存检查点，准备退出，不会继续处理后续视频。')
             raise PauseRequested()
         success, frame, timed_out = _read_frame_with_timeout(cap)
@@ -548,14 +676,14 @@ def detect_objects_in_video_yolov5(video_path, target_class,
         else:
             current_time = frame_count / fps_safe
         
-        # 预处理图像
-        img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        img_resized = cv2.resize(img, (img_size, img_size))
-        img_tensor = torch.from_numpy(img_resized).float().permute(2, 0, 1).unsqueeze(0) / 255.0
-        
         detected = False
         
         try:
+            # 预处理图像
+            img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            img_resized = cv2.resize(img, (img_size, img_size))
+            img_tensor = torch.from_numpy(img_resized).float().permute(2, 0, 1).unsqueeze(0) / 255.0
+
             # YOLOv5推理
             if device is not None:
                 img_tensor = img_tensor.to(device)
@@ -628,13 +756,32 @@ def detect_objects_in_video_yolov5(video_path, target_class,
                                 frame_annotations.append(annotation_line)
         
         except KeyboardInterrupt:
-            _save_checkpoint(video_path, next_frame=frame_count, detections=detections, last_detected=last_detected)
+            _save_checkpoint(
+                video_path,
+                next_frame=frame_count,
+                detections=detections,
+                last_detected=last_detected,
+                claim_md5=claim_md5,
+                last_success_frame=frame_count - 1,
+                pipeline_id=pipeline,
+                reason='keyboard_interrupt',
+            )
             print('\nCtrl+C 已保存检查点，准备退出，不会继续处理后续视频。')
             raise PauseRequested()
         except Exception as e:
             print(f"处理帧 {frame_count} 时出错: {e}")
-            # 继续处理下一帧，而不是中断
-            pass
+            _save_checkpoint(
+                video_path,
+                next_frame=frame_count,
+                detections=detections,
+                last_detected=last_detected,
+                claim_md5=claim_md5,
+                last_success_frame=frame_count - 1,
+                pipeline_id=pipeline,
+                reason='frame_processing_error',
+            )
+            processing_error = f"处理帧 {frame_count} 时出错: {e}"
+            break
         
         if show_window and detected:
             cv2.imshow('Detection Preview', frame)
@@ -642,7 +789,9 @@ def detect_objects_in_video_yolov5(video_path, target_class,
                 break
         
         if save_training_data and frame_annotations:
-            training_base = safe_artifact_basename(video_path)
+            training_base = safe_artifact_basename(
+                video_path, pipeline_id=pipeline
+            )
             training_image_path = os.path.join(training_folder, f"{training_base}_{frame_count}.jpg")
             training_annotation_path = os.path.splitext(training_image_path)[0] + ".txt"
             cv2.imwrite(training_image_path, frame)
@@ -652,16 +801,19 @@ def detect_objects_in_video_yolov5(video_path, target_class,
         
         frame_count += 1
     
-    cap.release()
-    pbar.close()
-    if show_window:
-        cv2.destroyAllWindows()
+    if processing_error:
+        return VideoProcessingResult.failed(processing_error)
+
+    if claim_md5 and not _call_directory_index(
+        'refresh_claim', claim_md5, pipeline_id=pipeline
+    ):
+        raise ClaimLostError(f"视频声明已失效，放弃写入最终产物: {video_path}")
 
     if (not _pause_requested(pause_file)) and (frame_count >= total_frames or total_frames == 0):
-        _clear_checkpoint(video_path)
+        _clear_checkpoint(video_path, pipeline_id=pipeline)
 
     video_dir = os.path.dirname(video_path) or '.'
-    artifact_base = safe_artifact_basename(video_path)
+    artifact_base = safe_artifact_basename(video_path, pipeline_id=pipeline)
     txt_save_path = os.path.join(video_dir, artifact_base + ".txt")
     with open(txt_save_path, 'w') as f:
         f.write("检测到目标的时间位置（秒）:\n")
@@ -692,23 +844,65 @@ def detect_objects_in_video_yolov5(video_path, target_class,
                 mosaic_path = os.path.join(video_dir, artifact_base + "_mosaic.jpg")
                 cv2.imwrite(mosaic_path, final_mosaic)
                 print(f"已保存拼接图片至: {mosaic_path}")
-                write_done_marker(video_path)
-    return detections
+    return VideoProcessingResult.succeeded(detections)
 
-def should_process(file_path):
-    if has_existing_artifacts(file_path):
+
+def detect_objects_in_video_yolov5(
+    video_path,
+    target_class,
+    claim_md5=None,
+    pipeline_id=None,
+    show_window=False,
+    save_crops=False,
+    save_training_data=False,
+    all_objects=False,
+    model_path='models/breast.pt',
+):
+    """使用 YOLOv5 检测，并确保所有退出路径都释放视频资源。"""
+    resources = {}
+    try:
+        return _detect_objects_in_video_yolov5_impl(
+            video_path,
+            target_class,
+            claim_md5=claim_md5,
+            pipeline_id=pipeline_id,
+            show_window=show_window,
+            save_crops=save_crops,
+            save_training_data=save_training_data,
+            all_objects=all_objects,
+            model_path=model_path,
+            _resources=resources,
+        )
+    finally:
+        _release_detection_resources(resources)
+
+def should_process(file_path, pipeline_id=None):
+    pipeline = _resolve_pipeline_id(pipeline_id)
+    if has_existing_artifacts(file_path, pipeline_id=pipeline):
         return
+    try:
+        has_checkpoint = os.path.exists(
+            _checkpoint_path(file_path, pipeline_id=pipeline)
+        )
+    except Exception:
+        has_checkpoint = False
     md5 = get_file_md5_cached(file_path)
     if not md5:
         return
-    yoloed_md5 = load_yoloed_md5(reload=False)
-    if md5 in yoloed_md5:
+    if _call_directory_index(
+        'is_video_processed_by_md5', md5, pipeline_id=pipeline
+    ):
         return
+    if pipeline is None:
+        yoloed_md5 = load_yoloed_md5(reload=False)
+        if not has_checkpoint and md5 in yoloed_md5:
+            return
     return True, None
 
 
-def create_mosaic_from_crops(crops_dir, video_path):
+def create_mosaic_from_crops(crops_dir, video_path, pipeline_id=None):
     """从裁剪图片创建拼接图"""
+    pipeline = _resolve_pipeline_id(pipeline_id)
     crops = []
     crop_size = (160, 160)
     max_cols = 8
@@ -742,21 +936,98 @@ def create_mosaic_from_crops(crops_dir, video_path):
             final_mosaic = np.vstack(rows)
             
             dir_name = os.path.dirname(video_path) or '.'
-            base_name = safe_artifact_basename(video_path)
+            base_name = safe_artifact_basename(
+                video_path, pipeline_id=pipeline
+            )
             mosaic_path = os.path.join(dir_name, base_name + "_mosaic.jpg")
             cv2.imwrite(mosaic_path, final_mosaic)
             print(f"已保存拼接图片至: {mosaic_path}")
 
-def detect_objects_with_frame_analysis(video_path, target_class,
-                                       show_window=False, save_crops=False,
-                                       save_training_data=False,
-                                       all_objects=False,
-                                       model_path='models/breast.pt'):
+
+def _run_detect_command(
+    cmd,
+    cwd,
+    claim_md5=None,
+    video_path=None,
+    heartbeat_interval=None,
+    pipeline_id=None,
+):
+    """运行 detect.py，并在等待期间维持当前视频 claim。"""
+    if not claim_md5:
+        return subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
+
+    interval = heartbeat_interval or get_claim_heartbeat_interval_seconds()
+    process = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    def _terminate():
+        process.terminate()
+        try:
+            process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+
+    while True:
+        try:
+            stdout, stderr = process.communicate(timeout=interval)
+            return subprocess.CompletedProcess(
+                cmd, process.returncode, stdout=stdout, stderr=stderr
+            )
+        except subprocess.TimeoutExpired:
+            if _pause_requested():
+                _terminate()
+                raise PauseRequested()
+            if _call_directory_index(
+                'refresh_claim',
+                claim_md5,
+                pipeline_id=_resolve_pipeline_id(pipeline_id),
+            ):
+                continue
+            _terminate()
+            raise ClaimLostError(
+                f"视频声明已失效，已停止 detect.py: {video_path or ''}"
+            )
+        except KeyboardInterrupt:
+            _terminate()
+            raise PauseRequested()
+
+
+def _detect_objects_with_frame_analysis_impl(
+    video_path,
+    target_class,
+    claim_md5=None,
+    pipeline_id=None,
+    show_window=False,
+    save_crops=False,
+    save_training_data=False,
+    all_objects=False,
+    model_path='models/breast.pt',
+    _resources=None,
+):
     """通过逐帧分析获取准确的时间戳"""
+
+    pipeline = _resolve_pipeline_id(pipeline_id)
+    claim_heartbeat_interval = get_claim_heartbeat_interval_seconds()
+    if claim_md5 and not _call_directory_index(
+        'refresh_claim', claim_md5, pipeline_id=pipeline
+    ):
+        raise ClaimLostError(f"视频声明已失效，无法开始处理: {video_path}")
+    last_claim_heartbeat = time.monotonic()
     
     # 首先使用detect.py进行检测
     detect_script = os.path.join(os.path.dirname(__file__), 'yolov5', 'detect.py')
     output_dir = os.path.join(os.path.dirname(video_path), "yolov5_output")
+    run_name = (
+        safe_artifact_basename(video_path, pipeline_id=pipeline)
+        if pipeline is not None
+        else 'exp'
+    )
     
     # 获取当前Python解释器路径（虚拟环境中的Python）
     python_exe = sys.executable
@@ -766,7 +1037,7 @@ def detect_objects_with_frame_analysis(video_path, target_class,
         '--weights', model_path,
         '--source', video_path,
         '--project', output_dir,
-        '--name', 'exp',
+        '--name', run_name,
         '--exist-ok',
         '--conf-thres', '0.5',
         '--save-txt',  # 临时保存标签用于解析时间戳，解析后自动清理
@@ -778,34 +1049,74 @@ def detect_objects_with_frame_analysis(video_path, target_class,
     print(f"运行YOLOv5 detect.py进行检测...")
     
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, cwd=os.path.dirname(__file__))
+        result = _run_detect_command(
+            cmd,
+            cwd=os.path.dirname(__file__),
+            claim_md5=claim_md5,
+            video_path=video_path,
+            heartbeat_interval=claim_heartbeat_interval,
+            pipeline_id=pipeline,
+        )
         
         if result.returncode != 0:
             print(f"detect.py运行失败: {result.stderr}")
-            return []
+            return VideoProcessingResult.failed(
+                f"detect.py运行失败: {result.stderr or result.returncode}"
+            )
+
+        if claim_md5 and not _call_directory_index(
+            'refresh_claim', claim_md5, pipeline_id=pipeline
+        ):
+            raise ClaimLostError(f"视频声明已失效，停止处理: {video_path}")
+        last_claim_heartbeat = time.monotonic()
         
         # 分析视频帧和检测结果
         pause_file = _get_pause_file_path()
         resume_enabled = _truthy_env('FINDINVIDEO_RESUME', default=True)
-        ckpt = _load_checkpoint(video_path) if resume_enabled else None
+        ckpt = _load_checkpoint(
+            video_path, pipeline_id=pipeline
+        ) if resume_enabled else None
         start_frame = int(ckpt.get('next_frame', 0)) if ckpt else 0
         detections = list(ckpt.get('detections', [])) if ckpt else []
         last_detected = float(ckpt.get('last_detected', detections[-1] if detections else -5.0)) if ckpt else -5
 
         cap = cv2.VideoCapture(video_path)
+        if _resources is not None:
+            _resources['cap'] = cap
         if not cap.isOpened():
             print(f"警告: 无法打开视频: {video_path}")
-            return []
+            return VideoProcessingResult.failed(f"无法打开视频: {video_path}")
         fps = cap.get(cv2.CAP_PROP_FPS)
         fps_safe = fps if fps and fps > 0 else 25
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         if start_frame > 0:
             try:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-            except Exception:
-                pass
+                seek_ok = cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+                reported_frame = cap.get(cv2.CAP_PROP_POS_FRAMES)
+            except Exception as exc:
+                record_resume_seek(
+                    video_path, start_frame, False, error=exc,
+                    file_md5=claim_md5, pipeline_id=pipeline,
+                )
+                cap.release()
+                return VideoProcessingResult.failed(
+                    f"无法恢复视频断点到第 {start_frame} 帧: {exc}"
+                )
+            if not seek_ok:
+                record_resume_seek(
+                    video_path, start_frame, False, file_md5=claim_md5,
+                    pipeline_id=pipeline,
+                )
+                cap.release()
+                return VideoProcessingResult.failed(
+                    f"无法恢复视频断点到第 {start_frame} 帧"
+                )
+            record_resume_seek(
+                video_path, start_frame, True, reported_frame=reported_frame,
+                file_md5=claim_md5, pipeline_id=pipeline,
+            )
         
-        results_dir = os.path.join(output_dir, 'exp')
+        results_dir = os.path.join(output_dir, run_name)
         labels_dir = os.path.join(results_dir, 'labels')
         
         print(f"分析视频帧以获取准确时间戳...")
@@ -815,12 +1126,34 @@ def detect_objects_with_frame_analysis(video_path, target_class,
             desc='分析视频',
             dynamic_ncols=True,
         )
+        if _resources is not None:
+            _resources['pbar'] = pbar
 
         frame_count = start_frame
         
         while cap.isOpened():
+            if claim_md5 and (
+                time.monotonic() - last_claim_heartbeat
+                >= claim_heartbeat_interval
+            ):
+                if not _call_directory_index(
+                    'refresh_claim', claim_md5, pipeline_id=pipeline
+                ):
+                    raise ClaimLostError(
+                        f"视频声明已失效，停止处理以避免重复写入: {video_path}"
+                    )
+                last_claim_heartbeat = time.monotonic()
             if _pause_requested(pause_file):
-                _save_checkpoint(video_path, next_frame=frame_count, detections=detections, last_detected=last_detected)
+                _save_checkpoint(
+                    video_path,
+                    next_frame=frame_count,
+                    detections=detections,
+                    last_detected=last_detected,
+                    claim_md5=claim_md5,
+                    last_success_frame=frame_count - 1,
+                    pipeline_id=pipeline,
+                    reason='pause_requested',
+                )
                 print('\n已在当前帧结束后保存检查点，准备退出，不会继续处理后续视频。')
                 raise PauseRequested()
             success, frame, timed_out = _read_frame_with_timeout(cap)
@@ -849,7 +1182,7 @@ def detect_objects_with_frame_analysis(video_path, target_class,
                 current_time = frame_count / fps_safe
             
             # 检查对应的标签文件是否存在
-            label_filename = f"{os.path.splitext(os.path.basename(video_path))[0]}_{frame_count:06d}.txt"
+            label_filename = f"{os.path.splitext(os.path.basename(video_path))[0]}_{frame_count + 1}.txt"
             label_path = os.path.join(labels_dir, label_filename)
             
             if os.path.exists(label_path):
@@ -863,15 +1196,19 @@ def detect_objects_with_frame_analysis(video_path, target_class,
             
             frame_count += 1
         
-        cap.release()
-        pbar.close()
+        if claim_md5 and not _call_directory_index(
+            'refresh_claim', claim_md5, pipeline_id=pipeline
+        ):
+            raise ClaimLostError(f"视频声明已失效，放弃写入最终产物: {video_path}")
 
         if (not _pause_requested(pause_file)) and (frame_count >= total_frames or total_frames == 0):
-            _clear_checkpoint(video_path)
+            _clear_checkpoint(video_path, pipeline_id=pipeline)
         
         # 保存时间戳
         video_dir = os.path.dirname(video_path) or '.'
-        artifact_base = safe_artifact_basename(video_path)
+        artifact_base = safe_artifact_basename(
+            video_path, pipeline_id=pipeline
+        )
         txt_save_path = os.path.join(video_dir, artifact_base + ".txt")
         with open(txt_save_path, 'w') as f:
             f.write("检测到目标的时间位置（秒）:\n")
@@ -890,56 +1227,214 @@ def detect_objects_with_frame_analysis(video_path, target_class,
         if save_crops:
             crops_dir = os.path.join(results_dir, 'crops')
             if os.path.exists(crops_dir):
-                create_mosaic_from_crops(crops_dir, video_path)
-        return detections
+                create_mosaic_from_crops(
+                    crops_dir, video_path, pipeline_id=pipeline
+                )
+        return VideoProcessingResult.succeeded(detections)
         
+    except (PauseRequested, ClaimLostError):
+        raise
     except Exception as e:
         print(f"检测失败: {e}")
-        raise
+        return VideoProcessingResult.failed(f"检测失败: {e}")
 
-def process_directory_videos(dir_path, target_item, all_objects_switch=False, model_path='models/yolov5s.pt', use_detectpy=False, skip_long_videos=True):
-    """处理目录中的所有视频文件"""
+
+def detect_objects_with_frame_analysis(
+    video_path,
+    target_class,
+    claim_md5=None,
+    pipeline_id=None,
+    show_window=False,
+    save_crops=False,
+    save_training_data=False,
+    all_objects=False,
+    model_path='models/breast.pt',
+):
+    """运行 detect.py 并确保所有退出路径都释放视频资源。"""
+    resources = {}
+    try:
+        return _detect_objects_with_frame_analysis_impl(
+            video_path,
+            target_class,
+            claim_md5=claim_md5,
+            pipeline_id=pipeline_id,
+            show_window=show_window,
+            save_crops=save_crops,
+            save_training_data=save_training_data,
+            all_objects=all_objects,
+            model_path=model_path,
+            _resources=resources,
+        )
+    finally:
+        _release_detection_resources(resources)
+
+def _mark_video_completed(
+    video_path,
+    result,
+    file_md5,
+    model_path,
+    pipeline_id=None,
+    source_snapshot=None,
+):
+    """消费当前 claim 后再写入兼容完成标记。"""
+    if not result.success:
+        return False
+    pipeline = _resolve_pipeline_id(pipeline_id)
+    detection_count = len(result.detections)
+    complete_kwargs = {}
+    if pipeline is not None:
+        complete_kwargs['source_snapshot'] = source_snapshot
+    completed = _call_directory_index(
+        'complete_claimed_video',
+        file_md5=file_md5,
+        video_path=str(video_path),
+        detection_count=detection_count,
+        model_name=model_path,
+        pipeline_id=pipeline,
+        **complete_kwargs,
+    )
+    if not completed:
+        print(f"视频声明已失效，未写入完成状态: {video_path}")
+        return False
+    if pipeline is None:
+        marker_written = write_done_marker(video_path)
+    else:
+        marker_written = write_done_marker(
+            video_path,
+            pipeline_id=pipeline,
+            file_md5=file_md5,
+            source_snapshot=source_snapshot,
+        )
+    if not marker_written:
+        _call_directory_index(
+            'rollback_video_completion',
+            file_md5,
+            pipeline_id=pipeline,
+        )
+        print(f"完成标记写入失败，已撤销数据库完成态: {video_path}")
+        return False
+    if pipeline is None:
+        append_yoloed_md5(file_md5, file_path=video_path)
+    _clear_checkpoint(video_path, pipeline_id=pipeline)
+    return True
+
+
+def _release_claim_safely(file_md5, pipeline_id=None):
+    """尽力释放当前进程持有的 claim。"""
+    if not file_md5:
+        return
+    try:
+        _call_directory_index(
+            'release_claim',
+            file_md5,
+            pipeline_id=_resolve_pipeline_id(pipeline_id),
+        )
+    except Exception as exc:
+        print(f"释放视频声明失败: {exc}")
+
+
+def process_directory_videos(
+    dir_path,
+    target_item,
+    all_objects_switch=False,
+    model_path='models/yolov5s.pt',
+    use_detectpy=False,
+    skip_long_videos=True,
+    pipeline_id=None,
+):
+    """处理目录中的所有视频文件。"""
+    pipeline = _resolve_pipeline_id(pipeline_id)
     video_files = []
 
     try:
         for file in os.listdir(dir_path):
             if is_video_file(file):
                 file_path = os.path.join(dir_path, file)
-                if should_process(file_path):
+                if should_process(file_path, pipeline_id=pipeline):
                     video_files.append(file_path)
                 else:
-                    print(f"已存在拼接图片，跳过处理: {file_path}")
+                    print(f"已有可靠完成标记，跳过处理: {file_path}")
     except (PermissionError, FileNotFoundError) as e:
         print(f"警告: 无法访问目录 '{dir_path}': {e}")
-        return
+        return 0
 
+    completed_count = 0
     for video_file in video_files:
+        source_snapshot = None
+        if pipeline is not None:
+            try:
+                source_snapshot = _source_snapshot(video_file)
+            except OSError as exc:
+                print(f"无法读取视频源状态，本轮不处理: {video_file}, 错误: {exc}")
+                continue
+        md5 = get_file_md5_cached(video_file)
+        if not md5:
+            print(f"无法计算视频MD5，本轮不处理: {video_file}")
+            continue
+        if pipeline is not None:
+            try:
+                if _source_snapshot(video_file) != source_snapshot:
+                    print(f"视频在计算MD5期间发生变化，本轮不处理: {video_file}")
+                    continue
+            except OSError as exc:
+                print(f"无法复核视频源状态，本轮不处理: {video_file}, 错误: {exc}")
+                continue
+        claim_kwargs = {}
+        if pipeline is not None:
+            claim_kwargs['source_snapshot'] = source_snapshot
+        if not _call_directory_index(
+            'try_claim_video',
+            md5,
+            video_file,
+            pipeline_id=pipeline,
+            **claim_kwargs,
+        ):
+            print(f"视频已被其他实例占用或处理，跳过: {video_file}")
+            continue
+
         print(f"开始处理视频文件: {video_file}")
         try:
-            if use_detectpy:
-                detect_objects_with_frame_analysis(video_file, target_item,
-                                                 show_window=False,
-                                                 save_crops=True,
-                                                 save_training_data=False,
-                                                 all_objects=all_objects_switch,
-                                                 model_path=model_path)
-            else:
-                detect_objects_in_video_yolov5(video_file, target_item,
-                                              show_window=False,
-                                              save_crops=True,
-                                              save_training_data=False,
-                                              all_objects=all_objects_switch,
-                                              model_path=model_path)
-        except PauseRequested:
+            detector = (
+                detect_objects_with_frame_analysis
+                if use_detectpy
+                else detect_objects_in_video_yolov5
+            )
+            detector_kwargs = {}
+            if pipeline is not None:
+                detector_kwargs['pipeline_id'] = pipeline
+            result = detector(
+                video_file,
+                target_item,
+                claim_md5=md5,
+                show_window=False,
+                save_crops=True,
+                save_training_data=False,
+                all_objects=all_objects_switch,
+                model_path=model_path,
+                **detector_kwargs,
+            )
+            if not result.success:
+                print(f"处理视频失败: {video_file}, 错误: {result.error}")
+                continue
+            if not _mark_video_completed(
+                video_file,
+                result,
+                file_md5=md5,
+                model_path=model_path,
+                pipeline_id=pipeline,
+                source_snapshot=source_snapshot,
+            ):
+                continue
+            completed_count += 1
+        except (PauseRequested, KeyboardInterrupt):
             raise
         except Exception as exc:
             print(f"处理视频失败: {video_file}, 错误: {exc}")
             _LOGGER.error("Video failed: %s\n%s", video_file, traceback.format_exc())
-            continue
-        md5 = get_file_md5_cached(video_file)
-        if md5:
-            append_yoloed_md5(md5, file_path=video_file)
-        write_done_marker(video_file)
+        finally:
+            _release_claim_safely(md5, pipeline_id=pipeline)
+
+    return completed_count
 
 
 def get_file_md5(file_path):
@@ -1047,7 +1542,11 @@ def get_file_md5(file_path):
     return None
 
 if __name__ == "__main__":
+    _setup_diagnostics()
+    _install_pause_signal_handler()
     video_path = r"C:\Users\f1094\Desktop\DouyinLiveRecorder\download\邹邹大王"  # 可设置为视频文件或目录
+    processing_root = video_path if os.path.isdir(video_path) else os.path.dirname(video_path)
+    _init_processing_root(processing_root)
     # 如要检测所有模型内对象，则将 target_item 设置为任意值并启用全量检测开关
     target_item = "breast"  # 当 all_objects 为 True 时，该值不再限制检测
     all_objects_switch = True  # 设置为 True 表示显示所有检测对象
@@ -1057,6 +1556,15 @@ if __name__ == "__main__":
     
     # 新增选项：是否使用detect.py进行推理
     use_detectpy = True  # 设置为 True 使用detect.py，False 使用原有方法
+
+    PIPELINE_ID = build_pipeline_id(
+        engine='yolov5-detectpy' if use_detectpy else 'yolov5-inline',
+        model_path=yolov5_model_path,
+        target_class=target_item,
+        all_objects=all_objects_switch,
+        confidence=0.5,
+        image_size=640,
+    )
     
     # 新增功能：按叶子节点视频数量排序处理
     use_leaf_node_processing = True  # 设置为 True 启用叶子节点处理模式
