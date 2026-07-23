@@ -218,6 +218,33 @@ _IGNORED_SUBDIRS = {
 
 CHECKPOINT_SUFFIX = '.checkpoint.json'
 
+# OpenCV 有时会按照容器元数据多报少量尾部帧。仅容忍极小差异，避免因
+# 不可读取的尾部元数据反复从检查点重跑；较大的差异仍按异常 EOF 处理。
+TAIL_EOF_TOLERANCE_RATIO_DIVISOR = 1000  # 总帧数的 0.1%
+TAIL_EOF_TOLERANCE_MAX_FRAMES = 120
+
+
+def is_tail_eof_within_tolerance(processed_frames, total_frames):
+    """判断已读取到尾部时的少量帧数差异能否视为正常 EOF。"""
+    try:
+        processed = int(processed_frames)
+        total = int(total_frames)
+    except (TypeError, ValueError):
+        return False
+    if total <= 0 or processed >= total:
+        return True
+    if processed < 0:
+        return False
+
+    missing = total - processed
+    tolerance = max(
+        1,
+        (total + TAIL_EOF_TOLERANCE_RATIO_DIVISOR - 1)
+        // TAIL_EOF_TOLERANCE_RATIO_DIVISOR,
+    )
+    tolerance = min(TAIL_EOF_TOLERANCE_MAX_FRAMES, tolerance)
+    return missing <= tolerance
+
 # 处理审计事件与声明、检查点共用同一份 SQLite 状态库，便于跨进程追踪。
 PROCESSING_EVENT_TABLE = 'processing_events'
 

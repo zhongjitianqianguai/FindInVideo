@@ -168,8 +168,8 @@ class VideoCompletionGuardTests(unittest.TestCase):
                         (None, 'source_unstable'),
                     )
 
-    def test_failed_seek_and_early_eof_are_not_reported_as_success(self):
-        """断点定位失败或已知总帧下提前读失败时必须抛错。"""
+    def test_failed_seek_and_material_early_eof_are_not_reported_as_success(self):
+        """断点定位失败或明显提前读失败时必须抛错。"""
         for module_path, _needs_model in ENTRYPOINTS:
             with self.subTest(entrypoint=f'{module_path.name}:seek'), tempfile.TemporaryDirectory() as tmpdir:
                 module = load_entrypoint(module_path)
@@ -221,6 +221,43 @@ class VideoCompletionGuardTests(unittest.TestCase):
                 with mock.patch.object(module, '_load_checkpoint', return_value=None), \
                      self.assertRaisesRegex(RuntimeError, '提前结束'):
                     self._detect(module, video_path, EarlyEofCapture())
+
+    def test_tail_metadata_drift_is_reported_as_normal_eof(self):
+        """极小的尾部帧数偏差不应留下检查点并导致无限重跑。"""
+        for module_path, _needs_model in ENTRYPOINTS:
+            with self.subTest(entrypoint=module_path.name), tempfile.TemporaryDirectory() as tmpdir:
+                module = load_entrypoint(module_path)
+                module._ACTIVE_PIPELINE_ID = PIPELINE_ID
+                video_path = pathlib.Path(tmpdir) / 'video.mp4'
+                video_path.write_bytes(b'video')
+
+                class TailMetadataDriftCapture:
+                    def __init__(self):
+                        self.read_count = 0
+
+                    def isOpened(self):
+                        return True
+
+                    def get(self, prop):
+                        return 30 if prop == module.cv2.CAP_PROP_FPS else 5
+
+                    def read(self):
+                        self.read_count += 1
+                        return (True, object()) if self.read_count <= 4 else (False, None)
+
+                    def release(self):
+                        return None
+
+                with mock.patch.object(module, '_load_checkpoint', return_value=None), \
+                     mock.patch.object(module, '_save_pipeline_checkpoint') as save_checkpoint:
+                    self.assertEqual(
+                        self._detect(module, video_path, TailMetadataDriftCapture()), []
+                    )
+
+                save_checkpoint.assert_not_called()
+                self.assertTrue(
+                    module.is_tail_eof_within_tolerance(107622, 107652)
+                )
 
     def test_unknown_total_frame_count_allows_normal_eof(self):
         """无法获知总帧数时，read=False 仍是合法 EOF，兼容流式输入和测试替身。"""

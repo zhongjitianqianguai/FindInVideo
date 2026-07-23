@@ -28,6 +28,7 @@ from utils import (
     _checkpoint_path, _load_checkpoint, _save_checkpoint, _clear_checkpoint,
     _install_pause_signal_handler, _get_pause_file_path, _pause_requested,
     record_resume_seek, is_video_file, is_leaf_directory, count_videos_in_directory,
+    is_tail_eof_within_tolerance,
 )
 
 _PROCESSING_ROOT_DIR = None
@@ -756,18 +757,25 @@ def detect_objects_in_video(
 
     if not reached_eof:
         if total_frames > 0 and frame_count < total_frames:
-            _save_pipeline_checkpoint(
-                video_path,
-                next_frame=frame_count,
-                detections=detections,
-                last_detected=last_detected,
-                claim_md5=claim_md5,
-                last_success_frame=last_success_frame,
-                reason='unexpected_early_eof',
-            )
-            raise RuntimeError(
-                f"视频读取提前结束: 已处理 {frame_count}/{total_frames} 帧"
-            )
+            if is_tail_eof_within_tolerance(frame_count, total_frames):
+                missing_frames = total_frames - frame_count
+                print(
+                    f"提示: 视频尾部元数据比实际可读帧多 {missing_frames} 帧，"
+                    f"已按正常结束处理: {frame_count}/{total_frames}"
+                )
+            else:
+                _save_pipeline_checkpoint(
+                    video_path,
+                    next_frame=frame_count,
+                    detections=detections,
+                    last_detected=last_detected,
+                    claim_md5=claim_md5,
+                    last_success_frame=last_success_frame,
+                    reason='unexpected_early_eof',
+                )
+                raise RuntimeError(
+                    f"视频读取提前结束: 已处理 {frame_count}/{total_frames} 帧"
+                )
         reached_eof = True
 
     if claim_md5 and not _refresh_claim(claim_md5):
