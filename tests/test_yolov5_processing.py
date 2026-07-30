@@ -300,6 +300,33 @@ class YoloV5ProcessingTests(unittest.TestCase):
             ):
                 self.assertTrue(self.module.should_process(str(video_path)))
 
+    def test_future_early_eof_checkpoint_is_deferred_before_md5(self):
+        """YOLOv5 入口也必须在退避期内跳过坏视频。"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_path = pathlib.Path(tmpdir) / 'sample.mp4'
+            video_path.write_bytes(b'video')
+            pipeline_id = 'yolov5:test-retry'
+            self.module._save_checkpoint(
+                str(video_path),
+                next_frame=3,
+                detections=[],
+                last_detected=-5.0,
+                last_success_frame=2,
+                pipeline_id=pipeline_id,
+                reason='unexpected_early_eof',
+                early_eof_retry_count=1,
+                retry_not_before=time.time() + 600,
+            )
+
+            with mock.patch.object(
+                self.module,
+                'get_file_md5_cached',
+                side_effect=AssertionError('退避期内不应计算 MD5'),
+            ):
+                self.assertIsNone(self.module.should_process(
+                    str(video_path), pipeline_id=pipeline_id,
+                ))
+
     def test_directory_failure_never_writes_completion_state(self):
         events = []
 

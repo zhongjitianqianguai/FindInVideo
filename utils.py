@@ -251,6 +251,10 @@ PROCESSING_EVENT_TABLE = 'processing_events'
 CLAIM_TTL_DEFAULT_SECONDS = 86400
 CLAIM_TTL_MIN_SECONDS = 60
 CLAIM_HEARTBEAT_MAX_SECONDS = 60.0
+CHECKPOINT_INTERVAL_DEFAULT_SECONDS = 300.0
+CHECKPOINT_INTERVAL_MIN_SECONDS = 30.0
+EARLY_EOF_RETRY_DEFAULT_SECONDS = 21600
+EARLY_EOF_RETRY_MAX_DEFAULT_SECONDS = 86400
 
 
 def normalize_pipeline_id(pipeline_id=None):
@@ -354,6 +358,41 @@ def get_claim_heartbeat_interval_seconds():
         1.0,
         min(CLAIM_HEARTBEAT_MAX_SECONDS, get_claim_ttl_seconds() / 3.0),
     )
+
+
+def get_checkpoint_interval_seconds():
+    """读取周期检查点间隔，避免异常断电后从很久以前重新处理。"""
+    try:
+        configured = float(os.environ.get(
+            'FINDINVIDEO_CHECKPOINT_INTERVAL_SECONDS',
+            str(CHECKPOINT_INTERVAL_DEFAULT_SECONDS),
+        ))
+    except (TypeError, ValueError):
+        configured = CHECKPOINT_INTERVAL_DEFAULT_SECONDS
+    return max(CHECKPOINT_INTERVAL_MIN_SECONDS, configured)
+
+
+def get_early_eof_retry_delay_seconds(retry_count):
+    """按失败次数计算提前 EOF 的指数退避时间。"""
+    try:
+        retry_number = max(1, int(retry_count))
+    except (TypeError, ValueError):
+        retry_number = 1
+    try:
+        base = max(60, int(os.environ.get(
+            'FINDINVIDEO_EARLY_EOF_RETRY_SECONDS',
+            str(EARLY_EOF_RETRY_DEFAULT_SECONDS),
+        )))
+    except (TypeError, ValueError):
+        base = EARLY_EOF_RETRY_DEFAULT_SECONDS
+    try:
+        maximum = max(base, int(os.environ.get(
+            'FINDINVIDEO_EARLY_EOF_RETRY_MAX_SECONDS',
+            str(EARLY_EOF_RETRY_MAX_DEFAULT_SECONDS),
+        )))
+    except (TypeError, ValueError):
+        maximum = max(base, EARLY_EOF_RETRY_MAX_DEFAULT_SECONDS)
+    return min(maximum, base * (2 ** min(retry_number - 1, 20)))
 
 
 # ---------------------------------------------------------------------------
@@ -851,10 +890,13 @@ def _save_checkpoint(
     last_success_frame=None,
     pipeline_id=None,
     reason=None,
+    frame_video_segments=None,
+    early_eof_retry_count=None,
+    retry_not_before=None,
 ):
     path = _checkpoint_path(video_path, pipeline_id=pipeline_id)
     payload = {
-        'version': 1,
+        'version': 2,
         'pipeline_id': normalize_pipeline_id(pipeline_id),
         'next_frame': int(max(0, next_frame or 0)),
         'detections': detections or [],
@@ -865,6 +907,18 @@ def _save_checkpoint(
         'claim_heartbeat_at': time.time() if claim_md5 else None,
         'reason': str(reason or 'unspecified'),
     }
+    if frame_video_segments is not None:
+        payload['frame_video_segments'] = [
+            os.path.basename(str(name))
+            for name in frame_video_segments
+            if str(name or '').strip()
+        ]
+    if early_eof_retry_count is not None:
+        payload['early_eof_retry_count'] = max(
+            0, int(early_eof_retry_count or 0)
+        )
+    if retry_not_before is not None:
+        payload['retry_not_before'] = float(retry_not_before)
     try:
         st = os.stat(video_path)
         payload['size'] = st.st_size
@@ -898,6 +952,8 @@ def _save_checkpoint(
         last_success_frame=payload['last_success_frame'],
         detection_count=len(payload['detections']),
         reason=payload['reason'],
+        early_eof_retry_count=payload.get('early_eof_retry_count'),
+        retry_not_before=payload.get('retry_not_before'),
     )
     return True
 
@@ -922,6 +978,237 @@ def _clear_checkpoint(video_path, pipeline_id=None):
         )
         return False
     return False
+
+
+def is_checkpoint_retry_deferred(video_path, pipeline_id=None, now=None):
+    """判断提前 EOF 检查点是否仍处于退避期。"""
+    path = _checkpoint_path(video_path, pipeline_id=pipeline_id)
+    try:
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            data = json.load(f)
+        if data.get('reason') != 'unexpected_early_eof':
+            return False
+        if normalize_pipeline_id(data.get('pipeline_id')) != normalize_pipeline_id(
+            pipeline_id
+        ):
+            return False
+        retry_not_before = float(data.get('retry_not_before') or 0)
+        current_time = time.time() if now is None else float(now)
+        if retry_not_before <= current_time:
+            return False
+        st = os.stat(video_path)
+        if data.get('size') not in (None, st.st_size):
+            return False
+        if (
+            data.get('mtime') is not None
+            and abs(float(data['mtime']) - float(st.st_mtime)) > 2.0
+        ):
+            return False
+        return True
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
+class ResumableFrameVideo:
+    """将检测帧写入可恢复分段，并在成功结束时原子合并。"""
+
+    def __init__(self, final_path, fps, cv2_module, checkpoint=None):
+        self.final_path = os.path.abspath(str(final_path))
+        self.video_dir = os.path.dirname(self.final_path) or '.'
+        self.final_name = os.path.basename(self.final_path)
+        self.fps = float(fps) if fps and float(fps) > 0 else 25.0
+        self.cv2 = cv2_module
+        self.checkpoint = checkpoint or {}
+        self.segments = []
+        self.active_writer = None
+        self.active_path = None
+        self.active_start_frame = None
+        self.requires_full_rebuild = False
+        self._load_checkpoint_segments()
+
+    def _load_checkpoint_segments(self):
+        """加载已封口分段；旧检查点沿用原有最终文件作为第一段。"""
+        next_frame = int(self.checkpoint.get('next_frame', 0) or 0)
+        detections = self.checkpoint.get('detections') or []
+        saved_segments = self.checkpoint.get('frame_video_segments')
+        if saved_segments is None and next_frame > 0:
+            if os.path.isfile(self.final_path) and os.path.getsize(self.final_path) > 0:
+                saved_segments = [self.final_name]
+            else:
+                saved_segments = []
+        for name in saved_segments or []:
+            segment_name = os.path.basename(str(name))
+            if (
+                segment_name != str(name)
+                or not segment_name.lower().endswith('_frames.mp4')
+            ):
+                self.requires_full_rebuild = bool(detections)
+                self.segments = []
+                return
+            segment_path = os.path.join(self.video_dir, segment_name)
+            if not os.path.isfile(segment_path) or os.path.getsize(segment_path) <= 0:
+                self.requires_full_rebuild = bool(detections)
+                self.segments = []
+                return
+            if segment_name not in self.segments:
+                self.segments.append(segment_name)
+        if next_frame > 0 and detections and not self.segments:
+            self.requires_full_rebuild = True
+
+    def reset_for_full_rebuild(self):
+        """丢弃不完整恢复引用，从头生成完整检测帧视频。"""
+        self.abort_active_segment()
+        self.segments = []
+        self.requires_full_rebuild = False
+        if os.path.isfile(self.final_path):
+            os.remove(self.final_path)
+
+    def _segment_path(self, frame_number):
+        if not self.segments:
+            return self.final_path
+        stem = (
+            self.final_name[:-len('_frames.mp4')]
+            if self.final_name.lower().endswith('_frames.mp4')
+            else os.path.splitext(self.final_name)[0]
+        )
+        name = (
+            f'{stem}_part_{len(self.segments):03d}_'
+            f'{max(0, int(frame_number)):x}_frames.mp4'
+        )
+        return os.path.join(self.video_dir, name)
+
+    def write(self, frame, frame_number):
+        """写入一个检测帧；需要时创建当前可覆盖的工作分段。"""
+        if self.active_writer is None:
+            self.active_start_frame = max(0, int(frame_number))
+            self.active_path = self._segment_path(self.active_start_frame)
+            frame_h, frame_w = frame.shape[:2]
+            fourcc = self.cv2.VideoWriter_fourcc(*'mp4v')
+            writer = self.cv2.VideoWriter(
+                self.active_path,
+                fourcc,
+                self.fps,
+                (int(frame_w), int(frame_h)),
+            )
+            is_opened = getattr(writer, 'isOpened', None)
+            if callable(is_opened) and not is_opened():
+                writer.release()
+                self.active_path = None
+                raise RuntimeError('无法创建检测帧视频分段')
+            self.active_writer = writer
+        self.active_writer.write(frame)
+
+    def seal_segment(self):
+        """关闭当前分段并纳入下一份 checkpoint。"""
+        if self.active_writer is None:
+            return False
+        path = self.active_path
+        self.active_writer.release()
+        self.active_writer = None
+        self.active_path = None
+        self.active_start_frame = None
+        if not os.path.isfile(path) or os.path.getsize(path) <= 0:
+            raise RuntimeError(f'检测帧视频分段写入失败: {path}')
+        name = os.path.basename(path)
+        if name not in self.segments:
+            self.segments.append(name)
+        return True
+
+    def checkpoint_segments(self):
+        """返回可安全写入 checkpoint 的已封口分段名称。"""
+        return list(self.segments)
+
+    def abort_active_segment(self):
+        """异常退出时关闭并删除未被 checkpoint 接纳的工作分段。"""
+        if self.active_writer is not None:
+            try:
+                self.active_writer.release()
+            finally:
+                self.active_writer = None
+        path = self.active_path
+        self.active_path = None
+        self.active_start_frame = None
+        if path and os.path.isfile(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def _merge_segments(self, segment_paths):
+        """顺序重编码分段到临时文件，再原子替换最终产物。"""
+        stem = (
+            self.final_path[:-len('_frames.mp4')]
+            if self.final_path.lower().endswith('_frames.mp4')
+            else os.path.splitext(self.final_path)[0]
+        )
+        tmp_path = stem + '_merge_tmp_frames.mp4'
+        writer = None
+        written_frames = 0
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            for segment_path in segment_paths:
+                cap = self.cv2.VideoCapture(segment_path)
+                if not cap.isOpened():
+                    cap.release()
+                    raise RuntimeError(f'无法读取检测帧视频分段: {segment_path}')
+                try:
+                    while True:
+                        success, frame = cap.read()
+                        if not success:
+                            break
+                        if writer is None:
+                            frame_h, frame_w = frame.shape[:2]
+                            writer = self.cv2.VideoWriter(
+                                tmp_path,
+                                self.cv2.VideoWriter_fourcc(*'mp4v'),
+                                self.fps,
+                                (int(frame_w), int(frame_h)),
+                            )
+                            is_opened = getattr(writer, 'isOpened', None)
+                            if callable(is_opened) and not is_opened():
+                                raise RuntimeError('无法创建检测帧视频合并文件')
+                        writer.write(frame)
+                        written_frames += 1
+                finally:
+                    cap.release()
+            if writer is None or written_frames <= 0:
+                raise RuntimeError('检测帧视频分段中没有可合并帧')
+            writer.release()
+            writer = None
+            os.replace(tmp_path, self.final_path)
+        except Exception:
+            if writer is not None:
+                writer.release()
+            if os.path.isfile(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            raise
+
+    def finish(self):
+        """封口并合并全部分段，返回最终 checkpoint 应记录的分段。"""
+        self.seal_segment()
+        if not self.segments:
+            return []
+        segment_paths = [
+            os.path.join(self.video_dir, name)
+            for name in self.segments
+        ]
+        if len(segment_paths) == 1:
+            only_path = segment_paths[0]
+            if os.path.normcase(only_path) != os.path.normcase(self.final_path):
+                os.replace(only_path, self.final_path)
+        else:
+            self._merge_segments(segment_paths)
+            for segment_path in segment_paths:
+                if os.path.normcase(segment_path) == os.path.normcase(self.final_path):
+                    continue
+                if os.path.isfile(segment_path):
+                    os.remove(segment_path)
+        self.segments = [self.final_name]
+        return self.checkpoint_segments()
 
 
 def _done_marker_matches(

@@ -23,7 +23,8 @@ from dataclasses import dataclass
 from utils import (
     VIDEO_EXTENSIONS, DONE_SUFFIX, _IGNORED_SUBDIRS,
     PauseRequested, ClaimLostError, DIRECTORY_INDEX, _STOP_REQUESTED,
-    get_claim_heartbeat_interval_seconds,
+    get_claim_heartbeat_interval_seconds, get_checkpoint_interval_seconds,
+    get_early_eof_retry_delay_seconds,
     _read_frame_with_timeout, _READ_TIMEOUT_SEC,
     _truthy_env, _get_pause_file_path, _pause_requested, _install_pause_signal_handler,
     CHECKPOINT_SUFFIX, _checkpoint_path, _load_checkpoint, _save_checkpoint, _clear_checkpoint,
@@ -36,6 +37,7 @@ from utils import (
     has_completed_artifact, build_pipeline_id, _source_snapshot,
     write_done_marker as _write_done_marker_state,
     is_video_file, is_leaf_directory, count_videos_in_directory,
+    is_tail_eof_within_tolerance, is_checkpoint_retry_deferred,
 )
 
 # 需要排除的路径变量
@@ -563,6 +565,9 @@ def _detect_objects_in_video_yolov5_impl(
     start_frame = int(ckpt.get('next_frame', 0)) if ckpt else 0
     detections = list(ckpt.get('detections', [])) if ckpt else []
     last_detected = float(ckpt.get('last_detected', detections[-1] if detections else -5.0)) if ckpt else -5
+    checkpoint_created = bool(ckpt)
+    checkpoint_interval = get_checkpoint_interval_seconds()
+    last_periodic_checkpoint = time.time()
     
     # 视频处理初始化
     cap = cv2.VideoCapture(video_path)
@@ -800,17 +805,73 @@ def _detect_objects_in_video_yolov5_impl(
                     f.write(line + "\n")
         
         frame_count += 1
+
+        if (
+            time.time() - last_periodic_checkpoint
+            >= checkpoint_interval
+        ):
+            if _save_checkpoint(
+                video_path,
+                next_frame=frame_count,
+                detections=detections,
+                last_detected=last_detected,
+                claim_md5=claim_md5,
+                last_success_frame=frame_count - 1,
+                pipeline_id=pipeline,
+                reason='periodic',
+            ):
+                checkpoint_created = True
+                last_periodic_checkpoint = time.time()
     
     if processing_error:
         return VideoProcessingResult.failed(processing_error)
+
+    if total_frames > 0 and frame_count < total_frames:
+        if not is_tail_eof_within_tolerance(frame_count, total_frames):
+            retry_count = (
+                int((ckpt or {}).get('early_eof_retry_count', 0) or 0) + 1
+            )
+            _save_checkpoint(
+                video_path,
+                next_frame=frame_count,
+                detections=detections,
+                last_detected=last_detected,
+                claim_md5=claim_md5,
+                last_success_frame=frame_count - 1,
+                pipeline_id=pipeline,
+                reason='unexpected_early_eof',
+                early_eof_retry_count=retry_count,
+                retry_not_before=(
+                    time.time()
+                    + get_early_eof_retry_delay_seconds(retry_count)
+                ),
+            )
+            return VideoProcessingResult.failed(
+                f'视频读取提前结束: 已处理 {frame_count}/{total_frames} 帧'
+            )
+        print(
+            f'提示: 视频尾部元数据比实际可读帧多 '
+            f'{total_frames - frame_count} 帧，已按正常结束处理: '
+            f'{frame_count}/{total_frames}'
+        )
 
     if claim_md5 and not _call_directory_index(
         'refresh_claim', claim_md5, pipeline_id=pipeline
     ):
         raise ClaimLostError(f"视频声明已失效，放弃写入最终产物: {video_path}")
 
-    if (not _pause_requested(pause_file)) and (frame_count >= total_frames or total_frames == 0):
-        _clear_checkpoint(video_path, pipeline_id=pipeline)
+    if checkpoint_created:
+        if not _save_checkpoint(
+            video_path,
+            next_frame=frame_count,
+            detections=detections,
+            last_detected=last_detected,
+            claim_md5=claim_md5,
+            last_success_frame=frame_count - 1,
+            pipeline_id=pipeline,
+            reason='processing_complete_pending_commit',
+        ):
+            return VideoProcessingResult.failed('无法保存处理完成前检查点')
 
     video_dir = os.path.dirname(video_path) or '.'
     artifact_base = safe_artifact_basename(video_path, pipeline_id=pipeline)
@@ -886,6 +947,11 @@ def should_process(file_path, pipeline_id=None):
         )
     except Exception:
         has_checkpoint = False
+    if has_checkpoint and is_checkpoint_retry_deferred(
+        file_path, pipeline_id=pipeline
+    ):
+        print(f"提前 EOF 检查点仍在退避期，暂不重试: {file_path}")
+        return
     md5 = get_file_md5_cached(file_path)
     if not md5:
         return
@@ -1079,6 +1145,9 @@ def _detect_objects_with_frame_analysis_impl(
         start_frame = int(ckpt.get('next_frame', 0)) if ckpt else 0
         detections = list(ckpt.get('detections', [])) if ckpt else []
         last_detected = float(ckpt.get('last_detected', detections[-1] if detections else -5.0)) if ckpt else -5
+        checkpoint_created = bool(ckpt)
+        checkpoint_interval = get_checkpoint_interval_seconds()
+        last_periodic_checkpoint = time.time()
 
         cap = cv2.VideoCapture(video_path)
         if _resources is not None:
@@ -1195,14 +1264,70 @@ def _detect_objects_with_frame_analysis_impl(
                     last_detected = current_time
             
             frame_count += 1
+
+            if (
+                time.time() - last_periodic_checkpoint
+                >= checkpoint_interval
+            ):
+                if _save_checkpoint(
+                    video_path,
+                    next_frame=frame_count,
+                    detections=detections,
+                    last_detected=last_detected,
+                    claim_md5=claim_md5,
+                    last_success_frame=frame_count - 1,
+                    pipeline_id=pipeline,
+                    reason='periodic',
+                ):
+                    checkpoint_created = True
+                    last_periodic_checkpoint = time.time()
+
+        if total_frames > 0 and frame_count < total_frames:
+            if not is_tail_eof_within_tolerance(frame_count, total_frames):
+                retry_count = (
+                    int((ckpt or {}).get('early_eof_retry_count', 0) or 0) + 1
+                )
+                _save_checkpoint(
+                    video_path,
+                    next_frame=frame_count,
+                    detections=detections,
+                    last_detected=last_detected,
+                    claim_md5=claim_md5,
+                    last_success_frame=frame_count - 1,
+                    pipeline_id=pipeline,
+                    reason='unexpected_early_eof',
+                    early_eof_retry_count=retry_count,
+                    retry_not_before=(
+                        time.time()
+                        + get_early_eof_retry_delay_seconds(retry_count)
+                    ),
+                )
+                return VideoProcessingResult.failed(
+                    f'视频读取提前结束: 已处理 {frame_count}/{total_frames} 帧'
+                )
+            print(
+                f'提示: 视频尾部元数据比实际可读帧多 '
+                f'{total_frames - frame_count} 帧，已按正常结束处理: '
+                f'{frame_count}/{total_frames}'
+            )
         
         if claim_md5 and not _call_directory_index(
             'refresh_claim', claim_md5, pipeline_id=pipeline
         ):
             raise ClaimLostError(f"视频声明已失效，放弃写入最终产物: {video_path}")
 
-        if (not _pause_requested(pause_file)) and (frame_count >= total_frames or total_frames == 0):
-            _clear_checkpoint(video_path, pipeline_id=pipeline)
+        if checkpoint_created:
+            if not _save_checkpoint(
+                video_path,
+                next_frame=frame_count,
+                detections=detections,
+                last_detected=last_detected,
+                claim_md5=claim_md5,
+                last_success_frame=frame_count - 1,
+                pipeline_id=pipeline,
+                reason='processing_complete_pending_commit',
+            ):
+                return VideoProcessingResult.failed('无法保存处理完成前检查点')
         
         # 保存时间戳
         video_dir = os.path.dirname(video_path) or '.'

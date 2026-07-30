@@ -219,8 +219,26 @@ class VideoCompletionGuardTests(unittest.TestCase):
                         return None
 
                 with mock.patch.object(module, '_load_checkpoint', return_value=None), \
+                     mock.patch.object(
+                         module, '_save_pipeline_checkpoint'
+                     ) as save_checkpoint, \
                      self.assertRaisesRegex(RuntimeError, '提前结束'):
                     self._detect(module, video_path, EarlyEofCapture())
+
+                early_eof_call = save_checkpoint.call_args
+                self.assertIsNotNone(early_eof_call)
+                self.assertEqual(
+                    early_eof_call.kwargs['reason'],
+                    'unexpected_early_eof',
+                )
+                self.assertEqual(
+                    early_eof_call.kwargs['early_eof_retry_count'],
+                    1,
+                )
+                self.assertGreater(
+                    early_eof_call.kwargs['retry_not_before'],
+                    time.time(),
+                )
 
     def test_tail_metadata_drift_is_reported_as_normal_eof(self):
         """极小的尾部帧数偏差不应留下检查点并导致无限重跑。"""

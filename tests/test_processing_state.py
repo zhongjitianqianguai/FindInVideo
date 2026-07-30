@@ -1021,6 +1021,40 @@ class ProcessingStateTests(unittest.TestCase):
                     finally:
                         idx.close()
 
+    def test_future_early_eof_checkpoint_is_deferred_before_hashing(self):
+        """退避期内不应重新计算 MD5、创建 claim 或再次打开坏视频。"""
+        for module_path, _needs_model in ENTRYPOINTS:
+            with self.subTest(entrypoint=module_path.name):
+                entrypoint = load_main_module(module_path)
+                entrypoint._ACTIVE_PIPELINE_ID = 'test-pipeline'
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    video_path = pathlib.Path(tmpdir) / 'video.mp4'
+                    video_path.write_bytes(b'video')
+                    entrypoint._save_pipeline_checkpoint(
+                        str(video_path),
+                        next_frame=5,
+                        detections=[],
+                        last_detected=-5.0,
+                        last_success_frame=4,
+                        reason='unexpected_early_eof',
+                        early_eof_retry_count=1,
+                        retry_not_before=time.time() + 600,
+                    )
+
+                    with mock.patch.object(
+                        entrypoint,
+                        '_hash_stable_source',
+                        side_effect=AssertionError('退避期内不应重新哈希'),
+                    ):
+                        decision = entrypoint._get_processing_decision(
+                            str(video_path), acquire_claim=False,
+                        )
+
+                self.assertEqual(
+                    decision,
+                    (None, 'checkpoint_retry_deferred'),
+                )
+
     def test_claim_loss_is_detected_before_video_initialization(self):
         for module_path, needs_model in ENTRYPOINTS:
             with self.subTest(entrypoint=module_path.name):

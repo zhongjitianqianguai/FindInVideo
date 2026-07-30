@@ -16,6 +16,7 @@ import utils
 from utils import (
     VIDEO_EXTENSIONS, ARTIFACT_SUFFIXES, DONE_SUFFIX, DIR_ARTIFACT_SKIP_SUFFIXES,
     _IGNORED_SUBDIRS, CHECKPOINT_SUFFIX, get_claim_heartbeat_interval_seconds,
+    get_checkpoint_interval_seconds, get_early_eof_retry_delay_seconds,
     PauseRequested, ClaimLostError, DIRECTORY_INDEX,
     is_windows_style_path, windows_path_to_wsl, wsl_path_to_windows,
     normalize_posix_path_with_fs, windows_path_to_unc, unc_to_drive_letter,
@@ -28,6 +29,7 @@ from utils import (
     _checkpoint_path, _load_checkpoint, _save_checkpoint, _clear_checkpoint,
     _install_pause_signal_handler, _get_pause_file_path, _pause_requested,
     record_resume_seek, is_video_file, is_tail_eof_within_tolerance,
+    is_checkpoint_retry_deferred, ResumableFrameVideo,
 )
 
 _PROCESSING_ROOT_DIR = None
@@ -384,6 +386,25 @@ def detect_objects_in_video(
     fps = cap.get(cv2.CAP_PROP_FPS)
     fps_safe = fps if fps and fps > 0 else 25
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    frame_video = ResumableFrameVideo(
+        video_save_path,
+        fps=fps_safe,
+        cv2_module=cv2,
+        checkpoint=ckpt,
+    )
+    if frame_video.requires_full_rebuild:
+        print(
+            "检查点缺少完整检测帧分段，将从头重建，"
+            f"避免生成不完整产物: {video_path}"
+        )
+        ckpt = None
+        start_frame = 0
+        detections = []
+        last_detected = -5
+        frame_video.reset_for_full_rebuild()
+    checkpoint_created = bool(ckpt)
+    checkpoint_interval = get_checkpoint_interval_seconds()
+    last_periodic_checkpoint = time.time()
     if start_frame > 0:
         try:
             seek_ok = cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
@@ -424,10 +445,6 @@ def detect_objects_in_video(
     batch_size = 200  # 每批处理的目标数量
     batch_idx = 1  # 批次计数器
 
-    # ---- 检测帧视频写入器（懒初始化，首次检测到目标时创建）----
-    video_writer = None
-    frame_w, frame_h = 0, 0
-
     last_success_frame = start_frame - 1
     reached_eof = False
     try:
@@ -442,6 +459,7 @@ def detect_objects_in_video(
                     )
                 last_claim_heartbeat = time.monotonic()
             if _pause_requested(pause_file):
+                frame_video.seal_segment()
                 _save_pipeline_checkpoint(
                     video_path,
                     next_frame=frame_count,
@@ -450,12 +468,14 @@ def detect_objects_in_video(
                     claim_md5=claim_md5,
                     last_success_frame=last_success_frame,
                     reason='pause_requested',
+                    frame_video_segments=frame_video.checkpoint_segments(),
                 )
                 raise PauseRequested()
             success, frame = cap.read()
             if not success:
                 if total_frames <= 0 or frame_count >= total_frames:
                     reached_eof = True
+                frame_video.seal_segment()
                 break
 
             # 更新进度条
@@ -557,17 +577,12 @@ def detect_objects_in_video(
 
             # 若本帧有检测结果，写入输出视频
             if detected:
-                if video_writer is None:
-                    frame_h, frame_w = frame.shape[:2]
-                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                    video_writer = cv2.VideoWriter(
-                        video_save_path, fourcc, fps_safe, (frame_w, frame_h)
-                    )
-                video_writer.write(frame)
+                frame_video.write(frame, frame_count)
 
             if show_window and detected:
                 cv2.imshow("Detection Preview", frame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
+                    frame_video.seal_segment()
                     break
 
             if save_training_data and frame_annotations:
@@ -598,7 +613,26 @@ def detect_objects_in_video(
             # 释放当前帧
             del frame
 
+            if (
+                time.time() - last_periodic_checkpoint
+                >= checkpoint_interval
+            ):
+                frame_video.seal_segment()
+                if _save_pipeline_checkpoint(
+                    video_path,
+                    next_frame=frame_count,
+                    detections=detections,
+                    last_detected=last_detected,
+                    claim_md5=claim_md5,
+                    last_success_frame=last_success_frame,
+                    reason='periodic',
+                    frame_video_segments=frame_video.checkpoint_segments(),
+                ):
+                    checkpoint_created = True
+                    last_periodic_checkpoint = time.time()
+
     except KeyboardInterrupt:
+        frame_video.seal_segment()
         _save_pipeline_checkpoint(
             video_path,
             next_frame=frame_count,
@@ -607,11 +641,10 @@ def detect_objects_in_video(
             claim_md5=claim_md5,
             last_success_frame=last_success_frame,
             reason='keyboard_interrupt',
+            frame_video_segments=frame_video.checkpoint_segments(),
         )
         print(f"\nCtrl+C 已保存检查点，正在退出...")
         # 释放资源后重新抛出，让调用方知道是用户中断，不要标记为已完成
-        if video_writer is not None:
-            video_writer.release()
         cap.release()
         pbar.close()
         if show_window:
@@ -626,8 +659,7 @@ def detect_objects_in_video(
 
     finally:
         # 确保资源释放
-        if video_writer is not None:
-            video_writer.release()
+        frame_video.abort_active_segment()
         cap.release()
         pbar.close()
         if show_window:
@@ -642,6 +674,10 @@ def detect_objects_in_video(
                     f"已按正常结束处理: {frame_count}/{total_frames}"
                 )
             else:
+                frame_video.seal_segment()
+                retry_count = (
+                    int((ckpt or {}).get('early_eof_retry_count', 0) or 0) + 1
+                )
                 _save_pipeline_checkpoint(
                     video_path,
                     next_frame=frame_count,
@@ -650,6 +686,12 @@ def detect_objects_in_video(
                     claim_md5=claim_md5,
                     last_success_frame=last_success_frame,
                     reason='unexpected_early_eof',
+                    frame_video_segments=frame_video.checkpoint_segments(),
+                    early_eof_retry_count=retry_count,
+                    retry_not_before=(
+                        time.time()
+                        + get_early_eof_retry_delay_seconds(retry_count)
+                    ),
                 )
                 raise RuntimeError(
                     f"视频读取提前结束: 已处理 {frame_count}/{total_frames} 帧"
@@ -659,6 +701,20 @@ def detect_objects_in_video(
     if claim_md5 and not _refresh_claim(claim_md5):
         raise ClaimLostError(f"视频声明已失效，放弃写入最终产物: {video_path}")
 
+    final_frame_video_segments = frame_video.finish()
+    if checkpoint_created:
+        if not _save_pipeline_checkpoint(
+            video_path,
+            next_frame=frame_count,
+            detections=detections,
+            last_detected=last_detected,
+            claim_md5=claim_md5,
+            last_success_frame=last_success_frame,
+            reason='processing_complete_pending_commit',
+            frame_video_segments=final_frame_video_segments,
+        ):
+            raise RuntimeError('无法保存处理完成前检查点')
+
     # 处理剩余的裁剪图像
     if save_mosaic and save_crops and crops_batch:
         dir_name = os.path.dirname(video_path)
@@ -666,7 +722,7 @@ def detect_objects_in_video(
         save_mosaic_batch(crops_batch, batch_idx, dir_name, base_name, max_cols)
 
     # 输出视频结果提示
-    if video_writer is not None:
+    if final_frame_video_segments:
         print(f"已保存检测帧视频至: {video_save_path}")
     else:
         print(f"未检测到目标，未生成帧视频: {os.path.basename(video_path)}")
@@ -1019,6 +1075,11 @@ def _get_processing_decision(file_path, acquire_claim=True):
     if has_existing_artifacts(file_path):
         return None, "has_artifacts"
     pipeline = _resolve_pipeline_id()
+    if checkpoint_exists and is_checkpoint_retry_deferred(
+        file_path, pipeline_id=pipeline
+    ):
+        print(f"提前 EOF 检查点仍在退避期，暂不重试: {file_path}")
+        return None, "checkpoint_retry_deferred"
     legacy_pipeline = pipeline is None
     if legacy_pipeline and not checkpoint_exists and is_path_already_yoloed(file_path):
         return None, "path_already_yoloed"
@@ -1279,7 +1340,9 @@ def process_directory_videos(
             video_files.append((file_path, duration, md5))
         elif reason in ("claimed_elsewhere", "claim_failed"):
             claim_blocked_videos.append(file_path)
-        elif reason in ("md5_unavailable", "source_unstable"):
+        elif reason in (
+            "md5_unavailable", "source_unstable", "checkpoint_retry_deferred"
+        ):
             unresolved_videos.append(file_path)
 
     if not video_files:

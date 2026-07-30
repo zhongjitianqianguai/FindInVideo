@@ -2,6 +2,7 @@
 
 import pathlib
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -273,6 +274,228 @@ class ProcessingAuditTests(unittest.TestCase):
         self.assertEqual(resume_event['details']['requested_frame'], 2)
         self.assertEqual(resume_event['details']['reported_frame'], 2)
         self.assertTrue(resume_event['details']['position_verified'])
+
+    def test_resumed_frame_video_merges_pre_and_post_interrupt_segments(self):
+        """断点后的检测帧写入新分段，完成时必须保留中断前后的全部帧。"""
+        final_path = self.root / 'detected_frames.mp4'
+        first_frames = [
+            np.full((24, 32, 3), value, dtype=np.uint8)
+            for value in (20, 40, 60)
+        ]
+        resumed_frames = [
+            np.full((24, 32, 3), value, dtype=np.uint8)
+            for value in (80, 100)
+        ]
+
+        first_session = utils.ResumableFrameVideo(
+            str(final_path),
+            fps=10.0,
+            cv2_module=cv2,
+            checkpoint=None,
+        )
+        for frame_number, frame in enumerate(first_frames):
+            first_session.write(frame, frame_number)
+        first_session.seal_segment()
+        if not final_path.exists():
+            self.skipTest('当前 OpenCV 环境无法创建可验证的 MP4 分段')
+
+        checkpoint_segments = first_session.checkpoint_segments()
+        self.assertEqual(checkpoint_segments, [final_path.name])
+        self.assertTrue(utils._save_checkpoint(
+            str(self.video_path),
+            next_frame=len(first_frames),
+            detections=[0.0, 0.1, 0.2],
+            last_detected=0.2,
+            last_success_frame=2,
+            pipeline_id=self.pipeline_id,
+            reason='periodic',
+            frame_video_segments=checkpoint_segments,
+        ))
+        checkpoint = utils._load_checkpoint(
+            str(self.video_path), pipeline_id=self.pipeline_id,
+        )
+
+        resumed_session = utils.ResumableFrameVideo(
+            str(final_path),
+            fps=10.0,
+            cv2_module=cv2,
+            checkpoint=checkpoint,
+        )
+        for offset, frame in enumerate(resumed_frames, start=len(first_frames)):
+            resumed_session.write(frame, offset)
+        resumed_session.finish()
+
+        cap = cv2.VideoCapture(str(final_path))
+        self.assertTrue(cap.isOpened())
+        try:
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        finally:
+            cap.release()
+        self.assertEqual(frame_count, len(first_frames) + len(resumed_frames))
+        self.assertEqual(
+            list(self.root.glob('*_part_*_frames.mp4')),
+            [],
+            '合并成功后不应残留恢复分段',
+        )
+
+    def test_early_eof_checkpoint_defers_retry_until_deadline(self):
+        """提前 EOF 检查点必须带退避时间，避免每次启动立刻重复失败。"""
+        retry_not_before = time.time() + 600
+        self.assertTrue(utils._save_checkpoint(
+            str(self.video_path),
+            next_frame=5,
+            detections=[],
+            last_detected=-5.0,
+            last_success_frame=4,
+            pipeline_id=self.pipeline_id,
+            reason='unexpected_early_eof',
+            early_eof_retry_count=2,
+            retry_not_before=retry_not_before,
+        ))
+
+        self.assertTrue(utils.is_checkpoint_retry_deferred(
+            str(self.video_path), pipeline_id=self.pipeline_id,
+        ))
+        self.assertFalse(utils.is_checkpoint_retry_deferred(
+            str(self.video_path),
+            pipeline_id=self.pipeline_id,
+            now=retry_not_before + 1,
+        ))
+
+    def test_main_resume_keeps_detected_frames_and_writes_periodic_checkpoints(self):
+        """主入口恢复后应合并检测帧，并把周期进度持久化。"""
+        video_path = self.root / 'detected-entrypoint.avi'
+        writer = cv2.VideoWriter(
+            str(video_path),
+            cv2.VideoWriter_fourcc(*'MJPG'),
+            10.0,
+            (32, 24),
+        )
+        if not writer.isOpened():
+            self.skipTest('当前 OpenCV 环境无法创建主入口检测帧测试视频')
+        try:
+            for frame_number in range(10):
+                writer.write(np.full(
+                    (24, 32, 3), frame_number * 20, dtype=np.uint8,
+                ))
+        finally:
+            writer.release()
+
+        class FakeCoordinates:
+            """提供与模型框坐标相同的最小接口。"""
+
+            def cpu(self):
+                return self
+
+            def numpy(self):
+                return np.array([2, 2, 20, 20], dtype=np.float32)
+
+        class FakeXyxy:
+            def __getitem__(self, index):
+                return FakeCoordinates()
+
+        class FakeBox:
+            cls = 0
+            xyxy = FakeXyxy()
+
+        class DetectEveryFrameModel:
+            names = {0: 'face'}
+
+            def predict(self, *args, **kwargs):
+                return [type('Result', (), {'boxes': [FakeBox()]})()]
+
+        file_md5 = 'detected-entrypoint-md5'
+        self.assertTrue(self.first_index.try_claim_video(
+            file_md5, str(video_path), pipeline_id=self.pipeline_id,
+        ))
+        pause_checks = iter((False, False, True))
+        with mock.patch.object(
+            main_entrypoint, 'DIRECTORY_INDEX', self.first_index,
+        ), mock.patch.object(
+            main_entrypoint, '_ACTIVE_PIPELINE_ID', self.pipeline_id,
+        ), mock.patch.object(
+            main_entrypoint,
+            '_pause_requested',
+            side_effect=lambda *args: next(pause_checks),
+        ):
+            with self.assertRaises(main_entrypoint.PauseRequested):
+                main_entrypoint.detect_objects_in_video(
+                    str(video_path),
+                    target_class='face',
+                    claim_md5=file_md5,
+                    model=DetectEveryFrameModel(),
+                )
+            main_entrypoint._release_claim_safely(file_md5)
+
+        interrupted_checkpoint = utils._load_checkpoint(
+            str(video_path), pipeline_id=self.pipeline_id,
+        )
+        self.assertEqual(interrupted_checkpoint['next_frame'], 2)
+        self.assertEqual(len(interrupted_checkpoint['frame_video_segments']), 1)
+        self.first_index.close()
+
+        resumed_index = utils.DirectoryIndex(
+            str(self.db_path),
+            owner_token='detected-resumed-session',
+            host_name='audit-host',
+            host_id='audit-host-d',
+            pid=10004,
+            process_started_at=400.0,
+        )
+        utils.DIRECTORY_INDEX = resumed_index
+        self.assertTrue(resumed_index.try_claim_video(
+            file_md5, str(video_path), pipeline_id=self.pipeline_id,
+        ))
+        with mock.patch.object(
+            main_entrypoint, 'DIRECTORY_INDEX', resumed_index,
+        ), mock.patch.object(
+            main_entrypoint, '_ACTIVE_PIPELINE_ID', self.pipeline_id,
+        ), mock.patch.object(
+            main_entrypoint, '_pause_requested', return_value=False,
+        ), mock.patch.object(
+            main_entrypoint, 'get_checkpoint_interval_seconds', return_value=0,
+        ):
+            detections = main_entrypoint.detect_objects_in_video(
+                str(video_path),
+                target_class='face',
+                claim_md5=file_md5,
+                model=DetectEveryFrameModel(),
+            )
+        self.assertTrue(resumed_index.release_claim(
+            file_md5, pipeline_id=self.pipeline_id,
+        ))
+
+        artifact_base = utils.safe_artifact_basename(
+            str(video_path), pipeline_id=self.pipeline_id,
+        )
+        final_path = self.root / f'{artifact_base}_frames.mp4'
+        cap = cv2.VideoCapture(str(final_path))
+        self.assertTrue(cap.isOpened())
+        try:
+            output_frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        finally:
+            cap.release()
+        self.assertEqual(output_frame_count, len(detections))
+        self.assertGreater(output_frame_count, 2)
+        self.assertEqual(list(self.root.glob('*_part_*_frames.mp4')), [])
+
+        final_checkpoint = utils._load_checkpoint(
+            str(video_path), pipeline_id=self.pipeline_id,
+        )
+        self.assertEqual(
+            final_checkpoint['reason'],
+            'processing_complete_pending_commit',
+        )
+        events = resumed_index.list_processing_events(
+            limit=100,
+            file_md5=file_md5,
+            pipeline_id=self.pipeline_id,
+        )
+        self.assertTrue(any(
+            event['event_type'] == 'checkpoint_saved'
+            and event['details'].get('reason') == 'periodic'
+            for event in events
+        ))
 
 
 if __name__ == '__main__':
