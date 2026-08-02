@@ -47,6 +47,7 @@ _LOGGER = logging.getLogger(__name__)
 MODEL_PATH = 'models/yolov11l-face.pt'
 MODEL_CONFIDENCE = 0.5
 DEFAULT_IMAGE_SIZE = 1920
+MEMORY_RETRY_DELAY_SECONDS = 0.2
 # 需要排除的路径变量
 _EXCLUDE_PATHS_RAW = [
     os.path.abspath(r"D:\$RECYCLE.BIN"),
@@ -439,6 +440,39 @@ def save_mosaic_batch(crops_batch, batch_idx, dir_name, base_name, max_cols=8):
     gc.collect()
 
 
+def _clear_prediction_references(model):
+    """释放 Ultralytics 在连续单帧推理之间保留的图像和结果引用。"""
+    predictor = getattr(model, 'predictor', None)
+    if predictor is None:
+        return
+    for attribute in ('results', 'batch', 'dataset'):
+        try:
+            setattr(predictor, attribute, None)
+        except Exception:
+            pass
+
+
+def _predict_frame_with_memory_retry(model, frame, imgsz):
+    """单帧推理遇到内存分配失败时，释放旧结果后原帧重试一次。"""
+    _clear_prediction_references(model)
+    for attempt in range(2):
+        try:
+            return model.predict(
+                frame,
+                conf=MODEL_CONFIDENCE,
+                imgsz=imgsz,
+                verbose=False,
+            )
+        except MemoryError as exc:
+            _clear_prediction_references(model)
+            gc.collect()
+            if attempt == 0:
+                print(f"推理内存分配失败，已清理旧结果，正在重试当前帧: {exc}")
+                time.sleep(MEMORY_RETRY_DELAY_SECONDS)
+                continue
+            raise
+
+
 def detect_objects_in_video(
     video_path,
     target_class,
@@ -611,13 +645,41 @@ def detect_objects_in_video(
                 frame_annotations = []
 
             current_time = frame_count / fps_safe
-            results = model.predict(
-                frame,
-                conf=MODEL_CONFIDENCE,
-                imgsz=imgsz,
-                verbose=False,
-            )
+            try:
+                results = _predict_frame_with_memory_retry(model, frame, imgsz)
+            except MemoryError as exc:
+                # 当前帧尚未完成，保存精确恢复点，避免退回上一个周期检查点。
+                frame = None
+                gc.collect()
+                checkpoint_saved = False
+                try:
+                    frame_video.seal_segment()
+                    checkpoint_saved = _save_pipeline_checkpoint(
+                        video_path,
+                        next_frame=frame_count,
+                        detections=detections,
+                        last_detected=last_detected,
+                        claim_md5=claim_md5,
+                        last_success_frame=last_success_frame,
+                        reason='memory_allocation_error',
+                        frame_video_segments=frame_video.checkpoint_segments(),
+                    )
+                except Exception as checkpoint_error:
+                    print(f"保存内存异常检查点时出错: {checkpoint_error}")
+                if checkpoint_saved:
+                    print(
+                        f"内存分配重试仍失败，已保存即时检查点；"
+                        f"下次将从第 {frame_count} 帧重试: {exc}"
+                    )
+                else:
+                    print(
+                        "内存分配重试仍失败，即时检查点保存失败，"
+                        f"将保留最近一次有效检查点: {exc}"
+                    )
+                raise
             detected = False
+            result = None
+            box = None
 
             for result in results:
                 for box in result.boxes:
@@ -696,6 +758,12 @@ def detect_objects_in_video(
                                 f"{class_index} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}"
                             )
                             frame_annotations.append(annotation_line)
+
+            # Results 会引用原始帧，必须在下一次预处理分配内存前释放。
+            box = None
+            result = None
+            results = None
+            _clear_prediction_references(model)
 
             # 若本帧有检测结果，写入输出视频
             if detected:
@@ -776,6 +844,8 @@ def detect_objects_in_video(
         print('\n已在当前帧结束后保存检查点，准备退出，不会继续处理后续视频。')
         raise
     except Exception as e:
+        _clear_prediction_references(model)
+        gc.collect()
         print(f"处理视频时发生错误: {e}")
         raise
 
@@ -1553,7 +1623,7 @@ def process_directory_videos(
                 target_item,
                 claim_md5=md5,
                 show_window=False,
-                save_crops=True,
+                save_crops=save_mosaic_switch,
                 save_training_data=False,
                 all_objects=all_objects_switch,
                 save_mosaic=save_mosaic_switch,
@@ -1841,7 +1911,7 @@ if __name__ == "__main__":
                                     target_item,
                                     claim_md5=md5,
                                     show_window=False,
-                                    save_crops=True,
+                                    save_crops=save_mosaic_switch,
                                     save_training_data=False,
                                     all_objects=all_objects_switch,
                                     save_mosaic=save_mosaic_switch,
@@ -1897,7 +1967,7 @@ if __name__ == "__main__":
                                     target_item,
                                     claim_md5=md5,
                                     show_window=False,
-                                    save_crops=True,
+                                    save_crops=save_mosaic_switch,
                                     save_training_data=False,
                                     all_objects=all_objects_switch,
                                     save_mosaic=save_mosaic_switch,

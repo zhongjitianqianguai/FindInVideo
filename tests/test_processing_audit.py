@@ -43,6 +43,26 @@ class ProcessingAuditTests(unittest.TestCase):
         utils.DIRECTORY_INDEX = self.previous_index
         self.tempdir.cleanup()
 
+    def _create_test_video(self, name, frame_count=3):
+        """创建用于逐帧推理回归测试的小视频。"""
+        video_path = self.root / name
+        writer = cv2.VideoWriter(
+            str(video_path),
+            cv2.VideoWriter_fourcc(*'MJPG'),
+            10.0,
+            (32, 24),
+        )
+        if not writer.isOpened():
+            self.skipTest('当前 OpenCV 环境无法创建内存异常测试视频')
+        try:
+            for frame_number in range(frame_count):
+                writer.write(np.full(
+                    (24, 32, 3), frame_number * 20, dtype=np.uint8,
+                ))
+        finally:
+            writer.release()
+        return video_path
+
     def test_interrupt_release_and_resume_are_persisted(self):
         """中断后的新会话能领取、加载检查点并留下可查询的完整事件链。"""
         self.assertTrue(self.first_index.try_claim_video(
@@ -274,6 +294,90 @@ class ProcessingAuditTests(unittest.TestCase):
         self.assertEqual(resume_event['details']['requested_frame'], 2)
         self.assertEqual(resume_event['details']['reported_frame'], 2)
         self.assertTrue(resume_event['details']['position_verified'])
+
+    def test_main_memory_error_retries_current_frame_and_releases_state(self):
+        """单次内存分配失败应清理预测状态并原帧重试。"""
+        video_path = self._create_test_video('memory-retry.avi')
+
+        class RetryModel:
+            names = {}
+
+            def __init__(self):
+                self.calls = 0
+                self.predictor = type('PredictorState', (), {})()
+
+            def predict(self, *args, **kwargs):
+                self.calls += 1
+                self.predictor.results = ['模拟结果']
+                self.predictor.batch = object()
+                self.predictor.dataset = object()
+                if self.calls == 1:
+                    raise MemoryError('模拟一次内存分配失败')
+                return []
+
+        model = RetryModel()
+        with mock.patch.object(
+            main_entrypoint, '_ACTIVE_PIPELINE_ID', self.pipeline_id,
+        ), mock.patch.object(
+            main_entrypoint, '_pause_requested', return_value=False,
+        ), mock.patch.object(
+            main_entrypoint, 'MEMORY_RETRY_DELAY_SECONDS', 0,
+        ):
+            detections = main_entrypoint.detect_objects_in_video(
+                str(video_path), target_class='face', model=model,
+            )
+
+        self.assertEqual(detections, [])
+        self.assertEqual(model.calls, 4)
+        self.assertIsNone(model.predictor.results)
+        self.assertIsNone(model.predictor.batch)
+        self.assertIsNone(model.predictor.dataset)
+
+    def test_main_repeated_memory_error_saves_exact_checkpoint(self):
+        """内存重试仍失败时应保存当前未处理帧的即时检查点。"""
+        video_path = self._create_test_video('memory-checkpoint.avi')
+
+        class RepeatedFailureModel:
+            names = {}
+
+            def __init__(self):
+                self.calls = 0
+                self.predictor = type('PredictorState', (), {})()
+
+            def predict(self, *args, **kwargs):
+                self.calls += 1
+                self.predictor.results = ['模拟结果']
+                self.predictor.batch = object()
+                self.predictor.dataset = object()
+                if self.calls >= 2:
+                    raise MemoryError('模拟持续内存分配失败')
+                return []
+
+        model = RepeatedFailureModel()
+        with mock.patch.object(
+            main_entrypoint, '_ACTIVE_PIPELINE_ID', self.pipeline_id,
+        ), mock.patch.object(
+            main_entrypoint, '_pause_requested', return_value=False,
+        ), mock.patch.object(
+            main_entrypoint, 'MEMORY_RETRY_DELAY_SECONDS', 0,
+        ):
+            with self.assertRaisesRegex(MemoryError, '模拟持续内存分配失败'):
+                main_entrypoint.detect_objects_in_video(
+                    str(video_path), target_class='face', model=model,
+                )
+
+        checkpoint = utils._load_checkpoint(
+            str(video_path), pipeline_id=self.pipeline_id,
+        )
+        self.assertIsNotNone(checkpoint)
+        self.assertEqual(checkpoint['next_frame'], 1)
+        self.assertEqual(checkpoint['last_success_frame'], 0)
+        self.assertEqual(checkpoint['reason'], 'memory_allocation_error')
+        self.assertEqual(checkpoint['frame_video_segments'], [])
+        self.assertEqual(model.calls, 3)
+        self.assertIsNone(model.predictor.results)
+        self.assertIsNone(model.predictor.batch)
+        self.assertIsNone(model.predictor.dataset)
 
     def test_resumed_frame_video_merges_pre_and_post_interrupt_segments(self):
         """断点后的检测帧写入新分段，完成时必须保留中断前后的全部帧。"""
