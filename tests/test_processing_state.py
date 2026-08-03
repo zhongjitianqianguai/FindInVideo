@@ -123,6 +123,40 @@ class ProcessingStateTests(unittest.TestCase):
                 self.main_module.os.environ['FINDINVIDEO_CLAIM_TTL_SECONDS'] = original_ttl
             idx.close()
 
+    def test_claim_check_reconnects_after_disk_io_error(self):
+        """声明查询遇到共享盘 I/O 异常后应换连接重试。"""
+        utils_module = self.main_module.utils
+        idx = utils_module.DirectoryIndex(':memory:')
+        try:
+            with mock.patch.object(
+                idx,
+                '_get_claim_row',
+                side_effect=[sqlite3.OperationalError('disk I/O error'), None],
+            ), mock.patch.object(
+                idx, '_reconnect_claim_database', return_value=True
+            ) as reconnect:
+                self.assertFalse(idx.is_video_claimed('md5-reconnect'))
+            reconnect.assert_called_once_with()
+        finally:
+            idx.close()
+
+    def test_claim_check_pauses_after_repeated_disk_io_error(self):
+        """重连后仍无法读取声明时必须停止，而不是误判为未声明。"""
+        utils_module = self.main_module.utils
+        idx = utils_module.DirectoryIndex(':memory:')
+        try:
+            with mock.patch.object(
+                idx,
+                '_get_claim_row',
+                side_effect=sqlite3.OperationalError('disk I/O error'),
+            ), mock.patch.object(
+                idx, '_reconnect_claim_database', return_value=False
+            ), mock.patch.object(utils_module.time, 'sleep'):
+                with self.assertRaises(utils_module.CoordinationUnavailableError):
+                    idx.is_video_claimed('md5-unavailable')
+        finally:
+            idx.close()
+
     def test_dead_local_claim_is_reclaimed_before_ttl(self):
         utils_module = self.main_module.utils
         idx = utils_module.DirectoryIndex(
@@ -1418,6 +1452,33 @@ class ProcessingStateTests(unittest.TestCase):
                 self.assertEqual(detected, [])
                 self.assertEqual(releases, [])
                 self.assertEqual(marked_dirs, [])
+
+    def test_coordination_failure_stops_directory_scan(self):
+        """共享声明库不可用时不能继续扫描目录中的其余视频。"""
+        for module_path, needs_model in ENTRYPOINTS:
+            with self.subTest(entrypoint=module_path.name):
+                entrypoint = load_main_module(module_path)
+                entrypoint.utils._STOP_REQUESTED = False
+                decision = mock.Mock(
+                    side_effect=entrypoint.CoordinationUnavailableError(
+                        '检查视频声明失败'
+                    )
+                )
+                with mock.patch.object(
+                    entrypoint.os, 'listdir', lambda path: ['video.mp4']
+                ), mock.patch.object(
+                    entrypoint, 'is_video_file', lambda path: path.endswith('.mp4')
+                ), mock.patch.object(
+                    entrypoint, 'has_existing_artifacts', return_value=False
+                ), mock.patch.object(
+                    entrypoint, '_get_processing_decision', decision
+                ):
+                    args = ['root', 'person']
+                    if needs_model:
+                        args.append(object())
+                    with self.assertRaises(entrypoint.CoordinationUnavailableError):
+                        entrypoint.process_directory_videos(*args)
+                self.assertEqual(decision.call_count, 1)
 
     def test_partial_claim_block_never_marks_directory_completed(self):
         for module_path, needs_model in ENTRYPOINTS:

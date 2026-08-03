@@ -17,7 +17,7 @@ from utils import (
     VIDEO_EXTENSIONS, ARTIFACT_SUFFIXES, DONE_SUFFIX, DIR_ARTIFACT_SKIP_SUFFIXES,
     _IGNORED_SUBDIRS, CHECKPOINT_SUFFIX, get_claim_heartbeat_interval_seconds,
     get_checkpoint_interval_seconds, get_early_eof_retry_delay_seconds,
-    PauseRequested, ClaimLostError, DIRECTORY_INDEX,
+    PauseRequested, CoordinationUnavailableError, ClaimLostError, DIRECTORY_INDEX,
     is_windows_style_path, windows_path_to_wsl, wsl_path_to_windows,
     normalize_posix_path_with_fs, windows_path_to_unc, unc_to_drive_letter,
     _safe_relpath, canonical_video_path,
@@ -1534,6 +1534,9 @@ def _run_main():
 if __name__ == "__main__":
     try:
         _run_main()
+    except CoordinationUnavailableError as e:
+        print(f"\n共享声明数据库不可用，本轮已安全暂停: {e}")
+        raise SystemExit(2)
     except PauseRequested:
         print("\n已按请求暂停，本轮处理已停止。")
         raise SystemExit(0)

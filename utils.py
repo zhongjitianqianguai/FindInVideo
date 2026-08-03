@@ -251,6 +251,9 @@ PROCESSING_EVENT_TABLE = 'processing_events'
 CLAIM_TTL_DEFAULT_SECONDS = 86400
 CLAIM_TTL_MIN_SECONDS = 60
 CLAIM_HEARTBEAT_MAX_SECONDS = 60.0
+CLAIM_DATABASE_RETRY_ATTEMPTS = 3
+CLAIM_DATABASE_RETRY_DELAY_SECONDS = 0.5
+CLAIM_DATABASE_ERROR_LOG_INTERVAL_SECONDS = 30.0
 CHECKPOINT_INTERVAL_DEFAULT_SECONDS = 300.0
 CHECKPOINT_INTERVAL_MIN_SECONDS = 30.0
 EARLY_EOF_RETRY_DEFAULT_SECONDS = 21600
@@ -1433,6 +1436,10 @@ class PauseRequested(Exception):
     """Raised to request a graceful stop with checkpoint saved."""
 
 
+class CoordinationUnavailableError(PauseRequested):
+    """共享声明数据库不可用时触发安全暂停，避免重复处理。"""
+
+
 class ClaimLostError(RuntimeError):
     """处理中的视频 claim 已被回收或转移。"""
 
@@ -1545,6 +1552,7 @@ class DirectoryIndex:
         self.process_started_at = (
             float(started_at) if started_at is not None else None
         )
+        self._claim_database_error_log_times = {}
         self.db_path = db_path or ':memory:'
         self.conn = sqlite3.connect(self.db_path, timeout=60)
         self.conn.row_factory = sqlite3.Row
@@ -2046,6 +2054,91 @@ class DirectoryIndex:
         msg = str(exc).lower()
         return ('locked' in msg or 'busy' in msg or
                 'disk i/o error' in msg or 'unable to open' in msg)
+
+    @staticmethod
+    def _is_claim_connection_error(exc):
+        """判断声明查询是否因连接句柄或共享盘瞬断失败。"""
+        msg = str(exc).lower()
+        return (
+            'disk i/o error' in msg
+            or 'unable to open' in msg
+            or 'closed database' in msg
+            or 'cannot operate on a closed database' in msg
+        )
+
+    def _log_claim_database_error(self, operation_name, error, attempt, final=False):
+        """限频输出共享声明数据库故障，保留路径和重试阶段。"""
+        now = time.monotonic()
+        key = f'{operation_name}:{type(error).__name__}:{str(error).casefold()}'
+        last_logged = self._claim_database_error_log_times.get(key, 0.0)
+        if not final and (
+            now - last_logged < CLAIM_DATABASE_ERROR_LOG_INTERVAL_SECONDS
+        ):
+            return
+        self._claim_database_error_log_times[key] = now
+        if final:
+            state = '连续失败，本轮将安全暂停'
+        else:
+            state = f'第 {attempt}/{CLAIM_DATABASE_RETRY_ATTEMPTS} 次失败，正在重试'
+        print(
+            f'共享声明数据库{operation_name}{state}: {error}；'
+            f'数据库: {self.db_path}'
+        )
+
+    def _reconnect_claim_database(self):
+        """为声明查询新建连接，并以真实元数据查询验证共享库可读。"""
+        if self.db_path == ':memory:':
+            return False
+        new_conn = None
+        try:
+            new_conn = sqlite3.connect(self.db_path, timeout=60)
+            new_conn.row_factory = sqlite3.Row
+            new_conn.execute('PRAGMA busy_timeout = 30000;')
+            new_conn.execute('PRAGMA foreign_keys = ON;')
+            # SELECT 1 不会访问数据库文件，必须读取 schema 元数据确认共享盘已恢复。
+            new_conn.execute('PRAGMA schema_version;').fetchone()
+        except sqlite3.Error:
+            if new_conn is not None:
+                try:
+                    new_conn.close()
+                except sqlite3.Error:
+                    pass
+            return False
+
+        previous_conn = self.conn
+        self.conn = new_conn
+        try:
+            previous_conn.close()
+        except sqlite3.Error:
+            pass
+        return True
+
+    def _run_claim_database_operation(self, operation_name, operation):
+        """带有限重连的声明数据库操作；连续失败时停止整轮处理。"""
+        last_error = None
+        for attempt in range(1, CLAIM_DATABASE_RETRY_ATTEMPTS + 1):
+            try:
+                return operation()
+            except sqlite3.Error as error:
+                last_error = error
+                if attempt >= CLAIM_DATABASE_RETRY_ATTEMPTS:
+                    self._log_claim_database_error(
+                        operation_name, error, attempt, final=True
+                    )
+                    raise CoordinationUnavailableError(
+                        f'{operation_name}失败，无法确认视频声明状态: {error}'
+                    ) from error
+
+                self._log_claim_database_error(operation_name, error, attempt)
+                reconnected = False
+                if self._is_claim_connection_error(error):
+                    reconnected = self._reconnect_claim_database()
+                if not reconnected:
+                    time.sleep(CLAIM_DATABASE_RETRY_DELAY_SECONDS * attempt)
+
+        raise CoordinationUnavailableError(
+            f'{operation_name}失败，无法确认视频声明状态: {last_error}'
+        )
 
     @staticmethod
     def _remove_db_files(db_path):
@@ -3251,7 +3344,8 @@ class DirectoryIndex:
         """检查视频是否已有有效 claim，并安全清理确认失效的快照。"""
         if not file_md5:
             return False
-        try:
+
+        def _check_claim():
             for _attempt in range(2):
                 row = self._get_claim_row(file_md5)
                 if not row:
@@ -3261,9 +3355,8 @@ class DirectoryIndex:
                 if self._delete_claim_snapshot(row):
                     return False
             return self._get_claim_row(file_md5) is not None
-        except Exception as e:
-            print(f"检查视频声明失败: {e}")
-            return False
+
+        return self._run_claim_database_operation('检查视频声明', _check_claim)
 
     def has_active_claims_for_paths(self, video_paths):
         """检查给定视频路径中是否存在有效 claim，兼容 Windows/WSL 别名。"""
