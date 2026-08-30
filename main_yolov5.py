@@ -778,6 +778,8 @@ def _detect_objects_in_video_yolov5_impl(
             else:
                 print('\nCtrl+C 后检查点保存失败，正在安全退出。')
             raise PauseRequested()
+        except PauseRequested:
+            raise
         except Exception as e:
             print(f"处理帧 {frame_count} 时出错: {e}")
             if not _save_checkpoint(

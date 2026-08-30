@@ -1128,31 +1128,84 @@ class ResumableFrameVideo:
             self.active_path = self._segment_path(self.active_start_frame)
             frame_h, frame_w = frame.shape[:2]
             fourcc = self.cv2.VideoWriter_fourcc(*'mp4v')
-            writer = self.cv2.VideoWriter(
-                self.active_path,
-                fourcc,
-                self.fps,
-                (int(frame_w), int(frame_h)),
-            )
-            is_opened = getattr(writer, 'isOpened', None)
-            if callable(is_opened) and not is_opened():
-                writer.release()
+            try:
+                writer = self.cv2.VideoWriter(
+                    self.active_path,
+                    fourcc,
+                    self.fps,
+                    (int(frame_w), int(frame_h)),
+                )
+            except Exception as exc:
+                failed_path = self.active_path
+                self.abort_active_segment()
+                raise PauseRequested(
+                    f'无法创建检测帧视频分段，已安全停止当前处理: {failed_path}'
+                ) from exc
+            try:
+                is_opened = getattr(writer, 'isOpened', None)
+                writer_ok = not callable(is_opened) or is_opened()
+            except Exception as exc:
+                failed_path = self.active_path
+                try:
+                    writer.release()
+                except Exception:
+                    pass
                 self.active_path = None
-                raise RuntimeError('无法创建检测帧视频分段')
+                self.active_start_frame = None
+                raise PauseRequested(
+                    f'无法确认检测帧视频分段是否创建，已安全停止当前处理: {failed_path}'
+                ) from exc
+            if not writer_ok:
+                try:
+                    writer.release()
+                except Exception:
+                    pass
+                self.active_path = None
+                self.active_start_frame = None
+                raise PauseRequested(
+                    '无法创建检测帧视频分段，已安全停止当前处理'
+                )
             self.active_writer = writer
-        self.active_writer.write(frame)
+        try:
+            self.active_writer.write(frame)
+        except Exception as exc:
+            raise PauseRequested(
+                f'检测帧视频分段写入失败，已安全停止当前处理: {self.active_path}'
+            ) from exc
 
     def seal_segment(self):
         """关闭当前分段并纳入下一份 checkpoint。"""
         if self.active_writer is None:
             return False
         path = self.active_path
-        self.active_writer.release()
+        writer = self.active_writer
+        try:
+            writer.release()
+        except Exception as exc:
+            self.active_writer = None
+            self.active_path = None
+            self.active_start_frame = None
+            if path and os.path.isfile(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            raise PauseRequested(
+                f'检测帧视频分段封口失败，已安全停止当前处理: {path}'
+            ) from exc
         self.active_writer = None
         self.active_path = None
         self.active_start_frame = None
-        if not os.path.isfile(path) or os.path.getsize(path) <= 0:
-            raise RuntimeError(f'检测帧视频分段写入失败: {path}')
+        try:
+            has_bytes = os.path.isfile(path) and os.path.getsize(path) > 0
+        except OSError as exc:
+            raise PauseRequested(
+                f'无法确认检测帧视频分段是否写入，已安全停止当前处理: {path}'
+            ) from exc
+        if not has_bytes:
+            raise PauseRequested(
+                f'检测帧视频分段写入失败，已安全停止当前处理: {path}'
+            )
         if not self._is_readable_segment(path):
             cleanup_error = None
             try:
@@ -1163,8 +1216,8 @@ class ResumableFrameVideo:
                 detail = '已清理未接纳分段'
             else:
                 detail = f'清理失败: {cleanup_error}'
-            raise RuntimeError(
-                f'检测帧视频分段损坏，{detail}: {path}'
+            raise PauseRequested(
+                f'检测帧视频分段损坏，{detail}，已安全停止当前处理: {path}'
             )
         name = os.path.basename(path)
         if name not in self.segments:
@@ -1180,6 +1233,9 @@ class ResumableFrameVideo:
         if self.active_writer is not None:
             try:
                 self.active_writer.release()
+            except Exception:
+                # 保留触发停止的原始 PauseRequested，不让清理异常覆盖它。
+                pass
             finally:
                 self.active_writer = None
         path = self.active_path
@@ -1206,15 +1262,15 @@ class ResumableFrameVideo:
             )
             free_bytes = int(shutil.disk_usage(self.video_dir).free)
         except (OSError, TypeError, ValueError) as exc:
-            raise RuntimeError(
-                f'无法检查检测帧视频合并所需磁盘空间: {exc}'
+            raise PauseRequested(
+                f'无法检查检测帧视频合并所需磁盘空间，已安全停止当前处理: {exc}'
             ) from exc
         required_bytes = source_bytes + MERGE_DISK_RESERVE_BYTES
         if free_bytes < required_bytes:
-            raise RuntimeError(
+            raise PauseRequested(
                 '检测帧视频合并前可用空间不足：'
                 f'需要至少 {required_bytes} 字节（含 {MERGE_DISK_RESERVE_BYTES} 字节余量），'
-                f'当前可用 {free_bytes} 字节；已保留原分段'
+                f'当前可用 {free_bytes} 字节；已保留原分段并安全停止当前处理'
             )
         writer = None
         written_frames = 0
@@ -1247,19 +1303,38 @@ class ResumableFrameVideo:
                 finally:
                     cap.release()
             if writer is None or written_frames <= 0:
-                raise RuntimeError('检测帧视频分段中没有可合并帧')
+                raise PauseRequested(
+                    '检测帧视频分段中没有可合并帧，已安全停止当前处理'
+                )
             writer.release()
             writer = None
             os.replace(tmp_path, self.final_path)
-        except Exception:
+        except PauseRequested:
             if writer is not None:
-                writer.release()
+                try:
+                    writer.release()
+                except Exception:
+                    pass
             if os.path.isfile(tmp_path):
                 try:
                     os.remove(tmp_path)
                 except OSError:
                     pass
             raise
+        except Exception as exc:
+            if writer is not None:
+                try:
+                    writer.release()
+                except Exception:
+                    pass
+            if os.path.isfile(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            raise PauseRequested(
+                f'检测帧视频合并写入失败，已安全停止当前处理: {self.final_path}'
+            ) from exc
 
     def finish(self):
         """封口并合并全部分段，返回最终 checkpoint 应记录的分段。"""
@@ -1273,14 +1348,24 @@ class ResumableFrameVideo:
         if len(segment_paths) == 1:
             only_path = segment_paths[0]
             if os.path.normcase(only_path) != os.path.normcase(self.final_path):
-                os.replace(only_path, self.final_path)
+                try:
+                    os.replace(only_path, self.final_path)
+                except OSError as exc:
+                    raise PauseRequested(
+                        f'检测帧视频最终文件写入失败，已安全停止当前处理: {self.final_path}'
+                    ) from exc
         else:
             self._merge_segments(segment_paths)
             for segment_path in segment_paths:
                 if os.path.normcase(segment_path) == os.path.normcase(self.final_path):
                     continue
                 if os.path.isfile(segment_path):
-                    os.remove(segment_path)
+                    try:
+                        os.remove(segment_path)
+                    except OSError as exc:
+                        raise PauseRequested(
+                            f'检测帧视频分段清理失败，已安全停止当前处理: {segment_path}'
+                        ) from exc
         self.segments = [self.final_name]
         return self.checkpoint_segments()
 

@@ -493,7 +493,7 @@ class ProcessingAuditTests(unittest.TestCase):
         )
         session.active_writer = ReleasedWriter()
         session.active_path = str(final_path)
-        with self.assertRaisesRegex(RuntimeError, '分段损坏'):
+        with self.assertRaisesRegex(utils.PauseRequested, '分段损坏'):
             session.seal_segment()
         self.assertFalse(final_path.exists())
         self.assertEqual(session.checkpoint_segments(), [])
@@ -578,7 +578,7 @@ class ProcessingAuditTests(unittest.TestCase):
                 free=source_bytes + utils.MERGE_DISK_RESERVE_BYTES - 1,
             ),
         ):
-            with self.assertRaisesRegex(RuntimeError, '可用空间不足'):
+            with self.assertRaisesRegex(utils.PauseRequested, '可用空间不足'):
                 session._merge_segments([str(path) for path in segment_paths])
 
         self.assertFalse(merge_tmp.exists())

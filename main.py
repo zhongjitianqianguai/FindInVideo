@@ -666,6 +666,8 @@ def detect_objects_in_video(
                         reason='memory_allocation_error',
                         frame_video_segments=frame_video.checkpoint_segments(),
                     )
+                except PauseRequested:
+                    raise
                 except Exception as checkpoint_error:
                     print(f"保存内存异常检查点时出错: {checkpoint_error}")
                 if checkpoint_saved:
