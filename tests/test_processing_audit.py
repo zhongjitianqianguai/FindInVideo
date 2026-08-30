@@ -584,6 +584,48 @@ class ProcessingAuditTests(unittest.TestCase):
         self.assertFalse(merge_tmp.exists())
         self.assertTrue(all(path.exists() for path in segment_paths))
 
+    def test_corrupt_merge_tmp_stops_before_replacing_valid_segments(self):
+        """合并临时文件不可读时不得替换正式文件或删除原分段。"""
+        final_path = self.root / 'merge_validation_frames.mp4'
+        session = utils.ResumableFrameVideo(
+            str(final_path), fps=10.0, cv2_module=cv2, checkpoint=None,
+        )
+        for frame_number in range(2):
+            session.write(
+                np.full((24, 32, 3), frame_number * 20, dtype=np.uint8),
+                frame_number,
+            )
+        session.seal_segment()
+        for frame_number in range(2, 4):
+            session.write(
+                np.full((24, 32, 3), frame_number * 20, dtype=np.uint8),
+                frame_number,
+            )
+        session.seal_segment()
+        segment_paths = [
+            self.root / name for name in session.checkpoint_segments()
+        ]
+        original_bytes = {
+            path: path.read_bytes() for path in segment_paths
+        }
+
+        with mock.patch.object(
+            session, '_is_readable_segment', return_value=False,
+        ):
+            with self.assertRaisesRegex(
+                utils.PauseRequested, '合并文件损坏',
+            ):
+                session._merge_segments([str(path) for path in segment_paths])
+
+        self.assertTrue(all(path.exists() for path in segment_paths))
+        self.assertEqual(
+            {path: path.read_bytes() for path in segment_paths},
+            original_bytes,
+        )
+        self.assertFalse(
+            (self.root / 'merge_validation_merge_tmp_frames.mp4').exists()
+        )
+
     def test_checkpoint_save_failure_raises_safe_pause(self):
         """必要检查点保存失败时 helper 必须立即安全暂停。"""
         with self.assertRaisesRegex(utils.PauseRequested, '检查点保存失败'):

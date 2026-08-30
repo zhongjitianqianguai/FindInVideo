@@ -1308,6 +1308,11 @@ class ResumableFrameVideo:
                 )
             writer.release()
             writer = None
+            if not self._is_readable_segment(tmp_path):
+                raise PauseRequested(
+                    '检测帧视频合并文件损坏，已保留原分段并安全停止当前处理: '
+                    f'{tmp_path}'
+                )
             os.replace(tmp_path, self.final_path)
         except PauseRequested:
             if writer is not None:
