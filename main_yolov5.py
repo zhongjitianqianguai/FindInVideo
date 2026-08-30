@@ -28,6 +28,7 @@ from utils import (
     _read_frame_with_timeout, _READ_TIMEOUT_SEC,
     _truthy_env, _get_pause_file_path, _pause_requested, _install_pause_signal_handler,
     CHECKPOINT_SUFFIX, _checkpoint_path, _load_checkpoint, _save_checkpoint, _clear_checkpoint,
+    _save_checkpoint_or_pause,
     record_resume_seek,
     is_windows_style_path, windows_path_to_wsl, wsl_path_to_windows,
     normalize_posix_path_with_fs, windows_path_to_unc, canonical_video_path,
@@ -639,7 +640,8 @@ def _detect_objects_in_video_yolov5_impl(
                 )
             last_claim_heartbeat = time.monotonic()
         if _pause_requested(pause_file):
-            _save_checkpoint(
+            _save_checkpoint_or_pause(
+                _save_checkpoint,
                 video_path,
                 next_frame=frame_count,
                 detections=detections,
@@ -761,7 +763,7 @@ def _detect_objects_in_video_yolov5_impl(
                                 frame_annotations.append(annotation_line)
         
         except KeyboardInterrupt:
-            _save_checkpoint(
+            checkpoint_saved = _save_checkpoint(
                 video_path,
                 next_frame=frame_count,
                 detections=detections,
@@ -771,20 +773,26 @@ def _detect_objects_in_video_yolov5_impl(
                 pipeline_id=pipeline,
                 reason='keyboard_interrupt',
             )
-            print('\nCtrl+C 已保存检查点，准备退出，不会继续处理后续视频。')
+            if checkpoint_saved:
+                print('\nCtrl+C 已保存检查点，准备退出，不会继续处理后续视频。')
+            else:
+                print('\nCtrl+C 后检查点保存失败，正在安全退出。')
             raise PauseRequested()
         except Exception as e:
             print(f"处理帧 {frame_count} 时出错: {e}")
-            _save_checkpoint(
-                video_path,
-                next_frame=frame_count,
-                detections=detections,
-                last_detected=last_detected,
-                claim_md5=claim_md5,
-                last_success_frame=frame_count - 1,
-                pipeline_id=pipeline,
-                reason='frame_processing_error',
-            )
+            if not _save_checkpoint(
+                    video_path,
+                    next_frame=frame_count,
+                    detections=detections,
+                    last_detected=last_detected,
+                    claim_md5=claim_md5,
+                    last_success_frame=frame_count - 1,
+                    pipeline_id=pipeline,
+                    reason='frame_processing_error',
+                ):
+                raise PauseRequested(
+                    f'帧处理异常且检查点保存失败，已安全停止当前处理: {video_path}'
+                )
             processing_error = f"处理帧 {frame_count} 时出错: {e}"
             break
         
@@ -810,7 +818,8 @@ def _detect_objects_in_video_yolov5_impl(
             time.time() - last_periodic_checkpoint
             >= checkpoint_interval
         ):
-            if _save_checkpoint(
+            _save_checkpoint_or_pause(
+                _save_checkpoint,
                 video_path,
                 next_frame=frame_count,
                 detections=detections,
@@ -819,9 +828,9 @@ def _detect_objects_in_video_yolov5_impl(
                 last_success_frame=frame_count - 1,
                 pipeline_id=pipeline,
                 reason='periodic',
-            ):
-                checkpoint_created = True
-                last_periodic_checkpoint = time.time()
+            )
+            checkpoint_created = True
+            last_periodic_checkpoint = time.time()
     
     if processing_error:
         return VideoProcessingResult.failed(processing_error)
@@ -831,7 +840,8 @@ def _detect_objects_in_video_yolov5_impl(
             retry_count = (
                 int((ckpt or {}).get('early_eof_retry_count', 0) or 0) + 1
             )
-            _save_checkpoint(
+            _save_checkpoint_or_pause(
+                _save_checkpoint,
                 video_path,
                 next_frame=frame_count,
                 detections=detections,
@@ -861,7 +871,8 @@ def _detect_objects_in_video_yolov5_impl(
         raise ClaimLostError(f"视频声明已失效，放弃写入最终产物: {video_path}")
 
     if checkpoint_created:
-        if not _save_checkpoint(
+        _save_checkpoint_or_pause(
+            _save_checkpoint,
             video_path,
             next_frame=frame_count,
             detections=detections,
@@ -870,8 +881,7 @@ def _detect_objects_in_video_yolov5_impl(
             last_success_frame=frame_count - 1,
             pipeline_id=pipeline,
             reason='processing_complete_pending_commit',
-        ):
-            return VideoProcessingResult.failed('无法保存处理完成前检查点')
+        )
 
     video_dir = os.path.dirname(video_path) or '.'
     artifact_base = safe_artifact_basename(video_path, pipeline_id=pipeline)
@@ -1213,7 +1223,8 @@ def _detect_objects_with_frame_analysis_impl(
                     )
                 last_claim_heartbeat = time.monotonic()
             if _pause_requested(pause_file):
-                _save_checkpoint(
+                _save_checkpoint_or_pause(
+                    _save_checkpoint,
                     video_path,
                     next_frame=frame_count,
                     detections=detections,
@@ -1269,7 +1280,8 @@ def _detect_objects_with_frame_analysis_impl(
                 time.time() - last_periodic_checkpoint
                 >= checkpoint_interval
             ):
-                if _save_checkpoint(
+                _save_checkpoint_or_pause(
+                    _save_checkpoint,
                     video_path,
                     next_frame=frame_count,
                     detections=detections,
@@ -1278,16 +1290,17 @@ def _detect_objects_with_frame_analysis_impl(
                     last_success_frame=frame_count - 1,
                     pipeline_id=pipeline,
                     reason='periodic',
-                ):
-                    checkpoint_created = True
-                    last_periodic_checkpoint = time.time()
+                )
+                checkpoint_created = True
+                last_periodic_checkpoint = time.time()
 
         if total_frames > 0 and frame_count < total_frames:
             if not is_tail_eof_within_tolerance(frame_count, total_frames):
                 retry_count = (
                     int((ckpt or {}).get('early_eof_retry_count', 0) or 0) + 1
                 )
-                _save_checkpoint(
+                _save_checkpoint_or_pause(
+                    _save_checkpoint,
                     video_path,
                     next_frame=frame_count,
                     detections=detections,
@@ -1317,7 +1330,8 @@ def _detect_objects_with_frame_analysis_impl(
             raise ClaimLostError(f"视频声明已失效，放弃写入最终产物: {video_path}")
 
         if checkpoint_created:
-            if not _save_checkpoint(
+            _save_checkpoint_or_pause(
+                _save_checkpoint,
                 video_path,
                 next_frame=frame_count,
                 detections=detections,
@@ -1326,8 +1340,7 @@ def _detect_objects_with_frame_analysis_impl(
                 last_success_frame=frame_count - 1,
                 pipeline_id=pipeline,
                 reason='processing_complete_pending_commit',
-            ):
-                return VideoProcessingResult.failed('无法保存处理完成前检查点')
+            )
         
         # 保存时间戳
         video_dir = os.path.dirname(video_path) or '.'

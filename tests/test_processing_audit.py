@@ -333,6 +333,41 @@ class ProcessingAuditTests(unittest.TestCase):
         self.assertIsNone(model.predictor.batch)
         self.assertIsNone(model.predictor.dataset)
 
+    def test_main_checkpoint_save_failure_stops_before_next_inference(self):
+        """周期检查点保存失败时不得继续处理下一帧。"""
+        video_path = self._create_test_video('checkpoint-save-failure.avi', frame_count=4)
+
+        class CountingModel:
+            """记录推理调用次数的轻量模型替身。"""
+
+            names = {}
+
+            def __init__(self):
+                self.calls = 0
+
+            def predict(self, *args, **kwargs):
+                self.calls += 1
+                return []
+
+        model = CountingModel()
+        with mock.patch.object(
+            main_entrypoint, '_ACTIVE_PIPELINE_ID', self.pipeline_id,
+        ), mock.patch.object(
+            main_entrypoint, '_pause_requested', return_value=False,
+        ), mock.patch.object(
+            main_entrypoint, 'get_checkpoint_interval_seconds', return_value=0,
+        ), mock.patch.object(
+            main_entrypoint, '_save_pipeline_checkpoint', return_value=False,
+        ):
+            with self.assertRaisesRegex(
+                main_entrypoint.PauseRequested, '检查点保存失败',
+            ):
+                main_entrypoint.detect_objects_in_video(
+                    str(video_path), target_class='face', model=model,
+                )
+
+        self.assertEqual(model.calls, 1)
+
     def test_main_repeated_memory_error_saves_exact_checkpoint(self):
         """内存重试仍失败时应保存当前未处理帧的即时检查点。"""
         video_path = self._create_test_video('memory-checkpoint.avi')
@@ -441,6 +476,124 @@ class ProcessingAuditTests(unittest.TestCase):
             [],
             '合并成功后不应残留恢复分段',
         )
+
+    def test_nonzero_corrupt_segment_is_removed_when_sealed(self):
+        """非零但缺少 MP4 元数据的分段不能进入 checkpoint。"""
+        final_path = self.root / 'corrupt_frames.mp4'
+        final_path.write_bytes(b'not an mp4' * 128)
+
+        class ReleasedWriter:
+            """模拟已经写完但产生损坏文件的 OpenCV writer。"""
+
+            def release(self):
+                return None
+
+        session = utils.ResumableFrameVideo(
+            str(final_path), fps=10.0, cv2_module=cv2, checkpoint=None,
+        )
+        session.active_writer = ReleasedWriter()
+        session.active_path = str(final_path)
+        with self.assertRaisesRegex(RuntimeError, '分段损坏'):
+            session.seal_segment()
+        self.assertFalse(final_path.exists())
+        self.assertEqual(session.checkpoint_segments(), [])
+
+    def test_corrupt_checkpoint_segment_requires_full_rebuild(self):
+        """检查点引用的非零损坏分段必须禁止错误帧位恢复。"""
+        final_path = self.root / 'checkpoint_corrupt_frames.mp4'
+        final_path.write_bytes(b'not an mp4' * 128)
+        session = utils.ResumableFrameVideo(
+            str(final_path),
+            fps=10.0,
+            cv2_module=cv2,
+            checkpoint={
+                'next_frame': 37,
+                'detections': [1.0],
+                'frame_video_segments': [final_path.name],
+            },
+        )
+        self.assertTrue(session.requires_full_rebuild)
+        self.assertEqual(session.checkpoint_segments(), [])
+
+    def test_checkpoint_save_failure_cleans_tmp_and_preserves_formal_file(self):
+        """检查点写入失败时清理临时文件，不覆盖已有正式检查点。"""
+        source_path = self.root / 'checkpoint_source.mp4'
+        source_path.write_bytes(b'source')
+        self.assertTrue(utils._save_checkpoint(
+            str(source_path),
+            next_frame=1,
+            detections=[0.1],
+            last_detected=0.1,
+            pipeline_id=self.pipeline_id,
+            reason='periodic',
+        ))
+        checkpoint_path = pathlib.Path(utils._checkpoint_path(
+            str(source_path), pipeline_id=self.pipeline_id,
+        ))
+        formal_bytes = checkpoint_path.read_bytes()
+
+        with mock.patch.object(
+            utils.os, 'replace', side_effect=OSError('磁盘空间不足'),
+        ):
+            self.assertFalse(utils._save_checkpoint(
+                str(source_path),
+                next_frame=2,
+                detections=[0.2],
+                last_detected=0.2,
+                pipeline_id=self.pipeline_id,
+                reason='periodic',
+            ))
+
+        self.assertFalse(pathlib.Path(str(checkpoint_path) + '.tmp').exists())
+        self.assertEqual(checkpoint_path.read_bytes(), formal_bytes)
+
+    def test_merge_preflight_stops_before_writing_tmp_when_space_is_low(self):
+        """合并前可用空间不足时保留全部输入分段。"""
+        final_path = self.root / 'preflight_frames.mp4'
+        session = utils.ResumableFrameVideo(
+            str(final_path), fps=10.0, cv2_module=cv2, checkpoint=None,
+        )
+        for frame_number in range(2):
+            session.write(
+                np.full((24, 32, 3), frame_number * 20, dtype=np.uint8),
+                frame_number,
+            )
+        session.seal_segment()
+        for frame_number in range(2, 4):
+            session.write(
+                np.full((24, 32, 3), frame_number * 20, dtype=np.uint8),
+                frame_number,
+            )
+        session.seal_segment()
+        segment_paths = [
+            self.root / name for name in session.checkpoint_segments()
+        ]
+        source_bytes = sum(path.stat().st_size for path in segment_paths)
+        merge_tmp = self.root / 'preflight_merge_tmp_frames.mp4'
+
+        with mock.patch.object(
+            utils.shutil,
+            'disk_usage',
+            return_value=mock.Mock(
+                free=source_bytes + utils.MERGE_DISK_RESERVE_BYTES - 1,
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, '可用空间不足'):
+                session._merge_segments([str(path) for path in segment_paths])
+
+        self.assertFalse(merge_tmp.exists())
+        self.assertTrue(all(path.exists() for path in segment_paths))
+
+    def test_checkpoint_save_failure_raises_safe_pause(self):
+        """必要检查点保存失败时 helper 必须立即安全暂停。"""
+        with self.assertRaisesRegex(utils.PauseRequested, '检查点保存失败'):
+            utils._save_checkpoint_or_pause(
+                lambda *_args, **_kwargs: False,
+                str(self.video_path),
+                next_frame=1,
+                detections=[],
+                last_detected=-5.0,
+            )
 
     def test_early_eof_checkpoint_defers_retry_until_deadline(self):
         """提前 EOF 检查点必须带退避时间，避免每次启动立刻重复失败。"""

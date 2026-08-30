@@ -27,6 +27,7 @@ from utils import (
     has_completed_artifact, build_pipeline_id, _source_snapshot,
     write_done_marker as _write_done_marker_state,
     _checkpoint_path, _load_checkpoint, _save_checkpoint, _clear_checkpoint,
+    _save_checkpoint_or_pause,
     _install_pause_signal_handler, _get_pause_file_path, _pause_requested,
     record_resume_seek, is_video_file, is_tail_eof_within_tolerance,
     is_checkpoint_retry_deferred, ResumableFrameVideo,
@@ -440,7 +441,8 @@ def detect_objects_in_video(video_path, target_class, model,
                 last_claim_heartbeat = time.monotonic()
             if _pause_requested(pause_file):
                 frame_video.seal_segment()
-                _save_pipeline_checkpoint(
+                _save_checkpoint_or_pause(
+                    _save_pipeline_checkpoint,
                     video_path,
                     next_frame=frame_count,
                     detections=detections,
@@ -572,7 +574,8 @@ def detect_objects_in_video(video_path, target_class, model,
                 >= checkpoint_interval
             ):
                 frame_video.seal_segment()
-                if _save_pipeline_checkpoint(
+                _save_checkpoint_or_pause(
+                    _save_pipeline_checkpoint,
                     video_path,
                     next_frame=frame_count,
                     detections=detections,
@@ -581,13 +584,13 @@ def detect_objects_in_video(video_path, target_class, model,
                     last_success_frame=last_success_frame,
                     reason='periodic',
                     frame_video_segments=frame_video.checkpoint_segments(),
-                ):
-                    checkpoint_created = True
-                    last_periodic_checkpoint = time.time()
-    
+                )
+                checkpoint_created = True
+                last_periodic_checkpoint = time.time()
+
     except KeyboardInterrupt:
         frame_video.seal_segment()
-        _save_pipeline_checkpoint(
+        checkpoint_saved = _save_pipeline_checkpoint(
             video_path,
             next_frame=frame_count,
             detections=detections,
@@ -597,14 +600,20 @@ def detect_objects_in_video(video_path, target_class, model,
             reason='keyboard_interrupt',
             frame_video_segments=frame_video.checkpoint_segments(),
         )
-        print(f"\nCtrl+C 已保存检查点，正在退出...")
+        if checkpoint_saved:
+            print(f"\nCtrl+C 已保存检查点，正在退出...")
+        else:
+            print("\nCtrl+C 后检查点保存失败，正在安全退出...")
         cap.release()
         pbar.close()
         if show_window:
             cv2.destroyAllWindows()
         raise
-    except PauseRequested:
-        print('\n已在当前帧结束后保存检查点，准备退出，不会继续处理后续视频。')
+    except PauseRequested as exc:
+        if str(exc):
+            print(f'\n{exc}，准备退出。')
+        else:
+            print('\n已在当前帧结束后保存检查点，准备退出，不会继续处理后续视频。')
         raise
     except Exception as e:
         print(f"处理视频时发生错误: {e}")
@@ -631,7 +640,8 @@ def detect_objects_in_video(video_path, target_class, model,
                 retry_count = (
                     int((ckpt or {}).get('early_eof_retry_count', 0) or 0) + 1
                 )
-                _save_pipeline_checkpoint(
+                _save_checkpoint_or_pause(
+                    _save_pipeline_checkpoint,
                     video_path,
                     next_frame=frame_count,
                     detections=detections,
@@ -656,7 +666,8 @@ def detect_objects_in_video(video_path, target_class, model,
 
     final_frame_video_segments = frame_video.finish()
     if checkpoint_created:
-        if not _save_pipeline_checkpoint(
+        _save_checkpoint_or_pause(
+            _save_pipeline_checkpoint,
             video_path,
             next_frame=frame_count,
             detections=detections,
@@ -665,8 +676,7 @@ def detect_objects_in_video(video_path, target_class, model,
             last_success_frame=last_success_frame,
             reason='processing_complete_pending_commit',
             frame_video_segments=final_frame_video_segments,
-        ):
-            raise RuntimeError('无法保存处理完成前检查点')
+        )
 
     # 处理剩余的裁剪图像
     if save_mosaic and save_crops and crops_batch:

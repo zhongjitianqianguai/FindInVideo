@@ -12,6 +12,7 @@ import socket
 import signal
 import errno
 import subprocess
+import shutil
 import threading
 import ntpath
 import ctypes
@@ -258,6 +259,8 @@ CHECKPOINT_INTERVAL_DEFAULT_SECONDS = 300.0
 CHECKPOINT_INTERVAL_MIN_SECONDS = 30.0
 EARLY_EOF_RETRY_DEFAULT_SECONDS = 21600
 EARLY_EOF_RETRY_MAX_DEFAULT_SECONDS = 86400
+# 合并分段会额外生成一份临时 MP4；预留固定空间避免合并过程把磁盘写满。
+MERGE_DISK_RESERVE_BYTES = 64 * 1024 * 1024
 
 
 def normalize_pipeline_id(pipeline_id=None):
@@ -928,14 +931,23 @@ def _save_checkpoint(
         payload['mtime'] = st.st_mtime
     except Exception:
         pass
+    tmp = path + '.tmp'
+    tmp_started = False
     try:
-        tmp = path + '.tmp'
+        tmp_started = True
         with open(tmp, 'w', encoding='utf-8', errors='ignore') as f:
             json.dump(payload, f, ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
     except Exception as e:
+        # 正式 checkpoint 不动；只清理本次写入留下的临时文件，避免 0 字节
+        # .tmp 在磁盘恢复后被误认为可恢复状态。
+        if tmp_started and os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
         record_processing_event(
             'checkpoint_save_failed',
             video_path=video_path,
@@ -959,6 +971,15 @@ def _save_checkpoint(
         retry_not_before=payload.get('retry_not_before'),
     )
     return True
+
+
+def _save_checkpoint_or_pause(saver, video_path, **kwargs):
+    """保存必要检查点；失败时立即安全暂停，禁止继续推理或标记完成。"""
+    if saver(video_path, **kwargs):
+        return True
+    raise PauseRequested(
+        f'检查点保存失败，已安全停止当前处理: {video_path}'
+    )
 
 
 def _clear_checkpoint(video_path, pipeline_id=None):
@@ -1045,18 +1066,38 @@ class ResumableFrameVideo:
                 segment_name != str(name)
                 or not segment_name.lower().endswith('_frames.mp4')
             ):
-                self.requires_full_rebuild = bool(detections)
+                self.requires_full_rebuild = True
                 self.segments = []
                 return
             segment_path = os.path.join(self.video_dir, segment_name)
-            if not os.path.isfile(segment_path) or os.path.getsize(segment_path) <= 0:
-                self.requires_full_rebuild = bool(detections)
+            if not self._is_readable_segment(segment_path):
+                self.requires_full_rebuild = True
                 self.segments = []
                 return
             if segment_name not in self.segments:
                 self.segments.append(segment_name)
         if next_frame > 0 and detections and not self.segments:
             self.requires_full_rebuild = True
+
+    def _is_readable_segment(self, path):
+        """用当前 OpenCV 验证分段至少能打开并读出一帧。"""
+        capture = None
+        try:
+            capture = self.cv2.VideoCapture(path)
+            is_opened = getattr(capture, 'isOpened', None)
+            if not callable(is_opened) or not is_opened():
+                return False
+            success, frame = capture.read()
+            frame_size = getattr(frame, 'size', 1) if frame is not None else 0
+            return bool(success and frame is not None and frame_size > 0)
+        except Exception:
+            return False
+        finally:
+            if capture is not None:
+                try:
+                    capture.release()
+                except Exception:
+                    pass
 
     def reset_for_full_rebuild(self):
         """丢弃不完整恢复引用，从头生成完整检测帧视频。"""
@@ -1112,6 +1153,19 @@ class ResumableFrameVideo:
         self.active_start_frame = None
         if not os.path.isfile(path) or os.path.getsize(path) <= 0:
             raise RuntimeError(f'检测帧视频分段写入失败: {path}')
+        if not self._is_readable_segment(path):
+            cleanup_error = None
+            try:
+                os.remove(path)
+            except OSError as exc:
+                cleanup_error = exc
+            if cleanup_error is None:
+                detail = '已清理未接纳分段'
+            else:
+                detail = f'清理失败: {cleanup_error}'
+            raise RuntimeError(
+                f'检测帧视频分段损坏，{detail}: {path}'
+            )
         name = os.path.basename(path)
         if name not in self.segments:
             self.segments.append(name)
@@ -1145,6 +1199,23 @@ class ResumableFrameVideo:
             else os.path.splitext(self.final_path)[0]
         )
         tmp_path = stem + '_merge_tmp_frames.mp4'
+        try:
+            source_bytes = sum(
+                max(0, int(os.path.getsize(segment_path)))
+                for segment_path in segment_paths
+            )
+            free_bytes = int(shutil.disk_usage(self.video_dir).free)
+        except (OSError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f'无法检查检测帧视频合并所需磁盘空间: {exc}'
+            ) from exc
+        required_bytes = source_bytes + MERGE_DISK_RESERVE_BYTES
+        if free_bytes < required_bytes:
+            raise RuntimeError(
+                '检测帧视频合并前可用空间不足：'
+                f'需要至少 {required_bytes} 字节（含 {MERGE_DISK_RESERVE_BYTES} 字节余量），'
+                f'当前可用 {free_bytes} 字节；已保留原分段'
+            )
         writer = None
         written_frames = 0
         try:
