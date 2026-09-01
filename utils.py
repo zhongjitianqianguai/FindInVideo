@@ -16,6 +16,7 @@ import shutil
 import threading
 import ntpath
 import ctypes
+import re
 from ctypes import wintypes
 import atexit
 import uuid
@@ -218,6 +219,18 @@ _IGNORED_SUBDIRS = {
 }
 
 CHECKPOINT_SUFFIX = '.checkpoint.json'
+
+_ORPHAN_ARTIFACT_RE = re.compile(
+    r'^(?P<source>.+)\.findinvideo-[0-9a-f]{12}'
+    r'(?:'
+    r'\.txt|\.done|\.checkpoint\.json|\.checkpoint\.json\.tmp|'
+    r'_frames\.mp4|_objects\.mp4|_detections\.mp4|_mosaic\.jpg|'
+    r'_merge_tmp_frames\.mp4|_mosaic_[0-9]+\.jpg|'
+    r'_part_[0-9]{3}_[0-9a-f]+_frames\.mp4|'
+    r'\.done\.[0-9]+\.[0-9a-f]{32}\.tmp'
+    r')$',
+    re.IGNORECASE,
+)
 
 # OpenCV 有时会按照容器元数据多报少量尾部帧。仅容忍极小差异，避免因
 # 不可读取的尾部元数据反复从检查点重跑；较大的差异仍按异常 EOF 处理。
@@ -661,6 +674,164 @@ def is_video_file(file_path):
     if '_frames.part' in base or '_objects.part' in base or '_detections.part' in base:
         return False
     return ext in VIDEO_EXTENSIONS
+
+
+def _cleanup_normalize_path(path):
+    """规范化清理扫描路径，失败时返回 None。"""
+    try:
+        return os.path.normcase(os.path.abspath(os.path.normpath(os.fspath(path))))
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _cleanup_path_is_excluded(path, exclusion_roots):
+    """判断路径是否位于排除目录本身或其子目录中。"""
+    normalized = _cleanup_normalize_path(path)
+    if normalized is None:
+        return True
+    for excluded in exclusion_roots:
+        try:
+            if os.path.commonpath((normalized, excluded)) == excluded:
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
+def _cleanup_summary(result):
+    """输出孤儿识别产物清理汇总。"""
+    print(
+        '孤儿识别产物清理：删除 '
+        f"{result['removed_files']} 个文件，释放 {result['removed_bytes']} 字节；"
+        f"跳过 {result['skipped_active_sources']} 个源文件组，"
+        f"失败 {result['failed_files']} 个文件"
+    )
+
+
+def cleanup_orphan_artifacts(root_path, exclusions=None, directory_index=None):
+    """清理当前目录树中源视频已不存在的安全命名识别产物。"""
+    result = {
+        'removed_files': 0,
+        'removed_bytes': 0,
+        'skipped_active_sources': 0,
+        'failed_files': 0,
+    }
+
+    if isinstance(exclusions, (str, bytes, os.PathLike)):
+        exclusions = [exclusions]
+    exclusion_roots = set()
+    for entry in (exclusions or []):
+        normalized = _cleanup_normalize_path(entry)
+        if normalized is not None:
+            exclusion_roots.add(normalized)
+    try:
+        root_path = os.fspath(root_path)
+    except (TypeError, ValueError):
+        _cleanup_summary(result)
+        return result
+
+    ignored_subdirs = {str(name).casefold() for name in _IGNORED_SUBDIRS}
+    normalized_root = _cleanup_normalize_path(root_path)
+    root_name = os.path.basename(os.path.normpath(root_path)).casefold()
+    if (
+        normalized_root is None
+        or not os.path.isdir(root_path)
+        or os.path.islink(root_path)
+        or root_name in ignored_subdirs
+        or _cleanup_path_is_excluded(root_path, exclusion_roots)
+    ):
+        _cleanup_summary(result)
+        return result
+
+    groups = {}
+    try:
+        walker = os.walk(root_path, topdown=True, followlinks=False)
+        for current_root, dirs, files in walker:
+            if _cleanup_path_is_excluded(current_root, exclusion_roots):
+                dirs[:] = []
+                continue
+
+            kept_dirs = []
+            for directory_name in dirs:
+                directory_path = os.path.join(current_root, directory_name)
+                if str(directory_name).casefold() in ignored_subdirs:
+                    continue
+                if os.path.islink(directory_path):
+                    continue
+                if _cleanup_path_is_excluded(directory_path, exclusion_roots):
+                    continue
+                kept_dirs.append(directory_name)
+            dirs[:] = kept_dirs
+
+            for file_name in files:
+                try:
+                    file_name = os.fsdecode(file_name)
+                except (TypeError, ValueError):
+                    continue
+                match = _ORPHAN_ARTIFACT_RE.fullmatch(file_name)
+                if match is None:
+                    continue
+                source_name = match.group('source')
+                source_path = os.path.join(current_root, source_name)
+                artifact_path = os.path.join(current_root, file_name)
+                try:
+                    if os.path.basename(source_name) != source_name:
+                        continue
+                    if not is_video_file(source_path):
+                        continue
+                    if os.path.exists(source_path):
+                        continue
+                    if os.path.islink(artifact_path) or not os.path.isfile(artifact_path):
+                        continue
+                except (OSError, TypeError, ValueError):
+                    continue
+
+                group_key = _cleanup_normalize_path(source_path)
+                if group_key is None:
+                    continue
+                group = groups.get(group_key)
+                if group is None:
+                    group = [source_path, []]
+                    groups[group_key] = group
+                group[1].append(artifact_path)
+    except (OSError, TypeError, ValueError):
+        pass
+
+    index = directory_index if directory_index is not None else globals().get('DIRECTORY_INDEX')
+    claim_checker = getattr(index, 'has_active_claims_for_paths', None)
+    for source_path, artifact_paths in groups.values():
+        if not callable(claim_checker):
+            result['skipped_active_sources'] += 1
+            continue
+        try:
+            if claim_checker([source_path]):
+                result['skipped_active_sources'] += 1
+                continue
+        except Exception:
+            result['skipped_active_sources'] += 1
+            continue
+
+        for artifact_path in artifact_paths:
+            try:
+                if os.path.exists(source_path):
+                    break
+            except (OSError, TypeError, ValueError):
+                break
+            try:
+                size = max(0, int(os.path.getsize(artifact_path)))
+            except Exception:
+                result['failed_files'] += 1
+                continue
+            try:
+                os.remove(artifact_path)
+            except Exception:
+                result['failed_files'] += 1
+                continue
+            result['removed_files'] += 1
+            result['removed_bytes'] += size
+
+    _cleanup_summary(result)
+    return result
 
 
 def is_leaf_directory(dir_path):

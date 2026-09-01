@@ -1373,6 +1373,12 @@ def _run_main():
     # 初始化处理根目录，数据库和yoloed.txt都放在 <video_path>/md5_list/ 下
     _root = video_path if os.path.isdir(video_path) else os.path.dirname(video_path)
     _init_processing_root(_root)
+    if os.path.isdir(video_path):
+        utils.cleanup_orphan_artifacts(
+            video_path,
+            exclusions=EXCLUDE_PATHS,
+            directory_index=DIRECTORY_INDEX,
+        )
     
     # 新增功能：按叶子节点视频数量排序处理
     use_leaf_node_processing = True  # 设置为 True 启用叶子节点处理模式

@@ -38,6 +38,7 @@ from utils import (
     has_completed_artifact, build_pipeline_id, _source_snapshot,
     write_done_marker as _write_done_marker_state,
     is_video_file, is_leaf_directory, count_videos_in_directory,
+    cleanup_orphan_artifacts,
     is_tail_eof_within_tolerance, is_checkpoint_retry_deferred,
 )
 
@@ -1687,6 +1688,12 @@ if __name__ == "__main__":
     video_path = r"C:\Users\f1094\Desktop\DouyinLiveRecorder\download\邹邹大王"  # 可设置为视频文件或目录
     processing_root = video_path if os.path.isdir(video_path) else os.path.dirname(video_path)
     _init_processing_root(processing_root)
+    if os.path.isdir(video_path):
+        cleanup_orphan_artifacts(
+            video_path,
+            exclusions=EXCLUDE_PATHS,
+            directory_index=DIRECTORY_INDEX,
+        )
     # 如要检测所有模型内对象，则将 target_item 设置为任意值并启用全量检测开关
     target_item = "breast"  # 当 all_objects 为 True 时，该值不再限制检测
     all_objects_switch = True  # 设置为 True 表示显示所有检测对象
