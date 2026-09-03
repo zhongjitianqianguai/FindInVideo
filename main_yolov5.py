@@ -22,13 +22,15 @@ from dataclasses import dataclass
 
 from utils import (
     VIDEO_EXTENSIONS, DONE_SUFFIX, _IGNORED_SUBDIRS,
-    PauseRequested, ClaimLostError, DIRECTORY_INDEX, _STOP_REQUESTED,
+    PauseRequested, RecoverableProcessingError, ClaimLostError,
+    DIRECTORY_INDEX, _STOP_REQUESTED,
     get_claim_heartbeat_interval_seconds, get_checkpoint_interval_seconds,
     get_early_eof_retry_delay_seconds,
     _read_frame_with_timeout, _READ_TIMEOUT_SEC,
     _truthy_env, _get_pause_file_path, _pause_requested, _install_pause_signal_handler,
     CHECKPOINT_SUFFIX, _checkpoint_path, _load_checkpoint, _save_checkpoint, _clear_checkpoint,
     _save_checkpoint_or_pause,
+    _make_recoverable_error,
     record_resume_seek,
     is_windows_style_path, windows_path_to_wsl, wsl_path_to_windows,
     normalize_posix_path_with_fs, windows_path_to_unc, canonical_video_path,
@@ -40,6 +42,8 @@ from utils import (
     is_video_file, is_leaf_directory, count_videos_in_directory,
     cleanup_orphan_artifacts,
     is_tail_eof_within_tolerance, is_checkpoint_retry_deferred,
+    retry_with_recovery, wait_for_recovery,
+    RECOVERY_CLAIM_NOT_ACQUIRED, RECOVERY_ALREADY_COMPLETED,
 )
 
 # 需要排除的路径变量
@@ -781,6 +785,8 @@ def _detect_objects_in_video_yolov5_impl(
             raise PauseRequested()
         except PauseRequested:
             raise
+        except RecoverableProcessingError:
+            raise
         except Exception as e:
             print(f"处理帧 {frame_count} 时出错: {e}")
             if not _save_checkpoint(
@@ -793,8 +799,15 @@ def _detect_objects_in_video_yolov5_impl(
                     pipeline_id=pipeline,
                     reason='frame_processing_error',
                 ):
-                raise PauseRequested(
-                    f'帧处理异常且检查点保存失败，已安全停止当前处理: {video_path}'
+                raise _make_recoverable_error(
+                    f'帧处理异常且检查点保存失败，等待恢复后重试: {video_path}',
+                    'frame_error_checkpoint_save',
+                    error=e,
+                    video_path=video_path,
+                    artifact_path=_checkpoint_path(
+                        video_path, pipeline_id=pipeline,
+                    ),
+                    frame_number=frame_count,
                 )
             processing_error = f"处理帧 {frame_count} 时出错: {e}"
             break
@@ -1373,7 +1386,7 @@ def _detect_objects_with_frame_analysis_impl(
                 )
         return VideoProcessingResult.succeeded(detections)
         
-    except (PauseRequested, ClaimLostError):
+    except (PauseRequested, RecoverableProcessingError, ClaimLostError):
         raise
     except Exception as e:
         print(f"检测失败: {e}")
@@ -1437,15 +1450,29 @@ def _mark_video_completed(
     if not completed:
         print(f"视频声明已失效，未写入完成状态: {video_path}")
         return False
-    if pipeline is None:
-        marker_written = write_done_marker(video_path)
-    else:
-        marker_written = write_done_marker(
-            video_path,
-            pipeline_id=pipeline,
-            file_md5=file_md5,
-            source_snapshot=source_snapshot,
+    try:
+        if pipeline is None:
+            marker_written = write_done_marker(video_path)
+        else:
+            marker_written = write_done_marker(
+                video_path,
+                pipeline_id=pipeline,
+                file_md5=file_md5,
+                source_snapshot=source_snapshot,
+            )
+    except RecoverableProcessingError:
+        retry_with_recovery(
+            lambda: _call_directory_index(
+                'rollback_video_completion',
+                file_md5,
+                pipeline_id=pipeline,
+            ),
+            video_path=video_path,
+            target_dir=os.path.dirname(video_path) or '.',
+            pause_checker=_pause_requested,
+            wait_fn=wait_for_recovery,
         )
+        raise
     if not marker_written:
         _call_directory_index(
             'rollback_video_completion',
@@ -1456,7 +1483,14 @@ def _mark_video_completed(
         return False
     if pipeline is None:
         append_yoloed_md5(file_md5, file_path=video_path)
-    _clear_checkpoint(video_path, pipeline_id=pipeline)
+    retry_with_recovery(
+        lambda: _clear_checkpoint(video_path, pipeline_id=pipeline) or True,
+        video_path=video_path,
+        artifact_path=_checkpoint_path(video_path, pipeline_id=pipeline),
+        target_dir=os.path.dirname(video_path) or '.',
+        pause_checker=_pause_requested,
+        wait_fn=wait_for_recovery,
+    )
     return True
 
 
@@ -1491,7 +1525,17 @@ def process_directory_videos(
         for file in os.listdir(dir_path):
             if is_video_file(file):
                 file_path = os.path.join(dir_path, file)
-                if should_process(file_path, pipeline_id=pipeline):
+                should_process_result = retry_with_recovery(
+                    lambda: should_process(file_path, pipeline_id=pipeline),
+                    video_path=file_path,
+                    artifact_path=_checkpoint_path(
+                        file_path, pipeline_id=pipeline,
+                    ),
+                    target_dir=os.path.dirname(file_path) or '.',
+                    pause_checker=_pause_requested,
+                    wait_fn=wait_for_recovery,
+                )
+                if should_process_result:
                     video_files.append(file_path)
                 else:
                     print(f"已有可靠完成标记，跳过处理: {file_path}")
@@ -1523,51 +1567,90 @@ def process_directory_videos(
         claim_kwargs = {}
         if pipeline is not None:
             claim_kwargs['source_snapshot'] = source_snapshot
-        if not _call_directory_index(
-            'try_claim_video',
-            md5,
-            video_file,
-            pipeline_id=pipeline,
-            **claim_kwargs,
-        ):
+        claimed = retry_with_recovery(
+            lambda: _call_directory_index(
+                'try_claim_video',
+                md5,
+                video_file,
+                pipeline_id=pipeline,
+                **claim_kwargs,
+            ),
+            video_path=video_file,
+            artifact_path=_checkpoint_path(video_file, pipeline_id=pipeline),
+            target_dir=os.path.dirname(video_file) or '.',
+            pause_checker=_pause_requested,
+            wait_fn=wait_for_recovery,
+        )
+        if not claimed:
             print(f"视频已被其他实例占用或处理，跳过: {video_file}")
             continue
 
         print(f"开始处理视频文件: {video_file}")
         try:
-            detector = (
-                detect_objects_with_frame_analysis
-                if use_detectpy
-                else detect_objects_in_video_yolov5
+            def _process_claimed_video_once():
+                """执行一次 YOLOv5 视频处理和完成态提交。"""
+                detector = (
+                    detect_objects_with_frame_analysis
+                    if use_detectpy
+                    else detect_objects_in_video_yolov5
+                )
+                detector_kwargs = {}
+                if pipeline is not None:
+                    detector_kwargs['pipeline_id'] = pipeline
+                result = detector(
+                    video_file,
+                    target_item,
+                    claim_md5=md5,
+                    show_window=False,
+                    save_crops=True,
+                    save_training_data=False,
+                    all_objects=all_objects_switch,
+                    model_path=model_path,
+                    **detector_kwargs,
+                )
+                if not result.success:
+                    print(f"处理视频失败: {video_file}, 错误: {result.error}")
+                    return False
+                return _mark_video_completed(
+                    video_file,
+                    result,
+                    file_md5=md5,
+                    model_path=model_path,
+                    pipeline_id=pipeline,
+                    source_snapshot=source_snapshot,
+                )
+
+            outcome = retry_with_recovery(
+                _process_claimed_video_once,
+                video_path=video_file,
+                artifact_path=_checkpoint_path(video_file, pipeline_id=pipeline),
+                target_dir=os.path.dirname(video_file) or '.',
+                release_claim=lambda: _release_claim_safely(
+                    md5, pipeline_id=pipeline,
+                ),
+                reacquire_claim=lambda: _call_directory_index(
+                    'try_claim_video',
+                    md5,
+                    video_file,
+                    pipeline_id=pipeline,
+                    **claim_kwargs,
+                ),
+                is_already_complete=lambda: has_existing_artifacts(
+                    video_file, pipeline_id=pipeline,
+                ),
+                pause_checker=_pause_requested,
+                wait_fn=wait_for_recovery,
             )
-            detector_kwargs = {}
-            if pipeline is not None:
-                detector_kwargs['pipeline_id'] = pipeline
-            result = detector(
-                video_file,
-                target_item,
-                claim_md5=md5,
-                show_window=False,
-                save_crops=True,
-                save_training_data=False,
-                all_objects=all_objects_switch,
-                model_path=model_path,
-                **detector_kwargs,
-            )
-            if not result.success:
-                print(f"处理视频失败: {video_file}, 错误: {result.error}")
+            if outcome is RECOVERY_ALREADY_COMPLETED:
                 continue
-            if not _mark_video_completed(
-                video_file,
-                result,
-                file_md5=md5,
-                model_path=model_path,
-                pipeline_id=pipeline,
-                source_snapshot=source_snapshot,
-            ):
+            if outcome is RECOVERY_CLAIM_NOT_ACQUIRED:
+                continue
+            if not outcome:
                 continue
             completed_count += 1
         except (PauseRequested, KeyboardInterrupt):
+            raise
+        except RecoverableProcessingError:
             raise
         except Exception as exc:
             print(f"处理视频失败: {video_file}, 错误: {exc}")

@@ -11,13 +11,15 @@ import time
 import logging
 import traceback
 import ntpath
+import sys
 
 import utils
 from utils import (
     VIDEO_EXTENSIONS, ARTIFACT_SUFFIXES, DONE_SUFFIX, DIR_ARTIFACT_SKIP_SUFFIXES,
     _IGNORED_SUBDIRS, CHECKPOINT_SUFFIX, get_claim_heartbeat_interval_seconds,
     get_checkpoint_interval_seconds, get_early_eof_retry_delay_seconds,
-    PauseRequested, CoordinationUnavailableError, ClaimLostError, DIRECTORY_INDEX,
+    PauseRequested, RecoverableProcessingError, CoordinationUnavailableError,
+    ClaimLostError, DIRECTORY_INDEX,
     is_windows_style_path, windows_path_to_wsl, wsl_path_to_windows,
     normalize_posix_path_with_fs, windows_path_to_unc, unc_to_drive_letter,
     _safe_relpath, canonical_video_path,
@@ -31,7 +33,8 @@ from utils import (
     _install_pause_signal_handler, _get_pause_file_path, _pause_requested,
     record_resume_seek, is_video_file, is_leaf_directory, count_videos_in_directory,
     is_tail_eof_within_tolerance, is_checkpoint_retry_deferred,
-    ResumableFrameVideo,
+    ResumableFrameVideo, retry_with_recovery, wait_for_recovery,
+    RECOVERY_CLAIM_NOT_ACQUIRED, RECOVERY_ALREADY_COMPLETED,
 )
 
 _PROCESSING_ROOT_DIR = None
@@ -552,6 +555,9 @@ def detect_objects_in_video(
         fps=fps_safe,
         cv2_module=cv2,
         checkpoint=ckpt,
+        video_path=video_path,
+        file_md5=claim_md5,
+        pipeline_id=_resolve_pipeline_id(),
     )
     if frame_video.requires_full_rebuild:
         print(
@@ -666,7 +672,7 @@ def detect_objects_in_video(
                         reason='memory_allocation_error',
                         frame_video_segments=frame_video.checkpoint_segments(),
                     )
-                except PauseRequested:
+                except (PauseRequested, RecoverableProcessingError):
                     raise
                 except Exception as checkpoint_error:
                     print(f"保存内存异常检查点时出错: {checkpoint_error}")
@@ -680,6 +686,14 @@ def detect_objects_in_video(
                         "内存分配重试仍失败，即时检查点保存失败，"
                         f"将保留最近一次有效检查点: {exc}"
                     )
+                    raise utils._make_recoverable_error(
+                        f'内存异常检查点保存失败，等待恢复后重试: {video_path}',
+                        'memory_error_checkpoint_save',
+                        error=exc,
+                        video_path=video_path,
+                        artifact_path=_pipeline_checkpoint_path(video_path),
+                        frame_number=frame_count,
+                    ) from exc
                 raise
             detected = False
             result = None
@@ -1421,12 +1435,27 @@ def _mark_video_completed(
             if not completed:
                 print(f"视频声明已失效，未写入完成状态: {video_path}")
                 return False
-            marker_ok = write_done_marker(
-                video_path,
-                pipeline_id=pipeline,
-                file_md5=md5,
-                source_snapshot=final_snapshot,
-            ) if pipeline is not None else write_done_marker(video_path)
+            try:
+                marker_ok = write_done_marker(
+                    video_path,
+                    pipeline_id=pipeline,
+                    file_md5=md5,
+                    source_snapshot=final_snapshot,
+                ) if pipeline is not None else write_done_marker(video_path)
+            except RecoverableProcessingError:
+                rollback_kwargs = (
+                    {'pipeline_id': pipeline} if pipeline is not None else {}
+                )
+                retry_with_recovery(
+                    lambda: DIRECTORY_INDEX.rollback_video_completion(
+                        md5, **rollback_kwargs
+                    ),
+                    video_path=video_path,
+                    target_dir=os.path.dirname(video_path) or '.',
+                    pause_checker=_pause_requested,
+                    wait_fn=wait_for_recovery,
+                )
+                raise
             marker_failed = marker_ok is False if pipeline is None else not marker_ok
             if marker_failed:
                 rollback_kwargs = {'pipeline_id': pipeline} if pipeline is not None else {}
@@ -1440,11 +1469,20 @@ def _mark_video_completed(
                 return False
             if pipeline is None:
                 append_yoloed_md5(md5, file_path=video_path)
-            _clear_pipeline_checkpoint(video_path)
+            retry_with_recovery(
+                lambda: _clear_pipeline_checkpoint(video_path) or True,
+                video_path=video_path,
+                artifact_path=_pipeline_checkpoint_path(video_path),
+                target_dir=os.path.dirname(video_path) or '.',
+                pause_checker=_pause_requested,
+                wait_fn=wait_for_recovery,
+            )
             print(
                 f"已写入完成状态（检测数={detection_count}）: {os.path.basename(video_path)}"
             )
             return True
+    except RecoverableProcessingError:
+        raise
     except Exception as e:
         print(f"写入视频完成状态失败: {e}")
     return False
@@ -1524,6 +1562,8 @@ def _mark_directory_done(dir_path, video_file_names, pipeline_id=None):
         if batch_count > 0:
             print(f"已将 {batch_count} 个视频的处理记录写入数据库和yoloed.txt")
         return True
+    except RecoverableProcessingError:
+        raise
     except Exception as e:
         print(f"标记目录完成状态失败: {e}")
         return False
@@ -1559,7 +1599,12 @@ def process_directory_videos(
 
     if not unprocessed_videos:
         print(f"目录中所有 {len(video_file_names)} 个视频已有衍生文件，跳过整个目录")
-        _mark_directory_done(dir_path, video_file_names)
+        retry_with_recovery(
+            lambda: _mark_directory_done(dir_path, video_file_names),
+            target_dir=dir_path,
+            pause_checker=_pause_requested,
+            wait_fn=wait_for_recovery,
+        )
         return 0
 
     skipped_count = len(video_file_names) - len(unprocessed_videos)
@@ -1572,7 +1617,14 @@ def process_directory_videos(
     unresolved_videos = []
     for file in unprocessed_videos:
         file_path = os.path.join(dir_path, file)
-        md5, reason = _get_processing_decision(file_path, acquire_claim=False)
+        md5, reason = retry_with_recovery(
+            lambda: _get_processing_decision(file_path, acquire_claim=False),
+            video_path=file_path,
+            artifact_path=_pipeline_checkpoint_path(file_path),
+            target_dir=os.path.dirname(file_path) or '.',
+            pause_checker=_pause_requested,
+            wait_fn=wait_for_recovery,
+        )
         if md5:
             # 检查视频时长
             cap = cv2.VideoCapture(file_path)
@@ -1613,7 +1665,12 @@ def process_directory_videos(
             return 0
         if unprocessed_videos:
             print(f"目录中剩余 {len(unprocessed_videos)} 个视频经精确检查后均无需处理")
-        _mark_directory_done(dir_path, video_file_names)
+        retry_with_recovery(
+            lambda: _mark_directory_done(dir_path, video_file_names),
+            target_dir=dir_path,
+            pause_checker=_pause_requested,
+            wait_fn=wait_for_recovery,
+        )
         return 0
 
     # 处理视频文件
@@ -1622,32 +1679,64 @@ def process_directory_videos(
     for video_file, duration, md5 in video_files:
         if _pause_requested():
             raise PauseRequested()
-        if not _try_claim_video(md5, video_file):
+        claimed = retry_with_recovery(
+            lambda: _try_claim_video(md5, video_file),
+            video_path=video_file,
+            artifact_path=_pipeline_checkpoint_path(video_file),
+            target_dir=os.path.dirname(video_file) or '.',
+            pause_checker=_pause_requested,
+            wait_fn=wait_for_recovery,
+        )
+        if not claimed:
             print(f"视频已被其他实例抢先声明，跳过: {video_file}")
             claim_blocked_videos.append(video_file)
             continue
         try:
             if duration == float("inf"):
                 print(f"提示: 无法获取视频时长，仍尝试处理: {video_file}")
-            print(f"开始处理视频文件: {video_file}")
-            detections = detect_objects_in_video(
-                video_file,
-                target_item,
-                claim_md5=md5,
-                show_window=False,
-                save_crops=save_mosaic_switch,
-                save_training_data=False,
-                all_objects=all_objects_switch,
-                save_mosaic=save_mosaic_switch,
-                save_timestamps=save_timestamps_switch,
+            def _process_claimed_video_once():
+                """执行一次视频处理和完成态提交。"""
+                print(f"开始处理视频文件: {video_file}")
+                detections = detect_objects_in_video(
+                    video_file,
+                    target_item,
+                    claim_md5=md5,
+                    show_window=False,
+                    save_crops=save_mosaic_switch,
+                    save_training_data=False,
+                    all_objects=all_objects_switch,
+                    save_mosaic=save_mosaic_switch,
+                    save_timestamps=save_timestamps_switch,
+                )
+                if not _mark_video_completed(video_file, detections, file_md5=md5):
+                    return False, None
+                if _pause_requested():
+                    raise PauseRequested()
+                return True, detections
+
+            outcome = retry_with_recovery(
+                _process_claimed_video_once,
+                video_path=video_file,
+                artifact_path=_pipeline_checkpoint_path(video_file),
+                target_dir=os.path.dirname(video_file) or '.',
+                release_claim=lambda: _release_claim_safely(md5),
+                reacquire_claim=lambda: _try_claim_video(md5, video_file),
+                is_already_complete=lambda: has_existing_artifacts(video_file),
+                pause_checker=_pause_requested,
+                wait_fn=wait_for_recovery,
             )
-            if not _mark_video_completed(video_file, detections, file_md5=md5):
+            if outcome is RECOVERY_ALREADY_COMPLETED:
+                continue
+            if outcome is RECOVERY_CLAIM_NOT_ACQUIRED:
+                claim_blocked_videos.append(video_file)
+                continue
+            if not outcome[0]:
                 failed_videos.append(video_file)
                 continue
             completed_count += 1
-            if _pause_requested():
-                raise PauseRequested()
         except (PauseRequested, KeyboardInterrupt):
+            raise
+        except RecoverableProcessingError:
             raise
         except Exception:
             _LOGGER.error("Video failed: %s\n%s", video_file, traceback.format_exc())
@@ -1677,7 +1766,12 @@ def process_directory_videos(
         return completed_count
 
     # 所有视频处理完成后，标记目录为已全部处理
-    _mark_directory_done(dir_path, video_file_names)
+    retry_with_recovery(
+        lambda: _mark_directory_done(dir_path, video_file_names),
+        target_dir=dir_path,
+        pause_checker=_pause_requested,
+        wait_fn=wait_for_recovery,
+    )
     return completed_count
 
 
@@ -1945,6 +2039,8 @@ if __name__ == "__main__":
                                     raise PauseRequested()
                             except (PauseRequested, KeyboardInterrupt):
                                 raise
+                            except RecoverableProcessingError:
+                                raise
                             except Exception:
                                 _LOGGER.error(
                                     "Video failed: %s\n%s",
@@ -2001,6 +2097,8 @@ if __name__ == "__main__":
                                     raise PauseRequested()
                             except (PauseRequested, KeyboardInterrupt):
                                 raise
+                            except RecoverableProcessingError:
+                                raise
                             except Exception:
                                 _LOGGER.error(
                                     "Video failed: %s\n%s",
@@ -2011,9 +2109,28 @@ if __name__ == "__main__":
                                 _release_claim_safely(md5)
                     else:
                         print(f"视频无需处理或已被占用，跳过: {video_path}")
-    except CoordinationUnavailableError as e:
-        print(f"\n共享声明数据库不可用，本轮已安全暂停: {e}")
-        raise SystemExit(2)
+    except RecoverableProcessingError as e:
+        while True:
+            print(f"\n检测到可恢复故障，等待恢复探测: {e}")
+            wait_for_recovery(
+                e,
+                target_dir=_PROCESSING_ROOT_DIR,
+                video_path=getattr(e, 'video_path', None),
+                artifact_path=getattr(e, 'artifact_path', None),
+                pause_checker=_pause_requested,
+            )
+            try:
+                os.execv(
+                    sys.executable,
+                    [sys.executable, os.path.abspath(__file__), *sys.argv[1:]],
+                )
+            except OSError as exc:
+                e = utils._make_recoverable_error(
+                    '恢复后重新启动当前入口失败，等待后重试',
+                    'entrypoint_restart',
+                    error=exc,
+                    artifact_path=sys.executable,
+                )
     except PauseRequested:
         print("\n已按请求暂停，本轮处理已停止。")
         raise SystemExit(0)

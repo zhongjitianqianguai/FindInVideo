@@ -342,6 +342,82 @@ class VideoCompletionGuardTests(unittest.TestCase):
                 )
                 clear_mock.assert_not_called()
 
+    def test_recoverable_marker_failure_rolls_back_before_retry(self):
+        """marker 瞬时故障也必须先撤销数据库完成态，再交给外层等待。"""
+        for module_path, _needs_model in ENTRYPOINTS:
+            with self.subTest(entrypoint=module_path.name):
+                module = load_entrypoint(module_path)
+                module._ACTIVE_PIPELINE_ID = PIPELINE_ID
+                calls = []
+
+                class FakeIndex:
+                    def complete_claimed_video(self, **kwargs):
+                        calls.append(('complete', kwargs))
+                        return True
+
+                    def rollback_video_completion(self, md5, **kwargs):
+                        calls.append(('rollback', md5, kwargs))
+                        return True
+
+                marker_error = module.RecoverableProcessingError(
+                    'marker 暂时不可写', stage='done_marker_write'
+                )
+                snapshot = {'size': 5, 'mtime_ns': 123}
+                with mock.patch.object(module, 'DIRECTORY_INDEX', FakeIndex()), \
+                     mock.patch.object(
+                         module, 'write_done_marker', side_effect=marker_error
+                     ), mock.patch.object(module, '_clear_checkpoint') as clear_mock, \
+                     self.assertRaises(module.RecoverableProcessingError):
+                    module._mark_video_completed(
+                        'video.mp4',
+                        [1.0],
+                        file_md5='video-md5',
+                        source_snapshot=snapshot,
+                    )
+
+                self.assertEqual(
+                    calls[1],
+                    ('rollback', 'video-md5', {'pipeline_id': PIPELINE_ID}),
+                )
+                clear_mock.assert_not_called()
+
+    def test_checkpoint_cleanup_waits_without_reprocessing_completion(self):
+        """完成态已落库后仅重试 checkpoint 清理，不重复提交完成态。"""
+        for module_path, _needs_model in ENTRYPOINTS:
+            with self.subTest(entrypoint=module_path.name):
+                module = load_entrypoint(module_path)
+                module._ACTIVE_PIPELINE_ID = PIPELINE_ID
+                complete_calls = []
+
+                class FakeIndex:
+                    def complete_claimed_video(self, **kwargs):
+                        complete_calls.append(kwargs)
+                        return True
+
+                clear_error = module.RecoverableProcessingError(
+                    'checkpoint 暂时无法删除', stage='checkpoint_clear'
+                )
+                clear_mock = mock.Mock(side_effect=[clear_error, True])
+                wait_mock = mock.Mock(return_value=True)
+                snapshot = {'size': 5, 'mtime_ns': 123}
+                with mock.patch.object(module, 'DIRECTORY_INDEX', FakeIndex()), \
+                     mock.patch.object(module, 'write_done_marker', return_value=True), \
+                     mock.patch.object(
+                         module, '_clear_pipeline_checkpoint', clear_mock
+                     ), mock.patch.object(
+                         module, 'wait_for_recovery', wait_mock
+                     ):
+                    self.assertTrue(module._mark_video_completed(
+                        'video.mp4',
+                        [1.0],
+                        file_md5='video-md5',
+                        source_snapshot=snapshot,
+                    ))
+
+                self.assertEqual(len(complete_calls), 1)
+                self.assertEqual(clear_mock.call_count, 2)
+                self.assertEqual(wait_mock.call_count, 1)
+
 
 if __name__ == '__main__':
     unittest.main()

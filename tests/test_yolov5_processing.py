@@ -446,6 +446,56 @@ class YoloV5ProcessingTests(unittest.TestCase):
         )
         self.assertEqual(events[-1], ('release', 'md5-sample'))
 
+    def test_directory_recoverable_failure_waits_and_reacquires_claim(self):
+        """YOLOv5 入口在可恢复故障后释放声明并重新领取再试。"""
+        events = []
+
+        class FakeDirectoryIndex:
+            def try_claim_video(self, md5, path):
+                events.append(('claim', md5, path))
+                return True
+
+            def release_claim(self, md5):
+                events.append(('release', md5))
+                return True
+
+        detector = mock.Mock(side_effect=[
+            self.module.RecoverableProcessingError(
+                '模拟共享目录暂时不可用', stage='test_recovery',
+            ),
+            self.module.VideoProcessingResult.succeeded([]),
+        ])
+        with mock.patch.object(
+            self.module.os, 'listdir', return_value=['sample.mp4']
+        ), mock.patch.object(
+            self.module, 'is_video_file', return_value=True
+        ), mock.patch.object(
+            self.module, 'should_process', return_value=(True, None)
+        ), mock.patch.object(
+            self.module, 'get_file_md5_cached', return_value='md5-sample'
+        ), mock.patch.object(
+            self.module, 'DIRECTORY_INDEX', FakeDirectoryIndex()
+        ), mock.patch.object(
+            self.module, 'detect_objects_with_frame_analysis', detector
+        ), mock.patch.object(
+            self.module, '_mark_video_completed', return_value=True
+        ), mock.patch.object(
+            self.module, 'wait_for_recovery',
+            side_effect=lambda *args, **kwargs: events.append(('wait', args[0])),
+        ), mock.patch.object(
+            self.module, '_pause_requested', return_value=False
+        ):
+            completed = self.module.process_directory_videos(
+                'root', 'person', use_detectpy=True,
+            )
+
+        self.assertEqual(completed, 1)
+        self.assertEqual(detector.call_count, 2)
+        self.assertEqual(
+            [event[0] for event in events],
+            ['claim', 'release', 'wait', 'claim', 'release'],
+        )
+
     def test_explicit_pipeline_uses_one_snapshot_for_claim_completion_and_marker(self):
         pipeline_id = 'yolov5:test-model:profile'
         events = []
@@ -540,6 +590,40 @@ class YoloV5ProcessingTests(unittest.TestCase):
         self.assertEqual(events[-1][0], 'rollback')
         self.assertEqual(events[-1][2]['pipeline_id'], pipeline_id)
         append_yoloed.assert_not_called()
+
+    def test_recoverable_marker_failure_rolls_back_before_retry(self):
+        pipeline_id = 'yolov5:test-model:profile'
+        source_snapshot = {'size': 5, 'mtime_ns': 7}
+        events = []
+
+        class FakeDirectoryIndex:
+            def complete_claimed_video(self, **kwargs):
+                events.append(('complete', kwargs))
+                return True
+
+            def rollback_video_completion(self, md5, **kwargs):
+                events.append(('rollback', md5, kwargs))
+                return True
+
+        marker_error = self.module.RecoverableProcessingError(
+            'marker 暂时不可写', stage='done_marker_write'
+        )
+        with mock.patch.object(
+            self.module, 'DIRECTORY_INDEX', FakeDirectoryIndex()
+        ), mock.patch.object(
+            self.module, 'write_done_marker', side_effect=marker_error
+        ), self.assertRaises(self.module.RecoverableProcessingError):
+            self.module._mark_video_completed(
+                'sample.mp4',
+                self.module.VideoProcessingResult.succeeded([]),
+                file_md5='md5-sample',
+                model_path='models/test.pt',
+                pipeline_id=pipeline_id,
+                source_snapshot=source_snapshot,
+            )
+
+        self.assertEqual(events[-1][0], 'rollback')
+        self.assertEqual(events[-1][2]['pipeline_id'], pipeline_id)
 
     def test_explicit_pipeline_never_uses_legacy_yoloed_skip(self):
         pipeline_id = 'yolov5:test-model:profile'

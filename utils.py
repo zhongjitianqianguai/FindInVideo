@@ -14,6 +14,7 @@ import errno
 import subprocess
 import shutil
 import threading
+import tempfile
 import ntpath
 import ctypes
 import re
@@ -274,6 +275,10 @@ EARLY_EOF_RETRY_DEFAULT_SECONDS = 21600
 EARLY_EOF_RETRY_MAX_DEFAULT_SECONDS = 86400
 # 合并分段会额外生成一份临时 MP4；预留固定空间避免合并过程把磁盘写满。
 MERGE_DISK_RESERVE_BYTES = 64 * 1024 * 1024
+# 可恢复故障默认每 30 秒探测一次目标目录；测试或运维可通过环境变量覆盖。
+RECOVERY_RETRY_DEFAULT_SECONDS = 30.0
+RECOVERY_CLAIM_NOT_ACQUIRED = object()
+RECOVERY_ALREADY_COMPLETED = object()
 
 
 def normalize_pipeline_id(pipeline_id=None):
@@ -412,6 +417,20 @@ def get_early_eof_retry_delay_seconds(retry_count):
     except (TypeError, ValueError):
         maximum = max(base, EARLY_EOF_RETRY_MAX_DEFAULT_SECONDS)
     return min(maximum, base * (2 ** min(retry_number - 1, 20)))
+
+
+def get_recovery_retry_seconds():
+    """读取可恢复故障的探测间隔，默认 30 秒。"""
+    try:
+        configured = float(os.environ.get(
+            'FINDINVIDEO_RECOVERY_RETRY_SECONDS',
+            str(RECOVERY_RETRY_DEFAULT_SECONDS),
+        ))
+    except (TypeError, ValueError):
+        configured = RECOVERY_RETRY_DEFAULT_SECONDS
+    if configured < 0:
+        return RECOVERY_RETRY_DEFAULT_SECONDS
+    return max(1.0, configured)
 
 
 # ---------------------------------------------------------------------------
@@ -920,6 +939,535 @@ def _legacy_artifact_basename_v1(video_path, max_length=80):
 # Checkpoint 系统
 # ---------------------------------------------------------------------------
 
+_RECOVERY_LOG_LOCK = threading.Lock()
+
+
+def _recovery_log_path():
+    """返回本机恢复事件 JSONL 路径。"""
+    configured = os.environ.get('FINDINVIDEO_RECOVERY_LOG_PATH')
+    if configured:
+        return os.path.abspath(os.path.expanduser(configured))
+    try:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+    except Exception:
+        base_dir = os.getcwd()
+    return os.path.join(base_dir, 'logs', 'recovery_events.jsonl')
+
+
+def _append_recovery_event_local(payload):
+    """追加本机 JSONL 恢复事件；日志故障不得覆盖业务故障。"""
+    path = _recovery_log_path()
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        line = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+        with _RECOVERY_LOG_LOCK:
+            with open(path, 'a', encoding='utf-8', errors='ignore') as handle:
+                handle.write(line + '\n')
+                handle.flush()
+                os.fsync(handle.fileno())
+        return True
+    except Exception:
+        return False
+
+
+def _path_recovery_snapshot(path):
+    """读取文件存在性、大小和父目录状态，失败字段保留为 None。"""
+    result = {
+        'path': str(path) if path else None,
+        'exists': None,
+        'size': None,
+        'is_file': None,
+        'is_dir': None,
+    }
+    if not path:
+        return result
+    try:
+        result['exists'] = bool(os.path.exists(path))
+        result['is_file'] = bool(os.path.isfile(path))
+        result['is_dir'] = bool(os.path.isdir(path))
+        if result['exists']:
+            result['size'] = int(os.path.getsize(path))
+    except Exception as exc:
+        result['stat_error'] = str(exc)
+    return result
+
+
+def build_recovery_failure_snapshot(
+    stage,
+    error=None,
+    video_path=None,
+    artifact_path=None,
+    **extra,
+):
+    """构造可持久化的故障快照，必须在清理失败现场前调用。"""
+    timestamp = time.time()
+    primary_path = artifact_path or video_path
+    parent_dir = None
+    if primary_path:
+        try:
+            parent_dir = os.path.dirname(os.path.abspath(str(primary_path))) or '.'
+        except Exception:
+            parent_dir = None
+    error_errno = getattr(error, 'errno', None) if error is not None else None
+    error_winerror = getattr(error, 'winerror', None) if error is not None else None
+    snapshot = {
+        'failure_id': uuid.uuid4().hex,
+        'event': 'recoverable_error',
+        'event_type': 'recoverable_error',
+        'stage': str(stage),
+        'timestamp': timestamp,
+        'time': timestamp,
+        'occurred_at': timestamp,
+        'pid': _PROCESS_PID,
+        'host_name': _PROCESS_HOST_NAME,
+        'host': _PROCESS_HOST_NAME,
+        'host_id': _PROCESS_HOST_ID,
+        'video_path': str(video_path) if video_path else None,
+        'artifact_path': str(artifact_path) if artifact_path else None,
+        'exception_class': type(error).__name__ if error is not None else None,
+        'exception_message': str(error) if error is not None else None,
+        'exception_type': type(error).__name__ if error is not None else None,
+        'error_message': str(error) if error is not None else None,
+        'errno': error_errno,
+        'winerror': error_winerror,
+        'parent_dir': parent_dir,
+        'parent_directory': parent_dir,
+        'parent_dir_exists': None,
+        'parent_dir_is_dir': None,
+        'parent_dir_writable': None,
+        'free_space_bytes': None,
+        'disk_total_bytes': None,
+        'disk_used_bytes': None,
+        'file_exists': None,
+        'file_size': None,
+        'file_is_file': None,
+        'file_is_dir': None,
+    }
+    if primary_path:
+        file_state = _path_recovery_snapshot(primary_path)
+        snapshot['file_exists'] = file_state.get('exists')
+        snapshot['file_size'] = file_state.get('size')
+        snapshot['file_is_file'] = file_state.get('is_file')
+        snapshot['file_is_dir'] = file_state.get('is_dir')
+        snapshot['file_state'] = file_state
+    if video_path and str(video_path) != str(primary_path):
+        snapshot['video_state'] = _path_recovery_snapshot(video_path)
+    if artifact_path and str(artifact_path) != str(primary_path):
+        snapshot['artifact_state'] = _path_recovery_snapshot(artifact_path)
+    if parent_dir:
+        try:
+            parent_stat = os.stat(parent_dir)
+            snapshot['parent_dir_exists'] = True
+            snapshot['parent_dir_is_dir'] = os.path.isdir(parent_dir)
+            snapshot['parent_dir_writable'] = bool(os.access(parent_dir, os.W_OK))
+            snapshot['parent_dir_mtime'] = getattr(parent_stat, 'st_mtime', None)
+        except Exception as exc:
+            snapshot['parent_dir_error'] = str(exc)
+        try:
+            usage = shutil.disk_usage(parent_dir)
+            snapshot['free_space_bytes'] = int(usage.free)
+            snapshot['disk_total_bytes'] = int(usage.total)
+            snapshot['disk_used_bytes'] = int(usage.used)
+        except Exception as exc:
+            snapshot['free_space_error'] = str(exc)
+    snapshot.update(extra)
+    return snapshot
+
+
+def record_recovery_event(
+    event_type,
+    failure_id=None,
+    video_path=None,
+    file_md5=None,
+    pipeline_id=None,
+    **details,
+):
+    """同时写共享审计库和本机 JSONL，所有写入均为尽力操作。"""
+    timestamp = details.pop('timestamp', time.time())
+    resolved_failure_id = failure_id or details.get('failure_id')
+    if resolved_failure_id:
+        details['failure_id'] = str(resolved_failure_id)
+    details.setdefault('event', str(event_type))
+    details.setdefault('timestamp', timestamp)
+    details.setdefault('occurred_at', timestamp)
+    details.setdefault('pid', _PROCESS_PID)
+    details.setdefault('host_name', _PROCESS_HOST_NAME)
+    details.setdefault('host', _PROCESS_HOST_NAME)
+    details.setdefault('host_id', _PROCESS_HOST_ID)
+    details.setdefault('video_path', str(video_path) if video_path else None)
+    details.setdefault('file_md5', str(file_md5) if file_md5 else None)
+    details.setdefault('pipeline_id', normalize_pipeline_id(pipeline_id))
+    shared_ok = False
+    try:
+        shared_details = dict(details)
+        shared_details.pop('video_path', None)
+        shared_details.pop('file_md5', None)
+        shared_details.pop('pipeline_id', None)
+        shared_ok = bool(record_processing_event(
+            event_type,
+            video_path=video_path,
+            file_md5=file_md5,
+            pipeline_id=pipeline_id,
+            **shared_details,
+        ))
+    except Exception:
+        shared_ok = False
+    local_payload = {
+        'event_type': str(event_type),
+        'event': str(event_type),
+        'failure_id': details.get('failure_id'),
+        'timestamp': timestamp,
+        'time': timestamp,
+        'occurred_at': timestamp,
+        'pid': _PROCESS_PID,
+        'host_name': _PROCESS_HOST_NAME,
+        'host': _PROCESS_HOST_NAME,
+        'host_id': _PROCESS_HOST_ID,
+        'video_path': str(video_path) if video_path else None,
+        'artifact_path': details.get('artifact_path'),
+        'stage': details.get('stage'),
+        'exception_class': details.get('exception_class'),
+        'exception_message': details.get('exception_message'),
+        'errno': details.get('errno'),
+        'winerror': details.get('winerror'),
+        'file_md5': str(file_md5) if file_md5 else None,
+        'pipeline_id': normalize_pipeline_id(pipeline_id),
+        'details': details,
+    }
+    local_ok = _append_recovery_event_local(local_payload)
+    return shared_ok or local_ok
+
+
+def record_recoverable_failure(
+    stage,
+    error=None,
+    video_path=None,
+    artifact_path=None,
+    file_md5=None,
+    pipeline_id=None,
+    **extra,
+):
+    """记录 recoverable_error，并返回关联的 failure_id。"""
+    snapshot = build_recovery_failure_snapshot(
+        stage,
+        error=error,
+        video_path=video_path,
+        artifact_path=artifact_path,
+        **extra,
+    )
+    event_details = dict(snapshot)
+    event_details.pop('failure_id', None)
+    event_details.pop('event_type', None)
+    event_details.pop('video_path', None)
+    event_details.pop('file_md5', None)
+    event_details.pop('pipeline_id', None)
+    record_recovery_event(
+        'recoverable_error',
+        failure_id=snapshot['failure_id'],
+        video_path=video_path,
+        file_md5=file_md5,
+        pipeline_id=pipeline_id,
+        **event_details,
+    )
+    return snapshot['failure_id']
+
+
+def _make_recoverable_error(
+    message,
+    stage,
+    error=None,
+    video_path=None,
+    artifact_path=None,
+    file_md5=None,
+    pipeline_id=None,
+    **extra,
+):
+    """先记录故障现场，再创建可恢复异常。"""
+    failure_id = record_recoverable_failure(
+        stage,
+        error=error,
+        video_path=video_path,
+        artifact_path=artifact_path,
+        file_md5=file_md5,
+        pipeline_id=pipeline_id,
+        **extra,
+    )
+    return RecoverableProcessingError(
+        message,
+        failure_id=failure_id,
+        stage=stage,
+        video_path=video_path,
+        artifact_path=artifact_path,
+    )
+
+
+def probe_recovery_target(target_dir):
+    """探测目标目录、可用空间以及临时文件读写链路。"""
+    temp_path = None
+    file_handle = None
+    try:
+        target_dir = os.path.abspath(os.fspath(target_dir))
+        if not os.path.isdir(target_dir):
+            raise FileNotFoundError(
+                errno.ENOENT,
+                f'恢复目标目录不存在: {target_dir}',
+                target_dir,
+            )
+        usage = shutil.disk_usage(target_dir)
+        if int(usage.free) <= 0:
+            raise OSError(errno.ENOSPC, f'恢复目标目录没有可用空间: {target_dir}')
+        fd, temp_path = tempfile.mkstemp(
+            prefix='.findinvideo-recovery-', suffix='.tmp', dir=target_dir,
+        )
+        file_handle = os.fdopen(fd, 'w+b')
+        token = uuid.uuid4().hex.encode('ascii')
+        file_handle.write(token)
+        file_handle.flush()
+        os.fsync(file_handle.fileno())
+        file_handle.seek(0)
+        if file_handle.read() != token:
+            raise OSError(errno.EIO, f'恢复探测临时文件读回校验失败: {temp_path}')
+        file_handle.close()
+        file_handle = None
+        os.remove(temp_path)
+        temp_path = None
+        return True, {
+            'target_dir': target_dir,
+            'free_space_bytes': int(usage.free),
+        }
+    except Exception as exc:
+        if file_handle is not None:
+            try:
+                file_handle.close()
+            except Exception:
+                pass
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+        return False, exc
+
+
+def _pause_during_recovery(pause_checker=None):
+    """恢复等待的统一主动暂停检查。"""
+    checker = pause_checker
+    if checker is None:
+        checker = globals().get('_pause_requested')
+    try:
+        return bool(checker and checker())
+    except PauseRequested:
+        raise
+    except Exception:
+        return False
+
+
+def wait_for_recovery(
+    failure=None,
+    target_dir=None,
+    video_path=None,
+    artifact_path=None,
+    pause_checker=None,
+    sleep_fn=None,
+):
+    """等待目标目录恢复；只响应明确的可恢复异常，不吞掉普通错误。"""
+    failure_id = getattr(failure, 'failure_id', None) if failure is not None else None
+    stage = getattr(failure, 'stage', None) if failure is not None else None
+    if video_path is None and failure is not None:
+        video_path = getattr(failure, 'video_path', None)
+    if artifact_path is None and failure is not None:
+        artifact_path = getattr(failure, 'artifact_path', None)
+    if not failure_id:
+        failure_id = record_recoverable_failure(
+            stage or 'recovery_wait',
+            error=failure,
+            video_path=video_path,
+            artifact_path=artifact_path,
+        )
+    target = target_dir
+    if stage == 'coordination_database' and artifact_path:
+        target = os.path.dirname(os.path.abspath(str(artifact_path))) or '.'
+    target_is_explicit = bool(target_dir)
+    if not target:
+        target = artifact_path or video_path
+    if target and not target_is_explicit and not os.path.isdir(str(target)):
+        target = os.path.dirname(os.path.abspath(str(target))) or '.'
+    target = target or os.getcwd()
+    interval = get_recovery_retry_seconds()
+    sleeper = sleep_fn or time.sleep
+    while True:
+        if _pause_during_recovery(pause_checker):
+            record_recovery_event(
+                'pause_requested',
+                failure_id=failure_id,
+                video_path=video_path,
+                stage=stage or 'recovery_wait',
+                source='recovery_wait',
+            )
+            raise PauseRequested('收到主动暂停请求，已停止恢复等待')
+        record_recovery_event(
+            'recovery_wait',
+            failure_id=failure_id,
+            video_path=video_path,
+            stage=stage or 'recovery_wait',
+            target_dir=target,
+            retry_seconds=interval,
+        )
+        if interval > 0:
+            remaining = interval
+            while remaining > 0:
+                if _pause_during_recovery(pause_checker):
+                    record_recovery_event(
+                        'pause_requested',
+                        failure_id=failure_id,
+                        video_path=video_path,
+                        stage='recovery_wait',
+                        source='recovery_wait',
+                    )
+                    raise PauseRequested('收到主动暂停请求，已停止恢复等待')
+                delay = min(1.0, remaining)
+                started = time.monotonic()
+                sleeper(delay)
+                elapsed = max(delay, time.monotonic() - started)
+                remaining -= elapsed
+        probe_ok, probe_result = probe_recovery_target(target)
+        if probe_ok:
+            record_recovery_event(
+                'recovery_probe_succeeded',
+                failure_id=failure_id,
+                video_path=video_path,
+                stage=stage or 'recovery_wait',
+                target_dir=target,
+                probe=probe_result,
+            )
+            return True
+        probe_snapshot = build_recovery_failure_snapshot(
+            'recovery_probe',
+            error=probe_result,
+            video_path=video_path,
+            artifact_path=artifact_path,
+            target_dir=target,
+            probe_error_class=type(probe_result).__name__,
+            probe_error_message=str(probe_result),
+        )
+        probe_details = dict(probe_snapshot)
+        probe_details.pop('failure_id', None)
+        probe_details.pop('event_type', None)
+        probe_details.pop('video_path', None)
+        probe_details.pop('file_md5', None)
+        probe_details.pop('pipeline_id', None)
+        record_recovery_event(
+            'recovery_probe_failed',
+            failure_id=failure_id,
+            video_path=video_path,
+            **probe_details,
+        )
+        if _pause_during_recovery(pause_checker):
+            record_recovery_event(
+                'pause_requested',
+                failure_id=failure_id,
+                video_path=video_path,
+                stage='recovery_wait',
+                source='recovery_wait',
+            )
+            raise PauseRequested('收到主动暂停请求，已停止恢复等待')
+
+
+def retry_with_recovery(
+    operation,
+    video_path=None,
+    artifact_path=None,
+    target_dir=None,
+    release_claim=None,
+    reacquire_claim=None,
+    is_already_complete=None,
+    pause_checker=None,
+    wait_fn=None,
+):
+    """执行操作并对明确可恢复故障等待后重试，claim 在等待前释放。"""
+    pending = None
+    last_failure = None
+    while True:
+        if pending is None:
+            try:
+                result = operation()
+            except (PauseRequested, KeyboardInterrupt):
+                raise
+            except RecoverableProcessingError as exc:
+                pending = exc
+            else:
+                if last_failure is not None:
+                    record_recovery_event(
+                        'recovery_resumed',
+                        failure_id=getattr(last_failure, 'failure_id', None),
+                        video_path=video_path,
+                        stage=getattr(last_failure, 'stage', None) or 'processing',
+                        artifact_path=artifact_path,
+                        outcome='operation_succeeded',
+                    )
+                return result
+        failure = pending
+        last_failure = failure
+        if not getattr(failure, 'failure_id', None):
+            failure.failure_id = record_recoverable_failure(
+                getattr(failure, 'stage', None) or 'processing',
+                error=failure,
+                video_path=video_path,
+                artifact_path=artifact_path,
+            )
+        if callable(release_claim):
+            try:
+                release_claim()
+            except Exception:
+                pass
+        waiter = wait_fn or wait_for_recovery
+        waiter(
+            failure,
+            target_dir=target_dir,
+            video_path=video_path,
+            artifact_path=artifact_path,
+            pause_checker=pause_checker,
+        )
+        if _pause_during_recovery(pause_checker):
+            record_recovery_event(
+                'pause_requested',
+                failure_id=getattr(failure, 'failure_id', None),
+                video_path=video_path,
+                stage='recovery_wait',
+                source='recovery_wait',
+            )
+            raise PauseRequested('收到主动暂停请求，已停止恢复重试')
+        if callable(reacquire_claim):
+            try:
+                acquired = bool(reacquire_claim())
+            except (PauseRequested, KeyboardInterrupt):
+                raise
+            except RecoverableProcessingError as exc:
+                pending = exc
+                continue
+            if not acquired:
+                if callable(is_already_complete):
+                    try:
+                        if is_already_complete():
+                            record_recovery_event(
+                                'recovery_resumed',
+                                failure_id=getattr(failure, 'failure_id', None),
+                                video_path=video_path,
+                                stage=getattr(failure, 'stage', None) or 'processing',
+                                artifact_path=artifact_path,
+                                outcome='completed_by_other_instance',
+                            )
+                            return RECOVERY_ALREADY_COMPLETED
+                    except (PauseRequested, KeyboardInterrupt):
+                        raise
+                    except RecoverableProcessingError as exc:
+                        pending = exc
+                        continue
+                return RECOVERY_CLAIM_NOT_ACQUIRED
+        pending = None
+
 def _checkpoint_path(video_path, pipeline_id=None):
     video_dir = os.path.dirname(video_path) or '.'
     base = safe_artifact_basename(video_path, pipeline_id=pipeline_id)
@@ -1114,6 +1662,16 @@ def _save_checkpoint(
     except Exception as e:
         # 正式 checkpoint 不动；只清理本次写入留下的临时文件，避免 0 字节
         # .tmp 在磁盘恢复后被误认为可恢复状态。
+        failure_id = record_recoverable_failure(
+            'checkpoint_save',
+            error=e,
+            video_path=video_path,
+            artifact_path=tmp,
+            file_md5=claim_md5,
+            pipeline_id=payload['pipeline_id'],
+            checkpoint_path=path,
+            next_frame=payload['next_frame'],
+        )
         if tmp_started and os.path.exists(tmp):
             try:
                 os.remove(tmp)
@@ -1124,6 +1682,7 @@ def _save_checkpoint(
             video_path=video_path,
             file_md5=claim_md5,
             pipeline_id=payload['pipeline_id'],
+            failure_id=failure_id,
             next_frame=payload['next_frame'],
             reason=payload['reason'],
             error=str(e),
@@ -1145,11 +1704,33 @@ def _save_checkpoint(
 
 
 def _save_checkpoint_or_pause(saver, video_path, **kwargs):
-    """保存必要检查点；失败时立即安全暂停，禁止继续推理或标记完成。"""
+    """保存必要检查点；失败时进入可恢复等待，禁止继续推理或标记完成。"""
     if saver(video_path, **kwargs):
         return True
-    raise PauseRequested(
-        f'检查点保存失败，已安全停止当前处理: {video_path}'
+    failure_id = record_recoverable_failure(
+        'checkpoint_save',
+        error=OSError(errno.EIO, '检查点保存函数返回失败'),
+        video_path=video_path,
+        artifact_path=_checkpoint_path(
+            video_path, pipeline_id=kwargs.get('pipeline_id')
+        ),
+        file_md5=kwargs.get('claim_md5'),
+        pipeline_id=kwargs.get('pipeline_id'),
+        checkpoint_reason=kwargs.get('reason'),
+        next_frame=kwargs.get('next_frame'),
+    )
+    if kwargs.get('reason') == 'pause_requested':
+        raise PauseRequested(
+            f'主动暂停时检查点保存失败，已按请求退出: {video_path}'
+        )
+    raise RecoverableProcessingError(
+        f'检查点保存失败，等待恢复后重试: {video_path}',
+        failure_id=failure_id,
+        stage='checkpoint_save',
+        video_path=video_path,
+        artifact_path=_checkpoint_path(
+            video_path, pipeline_id=kwargs.get('pipeline_id')
+        ),
     )
 
 
@@ -1165,13 +1746,27 @@ def _clear_checkpoint(video_path, pipeline_id=None):
             )
             return True
     except Exception as e:
+        failure_id = record_recoverable_failure(
+            'checkpoint_clear',
+            error=e,
+            video_path=video_path,
+            artifact_path=path,
+            pipeline_id=pipeline_id,
+        )
         record_processing_event(
             'checkpoint_clear_failed',
             video_path=video_path,
             pipeline_id=pipeline_id,
+            failure_id=failure_id,
             error=str(e),
         )
-        return False
+        raise RecoverableProcessingError(
+            f'检查点清理失败，等待恢复后重试: {path}',
+            failure_id=failure_id,
+            stage='checkpoint_clear',
+            video_path=video_path,
+            artifact_path=path,
+        ) from e
     return False
 
 
@@ -1207,19 +1802,57 @@ def is_checkpoint_retry_deferred(video_path, pipeline_id=None, now=None):
 class ResumableFrameVideo:
     """将检测帧写入可恢复分段，并在成功结束时原子合并。"""
 
-    def __init__(self, final_path, fps, cv2_module, checkpoint=None):
+    def __init__(
+        self,
+        final_path,
+        fps,
+        cv2_module,
+        checkpoint=None,
+        video_path=None,
+        file_md5=None,
+        pipeline_id=None,
+    ):
         self.final_path = os.path.abspath(str(final_path))
         self.video_dir = os.path.dirname(self.final_path) or '.'
         self.final_name = os.path.basename(self.final_path)
         self.fps = float(fps) if fps and float(fps) > 0 else 25.0
         self.cv2 = cv2_module
+        self.video_path = video_path
+        self.file_md5 = file_md5
+        self.pipeline_id = normalize_pipeline_id(pipeline_id)
         self.checkpoint = checkpoint or {}
         self.segments = []
         self.active_writer = None
         self.active_path = None
         self.active_start_frame = None
         self.requires_full_rebuild = False
+        self._last_segment_validation = {}
         self._load_checkpoint_segments()
+
+    def _raise_recoverable(self, message, stage, error=None, artifact_path=None, **details):
+        """记录当前现场并返回可恢复异常。"""
+        return _make_recoverable_error(
+            message,
+            stage,
+            error=error,
+            video_path=self.video_path,
+            artifact_path=artifact_path or self.final_path,
+            file_md5=self.file_md5,
+            pipeline_id=self.pipeline_id,
+            **details,
+        )
+
+    def _segment_validation_details(self):
+        """返回完整的 OpenCV 分段校验字段，便于区分失败阶段。"""
+        details = {
+            'capture_created': None,
+            'isOpened': None,
+            'read_success': None,
+            'frame_present': None,
+            'frame_size': None,
+        }
+        details.update(self._last_segment_validation or {})
+        return details
 
     def _load_checkpoint_segments(self):
         """加载已封口分段；旧检查点沿用原有最终文件作为第一段。"""
@@ -1253,15 +1886,32 @@ class ResumableFrameVideo:
     def _is_readable_segment(self, path):
         """用当前 OpenCV 验证分段至少能打开并读出一帧。"""
         capture = None
+        details = {
+            'capture_created': False,
+            'isOpened': None,
+            'read_success': None,
+            'frame_present': None,
+            'frame_size': None,
+        }
         try:
             capture = self.cv2.VideoCapture(path)
+            details['capture_created'] = capture is not None
             is_opened = getattr(capture, 'isOpened', None)
-            if not callable(is_opened) or not is_opened():
+            details['isOpened'] = bool(is_opened()) if callable(is_opened) else False
+            if not details['isOpened']:
+                self._last_segment_validation = details
                 return False
             success, frame = capture.read()
+            details['read_success'] = bool(success)
+            details['frame_present'] = frame is not None
             frame_size = getattr(frame, 'size', 1) if frame is not None else 0
+            details['frame_size'] = int(frame_size or 0)
+            self._last_segment_validation = details
             return bool(success and frame is not None and frame_size > 0)
-        except Exception:
+        except Exception as exc:
+            details['validation_error_class'] = type(exc).__name__
+            details['validation_error_message'] = str(exc)
+            self._last_segment_validation = details
             return False
         finally:
             if capture is not None:
@@ -1276,7 +1926,15 @@ class ResumableFrameVideo:
         self.segments = []
         self.requires_full_rebuild = False
         if os.path.isfile(self.final_path):
-            os.remove(self.final_path)
+            try:
+                os.remove(self.final_path)
+            except OSError as exc:
+                raise self._raise_recoverable(
+                    f'重建检测帧视频时清理旧文件失败，等待恢复后重试: {self.final_path}',
+                    'segment_rebuild_cleanup',
+                    error=exc,
+                    artifact_path=self.final_path,
+                ) from exc
 
     def _segment_path(self, frame_number):
         if not self.segments:
@@ -1308,40 +1966,59 @@ class ResumableFrameVideo:
                 )
             except Exception as exc:
                 failed_path = self.active_path
+                recoverable = self._raise_recoverable(
+                    f'无法创建检测帧视频分段，等待恢复后重试: {failed_path}',
+                    'segment_create',
+                    error=exc,
+                    artifact_path=failed_path,
+                    frame_number=frame_number,
+                )
                 self.abort_active_segment()
-                raise PauseRequested(
-                    f'无法创建检测帧视频分段，已安全停止当前处理: {failed_path}'
-                ) from exc
+                raise recoverable from exc
             try:
                 is_opened = getattr(writer, 'isOpened', None)
                 writer_ok = not callable(is_opened) or is_opened()
             except Exception as exc:
                 failed_path = self.active_path
-                try:
-                    writer.release()
-                except Exception:
-                    pass
-                self.active_path = None
-                self.active_start_frame = None
-                raise PauseRequested(
-                    f'无法确认检测帧视频分段是否创建，已安全停止当前处理: {failed_path}'
-                ) from exc
-            if not writer_ok:
-                try:
-                    writer.release()
-                except Exception:
-                    pass
-                self.active_path = None
-                self.active_start_frame = None
-                raise PauseRequested(
-                    '无法创建检测帧视频分段，已安全停止当前处理'
+                recoverable = self._raise_recoverable(
+                    f'无法确认检测帧视频分段是否创建，等待恢复后重试: {failed_path}',
+                    'segment_open_check',
+                    error=exc,
+                    artifact_path=failed_path,
+                    frame_number=frame_number,
                 )
+                try:
+                    writer.release()
+                except Exception:
+                    pass
+                self.active_path = None
+                self.active_start_frame = None
+                raise recoverable from exc
+            if not writer_ok:
+                recoverable = self._raise_recoverable(
+                    '无法创建检测帧视频分段，等待恢复后重试',
+                    'segment_open_check',
+                    error=OSError(errno.EIO, '检测帧视频分段未打开'),
+                    artifact_path=self.active_path,
+                    frame_number=frame_number,
+                )
+                try:
+                    writer.release()
+                except Exception:
+                    pass
+                self.active_path = None
+                self.active_start_frame = None
+                raise recoverable
             self.active_writer = writer
         try:
             self.active_writer.write(frame)
         except Exception as exc:
-            raise PauseRequested(
-                f'检测帧视频分段写入失败，已安全停止当前处理: {self.active_path}'
+            raise self._raise_recoverable(
+                f'检测帧视频分段写入失败，等待恢复后重试: {self.active_path}',
+                'segment_write',
+                error=exc,
+                artifact_path=self.active_path,
+                frame_number=frame_number,
             ) from exc
 
     def seal_segment(self):
@@ -1353,6 +2030,12 @@ class ResumableFrameVideo:
         try:
             writer.release()
         except Exception as exc:
+            recoverable = self._raise_recoverable(
+                f'检测帧视频分段封口失败，等待恢复后重试: {path}',
+                'segment_seal',
+                error=exc,
+                artifact_path=path,
+            )
             self.active_writer = None
             self.active_path = None
             self.active_start_frame = None
@@ -1361,23 +2044,34 @@ class ResumableFrameVideo:
                     os.remove(path)
                 except OSError:
                     pass
-            raise PauseRequested(
-                f'检测帧视频分段封口失败，已安全停止当前处理: {path}'
-            ) from exc
+            raise recoverable from exc
         self.active_writer = None
         self.active_path = None
         self.active_start_frame = None
         try:
             has_bytes = os.path.isfile(path) and os.path.getsize(path) > 0
         except OSError as exc:
-            raise PauseRequested(
-                f'无法确认检测帧视频分段是否写入，已安全停止当前处理: {path}'
+            raise self._raise_recoverable(
+                f'无法确认检测帧视频分段是否写入，等待恢复后重试: {path}',
+                'segment_size_check',
+                error=exc,
+                artifact_path=path,
             ) from exc
         if not has_bytes:
-            raise PauseRequested(
-                f'检测帧视频分段写入失败，已安全停止当前处理: {path}'
+            raise self._raise_recoverable(
+                f'检测帧视频分段写入失败，等待恢复后重试: {path}',
+                'segment_size_check',
+                error=OSError(errno.EIO, '检测帧视频分段为空'),
+                artifact_path=path,
             )
         if not self._is_readable_segment(path):
+            recoverable = self._raise_recoverable(
+                f'检测帧视频分段暂时不可读，等待恢复后重试: {path}',
+                'segment_validation',
+                error=OSError(errno.EIO, 'OpenCV 分段回读校验失败'),
+                artifact_path=path,
+                **self._segment_validation_details(),
+            )
             cleanup_error = None
             try:
                 os.remove(path)
@@ -1387,9 +2081,7 @@ class ResumableFrameVideo:
                 detail = '已清理未接纳分段'
             else:
                 detail = f'清理失败: {cleanup_error}'
-            raise PauseRequested(
-                f'检测帧视频分段损坏，{detail}，已安全停止当前处理: {path}'
-            )
+            raise recoverable
         name = os.path.basename(path)
         if name not in self.segments:
             self.segments.append(name)
@@ -1405,7 +2097,7 @@ class ResumableFrameVideo:
             try:
                 self.active_writer.release()
             except Exception:
-                # 保留触发停止的原始 PauseRequested，不让清理异常覆盖它。
+                # 保留触发恢复或停止的原始异常，不让清理异常覆盖它。
                 pass
             finally:
                 self.active_writer = None
@@ -1433,15 +2125,25 @@ class ResumableFrameVideo:
             )
             free_bytes = int(shutil.disk_usage(self.video_dir).free)
         except (OSError, TypeError, ValueError) as exc:
-            raise PauseRequested(
-                f'无法检查检测帧视频合并所需磁盘空间，已安全停止当前处理: {exc}'
+            raise self._raise_recoverable(
+                f'无法检查检测帧视频合并所需磁盘空间，等待恢复后重试: {exc}',
+                'merge_disk_check',
+                error=exc,
+                artifact_path=tmp_path,
+                segment_paths=list(segment_paths),
             ) from exc
         required_bytes = source_bytes + MERGE_DISK_RESERVE_BYTES
         if free_bytes < required_bytes:
-            raise PauseRequested(
+            raise self._raise_recoverable(
                 '检测帧视频合并前可用空间不足：'
                 f'需要至少 {required_bytes} 字节（含 {MERGE_DISK_RESERVE_BYTES} 字节余量），'
-                f'当前可用 {free_bytes} 字节；已保留原分段并安全停止当前处理'
+                f'当前可用 {free_bytes} 字节；已保留原分段并等待恢复后重试',
+                'merge_disk_check',
+                error=OSError(errno.ENOSPC, '检测帧视频合并前可用空间不足'),
+                artifact_path=tmp_path,
+                source_bytes=source_bytes,
+                required_bytes=required_bytes,
+                available_bytes=free_bytes,
             )
         writer = None
         written_frames = 0
@@ -1449,43 +2151,189 @@ class ResumableFrameVideo:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
             for segment_path in segment_paths:
-                cap = self.cv2.VideoCapture(segment_path)
-                if not cap.isOpened():
-                    cap.release()
-                    raise RuntimeError(f'无法读取检测帧视频分段: {segment_path}')
+                try:
+                    cap = self.cv2.VideoCapture(segment_path)
+                except Exception as exc:
+                    raise self._raise_recoverable(
+                        f'无法创建检测帧视频分段回读句柄，等待恢复后重试: {segment_path}',
+                        'merge_segment_open',
+                        error=exc,
+                        artifact_path=segment_path,
+                        capture_created=False,
+                        isOpened=None,
+                        read_success=None,
+                        frame_present=None,
+                        frame_size=None,
+                    ) from exc
+                try:
+                    segment_opened = bool(cap.isOpened())
+                except Exception as exc:
+                    recoverable = self._raise_recoverable(
+                        f'无法确认检测帧视频分段是否打开，等待恢复后重试: {segment_path}',
+                        'merge_segment_open_check',
+                        error=exc,
+                        artifact_path=segment_path,
+                        capture_created=True,
+                        isOpened=None,
+                        read_success=None,
+                        frame_present=None,
+                        frame_size=None,
+                    )
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
+                    raise recoverable from exc
+                if not segment_opened:
+                    recoverable = self._raise_recoverable(
+                        f'无法读取检测帧视频分段，等待恢复后重试: {segment_path}',
+                        'merge_segment_open',
+                        error=OSError(errno.EIO, 'OpenCV 分段未打开'),
+                        artifact_path=segment_path,
+                        capture_created=cap is not None,
+                        isOpened=False,
+                        read_success=None,
+                        frame_present=None,
+                        frame_size=None,
+                    )
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
+                    raise recoverable
                 try:
                     while True:
-                        success, frame = cap.read()
+                        try:
+                            success, frame = cap.read()
+                        except Exception as exc:
+                            raise self._raise_recoverable(
+                                f'检测帧视频分段回读失败，等待恢复后重试: {segment_path}',
+                                'merge_segment_read',
+                                error=exc,
+                                artifact_path=segment_path,
+                                capture_created=True,
+                                isOpened=True,
+                                read_success=False,
+                                frame_present=False,
+                                frame_size=0,
+                            ) from exc
                         if not success:
                             break
-                        if writer is None:
-                            frame_h, frame_w = frame.shape[:2]
-                            writer = self.cv2.VideoWriter(
-                                tmp_path,
-                                self.cv2.VideoWriter_fourcc(*'mp4v'),
-                                self.fps,
-                                (int(frame_w), int(frame_h)),
+                        if frame is None or getattr(frame, 'size', 0) <= 0:
+                            raise self._raise_recoverable(
+                                f'检测帧视频分段回读到空帧，等待恢复后重试: {segment_path}',
+                                'merge_segment_read',
+                                error=OSError(errno.EIO, 'OpenCV 分段回读空帧'),
+                                artifact_path=segment_path,
+                                capture_created=True,
+                                isOpened=True,
+                                read_success=bool(success),
+                                frame_present=frame is not None,
+                                frame_size=int(getattr(frame, 'size', 0) or 0),
                             )
-                            is_opened = getattr(writer, 'isOpened', None)
-                            if callable(is_opened) and not is_opened():
-                                raise RuntimeError('无法创建检测帧视频合并文件')
-                        writer.write(frame)
+                        if writer is None:
+                            try:
+                                frame_h, frame_w = frame.shape[:2]
+                                writer = self.cv2.VideoWriter(
+                                    tmp_path,
+                                    self.cv2.VideoWriter_fourcc(*'mp4v'),
+                                    self.fps,
+                                    (int(frame_w), int(frame_h)),
+                                )
+                            except Exception as exc:
+                                raise self._raise_recoverable(
+                                    '无法创建检测帧视频合并文件，等待恢复后重试',
+                                    'merge_writer_create',
+                                    error=exc,
+                                    artifact_path=tmp_path,
+                                ) from exc
+                            try:
+                                is_opened = getattr(writer, 'isOpened', None)
+                                writer_opened = (
+                                    bool(is_opened()) if callable(is_opened) else True
+                                )
+                            except Exception as exc:
+                                raise self._raise_recoverable(
+                                    '无法确认检测帧视频合并文件是否打开，等待恢复后重试',
+                                    'merge_writer_open',
+                                    error=exc,
+                                    artifact_path=tmp_path,
+                                ) from exc
+                            if not writer_opened:
+                                raise self._raise_recoverable(
+                                    '无法创建检测帧视频合并文件，等待恢复后重试',
+                                    'merge_writer_open',
+                                    error=OSError(errno.EIO, '合并文件未打开'),
+                                    artifact_path=tmp_path,
+                                )
+                        try:
+                            writer.write(frame)
+                        except Exception as exc:
+                            raise self._raise_recoverable(
+                                f'检测帧视频合并写入失败，等待恢复后重试: {tmp_path}',
+                                'merge_write',
+                                error=exc,
+                                artifact_path=tmp_path,
+                            ) from exc
                         written_frames += 1
                 finally:
-                    cap.release()
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
             if writer is None or written_frames <= 0:
-                raise PauseRequested(
-                    '检测帧视频分段中没有可合并帧，已安全停止当前处理'
+                raise self._raise_recoverable(
+                    '检测帧视频分段中没有可合并帧，等待恢复后重试',
+                    'merge_segment_read',
+                    error=OSError(errno.EIO, '检测帧视频分段没有可合并帧'),
+                    artifact_path=tmp_path,
+                    capture_created=True,
+                    isOpened=True,
+                    read_success=False,
+                    frame_present=False,
+                    frame_size=0,
                 )
-            writer.release()
+            try:
+                writer.release()
+            except Exception as exc:
+                raise self._raise_recoverable(
+                    f'检测帧视频合并文件封口失败，等待恢复后重试: {tmp_path}',
+                    'merge_seal',
+                    error=exc,
+                    artifact_path=tmp_path,
+                ) from exc
             writer = None
             if not self._is_readable_segment(tmp_path):
-                raise PauseRequested(
-                    '检测帧视频合并文件损坏，已保留原分段并安全停止当前处理: '
-                    f'{tmp_path}'
+                raise self._raise_recoverable(
+                    '检测帧视频合并文件暂时不可读，已保留原分段并等待恢复后重试: '
+                    f'{tmp_path}',
+                    'merge_validation',
+                    error=OSError(errno.EIO, 'OpenCV 合并文件回读校验失败'),
+                    artifact_path=tmp_path,
+                    **self._segment_validation_details(),
                 )
-            os.replace(tmp_path, self.final_path)
+            try:
+                os.replace(tmp_path, self.final_path)
+            except OSError as exc:
+                raise self._raise_recoverable(
+                    f'检测帧视频最终替换失败，等待恢复后重试: {self.final_path}',
+                    'merge_final_replace',
+                    error=exc,
+                    artifact_path=self.final_path,
+                ) from exc
         except PauseRequested:
+            if writer is not None:
+                try:
+                    writer.release()
+                except Exception:
+                    pass
+            if os.path.isfile(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            raise
+        except RecoverableProcessingError:
             if writer is not None:
                 try:
                     writer.release()
@@ -1508,8 +2356,11 @@ class ResumableFrameVideo:
                     os.remove(tmp_path)
                 except OSError:
                     pass
-            raise PauseRequested(
-                f'检测帧视频合并写入失败，已安全停止当前处理: {self.final_path}'
+            raise self._raise_recoverable(
+                f'检测帧视频合并写入失败，等待恢复后重试: {self.final_path}',
+                'merge_write',
+                error=exc,
+                artifact_path=self.final_path,
             ) from exc
 
     def finish(self):
@@ -1527,8 +2378,11 @@ class ResumableFrameVideo:
                 try:
                     os.replace(only_path, self.final_path)
                 except OSError as exc:
-                    raise PauseRequested(
-                        f'检测帧视频最终文件写入失败，已安全停止当前处理: {self.final_path}'
+                    raise self._raise_recoverable(
+                        f'检测帧视频最终文件写入失败，等待恢复后重试: {self.final_path}',
+                        'segment_final_replace',
+                        error=exc,
+                        artifact_path=self.final_path,
                     ) from exc
         else:
             self._merge_segments(segment_paths)
@@ -1539,8 +2393,11 @@ class ResumableFrameVideo:
                     try:
                         os.remove(segment_path)
                     except OSError as exc:
-                        raise PauseRequested(
-                            f'检测帧视频分段清理失败，已安全停止当前处理: {segment_path}'
+                        raise self._raise_recoverable(
+                            f'检测帧视频分段清理失败，等待恢复后重试: {segment_path}',
+                            'merge_cleanup',
+                            error=exc,
+                            artifact_path=segment_path,
                         ) from exc
         self.segments = [self.final_name]
         return self.checkpoint_segments()
@@ -1613,13 +2470,31 @@ def write_completion_marker(
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp_path, marker_path)
+        except OSError as exc:
+            raise _make_recoverable_error(
+                f'完成标记写入失败，等待恢复后重试: {marker_path}',
+                'done_marker_write',
+                error=exc,
+                video_path=source_path,
+                artifact_path=marker_path,
+                temp_path=tmp_path,
+            ) from exc
         finally:
             try:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
-            except OSError:
-                pass
+            except OSError as cleanup_error:
+                raise _make_recoverable_error(
+                    f'完成标记临时文件清理失败，等待恢复后重试: {tmp_path}',
+                    'done_marker_cleanup',
+                    error=cleanup_error,
+                    video_path=source_path,
+                    artifact_path=tmp_path,
+                    marker_path=marker_path,
+                ) from cleanup_error
         return True
+    except RecoverableProcessingError:
+        raise
     except (OSError, TypeError, ValueError):
         return False
 
@@ -1765,11 +2640,29 @@ _PAUSE_EVENT_RECORDED = False
 
 
 class PauseRequested(Exception):
-    """Raised to request a graceful stop with checkpoint saved."""
+    """用户主动请求停止，并在安全点保存检查点。"""
 
 
-class CoordinationUnavailableError(PauseRequested):
-    """共享声明数据库不可用时触发安全暂停，避免重复处理。"""
+class RecoverableProcessingError(RuntimeError):
+    """处理暂时失败，释放 claim 后应等待恢复并从检查点重试。"""
+
+    def __init__(
+        self,
+        message='',
+        failure_id=None,
+        stage=None,
+        video_path=None,
+        artifact_path=None,
+    ):
+        super().__init__(message)
+        self.failure_id = failure_id
+        self.stage = stage
+        self.video_path = video_path
+        self.artifact_path = artifact_path
+
+
+class CoordinationUnavailableError(RecoverableProcessingError):
+    """共享声明数据库暂时不可用，应进入恢复等待。"""
 
 
 class ClaimLostError(RuntimeError):
@@ -2385,7 +3278,9 @@ class DirectoryIndex:
         """判断异常是否为数据库锁冲突或网络瞬态错误。"""
         msg = str(exc).lower()
         return ('locked' in msg or 'busy' in msg or
-                'disk i/o error' in msg or 'unable to open' in msg)
+                'disk i/o error' in msg or 'unable to open' in msg or
+                'database or disk is full' in msg or 'disk is full' in msg or
+                'readonly' in msg or 'read-only' in msg)
 
     @staticmethod
     def _is_claim_connection_error(exc):
@@ -2394,6 +3289,10 @@ class DirectoryIndex:
         return (
             'disk i/o error' in msg
             or 'unable to open' in msg
+            or 'database or disk is full' in msg
+            or 'disk is full' in msg
+            or 'readonly' in msg
+            or 'read-only' in msg
             or 'closed database' in msg
             or 'cannot operate on a closed database' in msg
         )
@@ -2409,12 +3308,28 @@ class DirectoryIndex:
             return
         self._claim_database_error_log_times[key] = now
         if final:
-            state = '连续失败，本轮将安全暂停'
+            state = '连续失败，将进入恢复等待'
         else:
             state = f'第 {attempt}/{CLAIM_DATABASE_RETRY_ATTEMPTS} 次失败，正在重试'
         print(
             f'共享声明数据库{operation_name}{state}: {error}；'
             f'数据库: {self.db_path}'
+        )
+
+    def _coordination_error(self, operation_name, error):
+        """把共享声明库瞬时故障转换为可关联的可恢复异常。"""
+        failure_id = record_recoverable_failure(
+            'coordination_database',
+            error=error,
+            artifact_path=self.db_path,
+            operation=operation_name,
+            database_path=self.db_path,
+        )
+        return CoordinationUnavailableError(
+            f'{operation_name}失败，等待共享声明数据库恢复后重试: {error}',
+            failure_id=failure_id,
+            stage='coordination_database',
+            artifact_path=self.db_path,
         )
 
     def _reconnect_claim_database(self):
@@ -2446,7 +3361,7 @@ class DirectoryIndex:
         return True
 
     def _run_claim_database_operation(self, operation_name, operation):
-        """带有限重连的声明数据库操作；连续失败时停止整轮处理。"""
+        """带有限重连的声明数据库操作；连续失败时进入恢复等待。"""
         last_error = None
         for attempt in range(1, CLAIM_DATABASE_RETRY_ATTEMPTS + 1):
             try:
@@ -2457,9 +3372,7 @@ class DirectoryIndex:
                     self._log_claim_database_error(
                         operation_name, error, attempt, final=True
                     )
-                    raise CoordinationUnavailableError(
-                        f'{operation_name}失败，无法确认视频声明状态: {error}'
-                    ) from error
+                    raise self._coordination_error(operation_name, error) from error
 
                 self._log_claim_database_error(operation_name, error, attempt)
                 reconnected = False
@@ -2468,8 +3381,9 @@ class DirectoryIndex:
                 if not reconnected:
                     time.sleep(CLAIM_DATABASE_RETRY_DELAY_SECONDS * attempt)
 
-        raise CoordinationUnavailableError(
-            f'{operation_name}失败，无法确认视频声明状态: {last_error}'
+        raise self._coordination_error(
+            operation_name,
+            last_error or OSError(errno.EIO, '共享声明数据库操作失败'),
         )
 
     @staticmethod
@@ -2505,7 +3419,8 @@ class DirectoryIndex:
 
     def _fallback_to_memory_db(self, reason):
         """协调数据库不可用时拒绝降级，避免多实例重复处理。"""
-        raise RuntimeError(f"协调数据库不可用，已停止处理（{reason}）")
+        error = OSError(errno.EIO, f'协调数据库不可用: {reason}')
+        raise self._coordination_error('协调数据库', error) from error
 
     def _safe_reconnect(self, context_msg):
         """安全地重新连接到文件数据库。"""
@@ -2888,6 +3803,10 @@ class DirectoryIndex:
                 self.conn.execute(
                     'UPDATE directories SET has_artifact=1, dir_mtime=? WHERE path=?',
                     (current_mtime, normalized))
+        except sqlite3.Error as e:
+            if self._is_lock_error(e) or self._is_claim_connection_error(e):
+                raise self._coordination_error('标记目录已处理', e) from e
+            print(f"标记目录已处理失败: {e}")
         except Exception as e:
             print(f"标记目录已处理失败: {e}")
 
@@ -2976,6 +3895,15 @@ class DirectoryIndex:
             )
             self.conn.commit()
             return True
+        except sqlite3.Error as e:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            if self._is_lock_error(e) or self._is_claim_connection_error(e):
+                raise self._coordination_error('原子标记目录已处理', e) from e
+            print(f"原子标记目录已处理失败: {e}")
+            return False
         except Exception as e:
             try:
                 self.conn.rollback()
@@ -3108,6 +4036,11 @@ class DirectoryIndex:
                     ),
                 )
             return cur.rowcount == 1
+        except sqlite3.Error as e:
+            if self._is_lock_error(e) or self._is_claim_connection_error(e):
+                raise self._coordination_error('标记视频已处理', e) from e
+            print(f"标记视频已处理失败: {e}")
+            return False
         except Exception as e:
             print(f"标记视频已处理失败: {e}")
             return False
@@ -3174,6 +4107,11 @@ class DirectoryIndex:
                     source_snapshot=expected_snapshot,
                 )
             return True
+        except sqlite3.Error as e:
+            if self._is_lock_error(e) or self._is_claim_connection_error(e):
+                raise self._coordination_error('完成视频 claim', e) from e
+            print(f"完成视频 claim 失败: {e}")
+            return False
         except Exception as e:
             print(f"完成视频 claim 失败: {e}")
             return False
@@ -3188,7 +4126,7 @@ class DirectoryIndex:
         if not file_md5:
             return False
         pipeline = normalize_pipeline_id(pipeline_id)
-        try:
+        def _query():
             row = self.conn.execute(
                 """
                 SELECT detection_count FROM processed_videos
@@ -3201,6 +4139,11 @@ class DirectoryIndex:
             if not include_directory_backfill and row['detection_count'] == -1:
                 return False
             return True
+
+        try:
+            return self._run_claim_database_operation('查询视频完成状态', _query)
+        except RecoverableProcessingError:
+            raise
         except Exception:
             return False
 
@@ -3220,6 +4163,9 @@ class DirectoryIndex:
                 )
             return cur.rowcount == 1
         except sqlite3.Error as e:
+            if self._is_lock_error(e) or self._is_claim_connection_error(e):
+                self._reconnect_claim_database()
+                raise self._coordination_error('撤销视频完成状态', e) from e
             print(f"撤销视频完成状态失败: {e}")
             return False
 
@@ -3556,6 +4502,19 @@ class DirectoryIndex:
                 details={'reason': 'contention'},
             )
             return False
+        except sqlite3.Error as e:
+            if self._is_lock_error(e) or self._is_claim_connection_error(e):
+                self._reconnect_claim_database()
+                raise self._coordination_error('声明视频处理', e) from e
+            print(f"声明视频处理失败: {e}")
+            self.record_processing_event(
+                'claim_error',
+                video_path=video_path,
+                file_md5=file_md5,
+                pipeline_id=pipeline,
+                details={'error': str(e)},
+            )
+            return False
         except Exception as e:
             print(f"声明视频处理失败: {e}")
             self.record_processing_event(
@@ -3584,6 +4543,12 @@ class DirectoryIndex:
                     (now, file_md5, pipeline, self.owner_token),
                 )
             return bool(cur.rowcount)
+        except sqlite3.Error as e:
+            if self._is_lock_error(e) or self._is_claim_connection_error(e):
+                self._reconnect_claim_database()
+                raise self._coordination_error('刷新视频声明', e) from e
+            print(f"刷新视频声明心跳失败: {e}")
+            return False
         except Exception as e:
             print(f"刷新视频声明心跳失败: {e}")
             return False
@@ -3612,7 +4577,10 @@ class DirectoryIndex:
                 },
             )
             return released
-        except Exception as e:
+        except sqlite3.Error as e:
+            if self._is_lock_error(e) or self._is_claim_connection_error(e):
+                self._reconnect_claim_database()
+                raise self._coordination_error('释放视频声明', e) from e
             print(f"释放视频声明失败: {e}")
             self.record_processing_event(
                 'claim_release_failed',
@@ -3620,6 +4588,9 @@ class DirectoryIndex:
                 pipeline_id=pipeline,
                 details={'error': str(e)},
             )
+            return False
+        except Exception as e:
+            print(f"释放视频声明失败: {e}")
             return False
 
     def release_all_claims(self):
@@ -3735,6 +4706,12 @@ class DirectoryIndex:
                     if digest == row['file_md5']:
                         return True
             return False
+        except sqlite3.Error as e:
+            if self._is_lock_error(e) or self._is_claim_connection_error(e):
+                raise self._coordination_error('检查目录视频声明', e) from e
+            print(f"检查目录视频声明失败: {e}")
+            # 无法确认时保守阻止目录完成，避免把在途视频误标完成。
+            return True
         except Exception as e:
             print(f"检查目录视频声明失败: {e}")
             # 无法确认时保守阻止目录完成，避免把在途视频误标完成。

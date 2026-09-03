@@ -1453,8 +1453,8 @@ class ProcessingStateTests(unittest.TestCase):
                 self.assertEqual(releases, [])
                 self.assertEqual(marked_dirs, [])
 
-    def test_coordination_failure_stops_directory_scan(self):
-        """共享声明库不可用时不能继续扫描目录中的其余视频。"""
+    def test_coordination_failure_waits_until_user_pauses(self):
+        """共享声明库不可用时等待恢复，主动暂停仍能中断等待。"""
         for module_path, needs_model in ENTRYPOINTS:
             with self.subTest(entrypoint=module_path.name):
                 entrypoint = load_main_module(module_path)
@@ -1472,13 +1472,93 @@ class ProcessingStateTests(unittest.TestCase):
                     entrypoint, 'has_existing_artifacts', return_value=False
                 ), mock.patch.object(
                     entrypoint, '_get_processing_decision', decision
+                ), mock.patch.object(
+                    entrypoint, 'wait_for_recovery',
+                    side_effect=entrypoint.PauseRequested('测试主动暂停'),
                 ):
                     args = ['root', 'person']
                     if needs_model:
                         args.append(object())
-                    with self.assertRaises(entrypoint.CoordinationUnavailableError):
+                    with self.assertRaises(entrypoint.PauseRequested):
                         entrypoint.process_directory_videos(*args)
                 self.assertEqual(decision.call_count, 1)
+
+    def test_recoverable_video_releases_claim_waits_and_reacquires(self):
+        """三个 YOLOv11 视频入口的可恢复故障都在重试前释放、重试时重新领取声明。"""
+        for module_path, needs_model in ENTRYPOINTS:
+            with self.subTest(entrypoint=module_path.name):
+                entrypoint = load_main_module(module_path)
+                entrypoint.utils._STOP_REQUESTED = False
+                entrypoint.save_mosaic_switch = False
+                entrypoint.save_timestamps_switch = True
+                calls = []
+
+                class FakeCapture:
+                    def isOpened(self):
+                        return True
+
+                    def get(self, prop):
+                        if prop == entrypoint.cv2.CAP_PROP_FPS:
+                            return 30
+                        if prop == entrypoint.cv2.CAP_PROP_FRAME_COUNT:
+                            return 300
+                        return 0
+
+                    def release(self):
+                        return None
+
+                class FakeDirectoryIndex:
+                    def try_claim_video(self, md5, path):
+                        calls.append(('claim', md5, path))
+                        return True
+
+                    def release_claim(self, md5):
+                        calls.append(('release', md5))
+                        return True
+
+                detector = mock.Mock(side_effect=[
+                    entrypoint.RecoverableProcessingError(
+                        '模拟分段暂时不可用', stage='test_segment',
+                    ),
+                    [],
+                ])
+                with mock.patch.object(
+                    entrypoint.os, 'listdir', lambda path: ['video.mp4']
+                ), mock.patch.object(
+                    entrypoint, 'is_video_file', lambda path: path.endswith('.mp4')
+                ), mock.patch.object(
+                    entrypoint.cv2, 'VideoCapture', lambda path: FakeCapture()
+                ), mock.patch.object(
+                    entrypoint, 'has_existing_artifacts', return_value=False
+                ), mock.patch.object(
+                    entrypoint,
+                    '_get_processing_decision',
+                    lambda path, acquire_claim=True: ('md5-retry', 'ready'),
+                ), mock.patch.object(
+                    entrypoint, 'DIRECTORY_INDEX', FakeDirectoryIndex()
+                ), mock.patch.object(
+                    entrypoint, 'detect_objects_in_video', detector
+                ), mock.patch.object(
+                    entrypoint, '_mark_video_completed', return_value=True
+                ), mock.patch.object(
+                    entrypoint, '_mark_directory_done'
+                ), mock.patch.object(
+                    entrypoint, 'wait_for_recovery',
+                    side_effect=lambda *args, **kwargs: calls.append(('wait', args[0])),
+                ), mock.patch.object(
+                    entrypoint, '_pause_requested', return_value=False
+                ):
+                    args = ['root', 'person']
+                    if needs_model:
+                        args.append(object())
+                    result = entrypoint.process_directory_videos(*args)
+
+                self.assertEqual(result, 1)
+                self.assertEqual(detector.call_count, 2)
+                self.assertEqual(
+                    [item[0] for item in calls],
+                    ['claim', 'release', 'wait', 'claim', 'release'],
+                )
 
     def test_partial_claim_block_never_marks_directory_completed(self):
         for module_path, needs_model in ENTRYPOINTS:

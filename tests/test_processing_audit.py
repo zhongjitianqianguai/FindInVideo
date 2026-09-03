@@ -1,6 +1,8 @@
 """处理中断、声明释放与断点恢复审计日志回归测试。"""
 
 import pathlib
+import json
+import os
 import tempfile
 import time
 import unittest
@@ -62,6 +64,184 @@ class ProcessingAuditTests(unittest.TestCase):
         finally:
             writer.release()
         return video_path
+
+    def test_recoverable_failure_persists_structured_snapshot_to_both_logs(self):
+        """可恢复故障快照同时进入共享事件表和本机 JSONL。"""
+        artifact_path = self.root / 'partial.tmp'
+        artifact_path.write_bytes('现场'.encode('utf-8'))
+        local_log = self.root / 'recovery_events.jsonl'
+        previous_log = os.environ.get('FINDINVIDEO_RECOVERY_LOG_PATH')
+        os.environ['FINDINVIDEO_RECOVERY_LOG_PATH'] = str(local_log)
+        try:
+            error = OSError(28, '空间不足')
+            failure_id = utils.record_recoverable_failure(
+                'test_snapshot',
+                error=error,
+                video_path=str(self.video_path),
+                artifact_path=str(artifact_path),
+                file_md5=self.file_md5,
+                pipeline_id=self.pipeline_id,
+            )
+            events = self.first_index.list_processing_events(
+                limit=10,
+                file_md5=self.file_md5,
+                pipeline_id=self.pipeline_id,
+            )
+            self.assertEqual(events[-1]['event_type'], 'recoverable_error')
+            details = events[-1]['details']
+            self.assertEqual(details['failure_id'], failure_id)
+            self.assertEqual(details['stage'], 'test_snapshot')
+            self.assertEqual(details['exception_class'], 'OSError')
+            self.assertEqual(details['errno'], 28)
+            self.assertTrue(details['file_exists'])
+            self.assertEqual(details['file_size'], len('现场'.encode('utf-8')))
+            local_event = json.loads(local_log.read_text(encoding='utf-8').splitlines()[-1])
+            self.assertEqual(local_event['event_type'], 'recoverable_error')
+            self.assertEqual(local_event['failure_id'], failure_id)
+            self.assertEqual(local_event['artifact_path'], str(artifact_path))
+        finally:
+            if previous_log is None:
+                os.environ.pop('FINDINVIDEO_RECOVERY_LOG_PATH', None)
+            else:
+                os.environ['FINDINVIDEO_RECOVERY_LOG_PATH'] = previous_log
+
+    def test_recovery_wait_probes_then_reports_success_with_same_failure_id(self):
+        """恢复探测失败后继续等待，成功探测仍沿用同一 failure_id。"""
+        previous_retry = os.environ.get('FINDINVIDEO_RECOVERY_RETRY_SECONDS')
+        os.environ['FINDINVIDEO_RECOVERY_RETRY_SECONDS'] = '1'
+        try:
+            failure = utils._make_recoverable_error(
+                '模拟暂时不可用',
+                'test_wait',
+                error=OSError(5, 'I/O'),
+                video_path=str(self.video_path),
+                artifact_path=str(self.video_path) + '.tmp',
+            )
+            with mock.patch.object(
+                utils,
+                'probe_recovery_target',
+                side_effect=[
+                    (False, OSError(28, '空间不足')),
+                    (True, {'target_dir': str(self.root), 'free_space_bytes': 1}),
+                ],
+            ):
+                self.assertTrue(utils.wait_for_recovery(
+                    failure,
+                    target_dir=str(self.root),
+                    pause_checker=lambda: False,
+                    sleep_fn=lambda _seconds: None,
+                ))
+            events = self.first_index.list_processing_events(limit=20)
+            recovery_events = [
+                event for event in events
+                if event['event_type'] in {
+                    'recoverable_error', 'recovery_wait',
+                    'recovery_probe_failed', 'recovery_probe_succeeded',
+                }
+            ]
+            self.assertTrue(recovery_events)
+            self.assertTrue(all(
+                event['details'].get('failure_id') == failure.failure_id
+                for event in recovery_events
+            ))
+            self.assertEqual(
+                recovery_events[-1]['event_type'], 'recovery_probe_succeeded'
+            )
+        finally:
+            if previous_retry is None:
+                os.environ.pop('FINDINVIDEO_RECOVERY_RETRY_SECONDS', None)
+            else:
+                os.environ['FINDINVIDEO_RECOVERY_RETRY_SECONDS'] = previous_retry
+
+    def test_retry_marks_resumed_only_after_operation_succeeds(self):
+        """目录探测成功不等于业务恢复，实际操作成功后才记录 resumed。"""
+        attempts = []
+        failure = utils.RecoverableProcessingError(
+            '模拟瞬时失败', failure_id='failure-retry', stage='test_retry',
+        )
+
+        def operation():
+            attempts.append(True)
+            if len(attempts) == 1:
+                raise failure
+            return 'ok'
+
+        result = utils.retry_with_recovery(
+            operation,
+            video_path=str(self.video_path),
+            wait_fn=lambda *args, **kwargs: True,
+            pause_checker=lambda: False,
+        )
+
+        self.assertEqual(result, 'ok')
+        events = self.first_index.list_processing_events(limit=20)
+        resumed = [
+            event for event in events
+            if event['event_type'] == 'recovery_resumed'
+        ]
+        self.assertEqual(len(resumed), 1)
+        self.assertEqual(
+            resumed[0]['details']['failure_id'], 'failure-retry'
+        )
+        self.assertEqual(
+            resumed[0]['details']['outcome'], 'operation_succeeded'
+        )
+
+    def test_coordination_wait_probes_database_directory(self):
+        """声明库故障必须探测数据库目录，不能误探测视频目录。"""
+        database_path = self.root / 'state' / 'directory_index.db'
+        failure = utils.CoordinationUnavailableError(
+            '数据库暂时不可用',
+            failure_id='failure-db',
+            stage='coordination_database',
+            artifact_path=str(database_path),
+        )
+        probed = []
+        with mock.patch.object(
+            utils,
+            'probe_recovery_target',
+            side_effect=lambda path: (
+                probed.append(path) or True,
+                {'target_dir': path, 'free_space_bytes': 1},
+            ),
+        ):
+            self.assertTrue(utils.wait_for_recovery(
+                failure,
+                target_dir=str(self.root / 'videos'),
+                pause_checker=lambda: False,
+                sleep_fn=lambda _seconds: None,
+            ))
+
+        self.assertEqual(probed, [str(database_path.parent)])
+
+    def test_recovery_wait_is_interrupted_by_active_pause(self):
+        """等待期间发现主动暂停时必须抛出 PauseRequested。"""
+        previous_retry = os.environ.get('FINDINVIDEO_RECOVERY_RETRY_SECONDS')
+        os.environ['FINDINVIDEO_RECOVERY_RETRY_SECONDS'] = '1'
+        try:
+            failure = utils._make_recoverable_error(
+                '模拟等待',
+                'test_pause_wait',
+                video_path=str(self.video_path),
+                artifact_path=str(self.video_path) + '.tmp',
+            )
+            with self.assertRaises(utils.PauseRequested):
+                utils.wait_for_recovery(
+                    failure,
+                    target_dir=str(self.root),
+                    pause_checker=lambda: True,
+                )
+            events = self.first_index.list_processing_events(limit=20)
+            self.assertTrue(any(
+                event['event_type'] == 'pause_requested'
+                and event['details'].get('failure_id') == failure.failure_id
+                for event in events
+            ))
+        finally:
+            if previous_retry is None:
+                os.environ.pop('FINDINVIDEO_RECOVERY_RETRY_SECONDS', None)
+            else:
+                os.environ['FINDINVIDEO_RECOVERY_RETRY_SECONDS'] = previous_retry
 
     def test_interrupt_release_and_resume_are_persisted(self):
         """中断后的新会话能领取、加载检查点并留下可查询的完整事件链。"""
@@ -360,7 +540,7 @@ class ProcessingAuditTests(unittest.TestCase):
             main_entrypoint, '_save_pipeline_checkpoint', return_value=False,
         ):
             with self.assertRaisesRegex(
-                main_entrypoint.PauseRequested, '检查点保存失败',
+                main_entrypoint.RecoverableProcessingError, '检查点保存失败',
             ):
                 main_entrypoint.detect_objects_in_video(
                     str(video_path), target_class='face', model=model,
@@ -489,14 +669,35 @@ class ProcessingAuditTests(unittest.TestCase):
                 return None
 
         session = utils.ResumableFrameVideo(
-            str(final_path), fps=10.0, cv2_module=cv2, checkpoint=None,
+            str(final_path),
+            fps=10.0,
+            cv2_module=cv2,
+            checkpoint=None,
+            video_path=str(self.video_path),
+            file_md5=self.file_md5,
+            pipeline_id=self.pipeline_id,
         )
         session.active_writer = ReleasedWriter()
         session.active_path = str(final_path)
-        with self.assertRaisesRegex(utils.PauseRequested, '分段损坏'):
+        with self.assertRaisesRegex(utils.RecoverableProcessingError, '分段'):
             session.seal_segment()
         self.assertFalse(final_path.exists())
         self.assertEqual(session.checkpoint_segments(), [])
+        events = self.first_index.list_processing_events(
+            limit=10,
+            file_md5=self.file_md5,
+            pipeline_id=self.pipeline_id,
+        )
+        failure = next(
+            event for event in reversed(events)
+            if event['event_type'] == 'recoverable_error'
+        )
+        self.assertEqual(failure['details']['stage'], 'segment_validation')
+        self.assertEqual(
+            failure['details']['file_size'], len(b'not an mp4' * 128)
+        )
+        self.assertIn('isOpened', failure['details'])
+        self.assertIn('read_success', failure['details'])
 
     def test_corrupt_checkpoint_segment_requires_full_rebuild(self):
         """检查点引用的非零损坏分段必须禁止错误帧位恢复。"""
@@ -578,7 +779,7 @@ class ProcessingAuditTests(unittest.TestCase):
                 free=source_bytes + utils.MERGE_DISK_RESERVE_BYTES - 1,
             ),
         ):
-            with self.assertRaisesRegex(utils.PauseRequested, '可用空间不足'):
+            with self.assertRaisesRegex(utils.RecoverableProcessingError, '可用空间不足'):
                 session._merge_segments([str(path) for path in segment_paths])
 
         self.assertFalse(merge_tmp.exists())
@@ -613,7 +814,7 @@ class ProcessingAuditTests(unittest.TestCase):
             session, '_is_readable_segment', return_value=False,
         ):
             with self.assertRaisesRegex(
-                utils.PauseRequested, '合并文件损坏',
+                utils.RecoverableProcessingError, '合并文件',
             ):
                 session._merge_segments([str(path) for path in segment_paths])
 
@@ -626,9 +827,11 @@ class ProcessingAuditTests(unittest.TestCase):
             (self.root / 'merge_validation_merge_tmp_frames.mp4').exists()
         )
 
-    def test_checkpoint_save_failure_raises_safe_pause(self):
-        """必要检查点保存失败时 helper 必须立即安全暂停。"""
-        with self.assertRaisesRegex(utils.PauseRequested, '检查点保存失败'):
+    def test_checkpoint_save_failure_raises_recoverable_error(self):
+        """必要检查点保存失败时 helper 必须报告可恢复故障。"""
+        with self.assertRaisesRegex(
+            utils.RecoverableProcessingError, '检查点保存失败',
+        ):
             utils._save_checkpoint_or_pause(
                 lambda *_args, **_kwargs: False,
                 str(self.video_path),
