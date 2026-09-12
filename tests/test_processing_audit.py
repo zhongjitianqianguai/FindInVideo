@@ -105,6 +105,65 @@ class ProcessingAuditTests(unittest.TestCase):
             else:
                 os.environ['FINDINVIDEO_RECOVERY_LOG_PATH'] = previous_log
 
+    def test_full_disk_probe_waits_without_creating_files(self):
+        """满盘或只剩少量空间时不写探测文件，也不误报恢复。"""
+        for free_bytes in (0, 24576, 2129920):
+            with self.subTest(free_bytes=free_bytes), mock.patch.object(
+                utils.shutil, 'disk_usage', return_value=mock.Mock(free=free_bytes),
+            ), mock.patch.object(utils.tempfile, 'mkstemp') as create:
+                ok, error = utils.probe_recovery_target(str(self.root))
+                self.assertFalse(ok)
+                self.assertEqual(error.errno, 28)
+                create.assert_not_called()
+
+    def test_full_disk_stops_before_native_video_calls(self):
+        """空间不足时保留已存在分段，在进入 OpenCV 前转入可恢复等待。"""
+        native = mock.Mock()
+        with mock.patch.object(
+            utils.shutil, 'disk_usage', return_value=mock.Mock(free=24576),
+        ):
+            with self.assertRaises(utils.RecoverableProcessingError):
+                utils.ResumableFrameVideo(
+                    str(self.root / 'frames.mp4'), 10, native,
+                )
+        native.VideoWriter.assert_not_called()
+        native.VideoCapture.assert_not_called()
+
+    def test_storage_wait_is_sparse_and_honors_merge_requirement(self):
+        """默认每五分钟探测一次，空间够合并后才返回，不反复启动处理。"""
+        failure = utils.RecoverableProcessingError(
+            '空间不足', failure_id='full-disk', stage='merge_disk_check',
+        )
+        failure.required_bytes = 1024 * 1024 * 1024
+        delays = []
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            utils, 'probe_recovery_target', side_effect=[
+                (False, OSError(28, '空间不足')),
+                (True, {'free_space_bytes': failure.required_bytes}),
+            ],
+        ) as probe, mock.patch('builtins.print') as output:
+            self.assertTrue(utils.wait_for_recovery(
+                failure, target_dir=str(self.root),
+                pause_checker=lambda: False, sleep_fn=delays.append,
+            ))
+        self.assertGreaterEqual(sum(delays), 600)
+        self.assertEqual(probe.call_count, 2)
+        self.assertEqual(probe.call_args.kwargs['required_bytes'], failure.required_bytes)
+        self.assertEqual(output.call_count, 3)
+
+    def test_active_segment_stops_writing_when_disk_fills(self):
+        """运行中空间不足时停止后续原生写入，交由原有断点恢复流程接管。"""
+        native = mock.Mock()
+        session = utils.ResumableFrameVideo(str(self.root / 'frames.mp4'), 10, native)
+        session.active_writer = mock.Mock()
+        session._next_disk_check = 0
+        with mock.patch.object(
+            utils.shutil, 'disk_usage', return_value=mock.Mock(free=24576),
+        ):
+            with self.assertRaises(utils.RecoverableProcessingError):
+                session.write(np.zeros((24, 32, 3), dtype=np.uint8), 10)
+        session.active_writer.write.assert_not_called()
+
     def test_recovery_wait_probes_then_reports_success_with_same_failure_id(self):
         """恢复探测失败后继续等待，成功探测仍沿用同一 failure_id。"""
         previous_retry = os.environ.get('FINDINVIDEO_RECOVERY_RETRY_SECONDS')
@@ -200,7 +259,7 @@ class ProcessingAuditTests(unittest.TestCase):
         with mock.patch.object(
             utils,
             'probe_recovery_target',
-            side_effect=lambda path: (
+            side_effect=lambda path, **kwargs: (
                 probed.append(path) or True,
                 {'target_dir': path, 'free_space_bytes': 1},
             ),

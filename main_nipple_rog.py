@@ -370,15 +370,19 @@ def detect_objects_in_video(video_path, target_class, model,
     fps = cap.get(cv2.CAP_PROP_FPS)
     fps_safe = fps if fps and fps > 0 else 25
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    frame_video = ResumableFrameVideo(
-        video_save_path,
-        fps=fps_safe,
-        cv2_module=cv2,
-        checkpoint=ckpt,
-        video_path=video_path,
-        file_md5=claim_md5,
-        pipeline_id=pipeline,
-    )
+    try:
+        frame_video = ResumableFrameVideo(
+            video_save_path,
+            fps=fps_safe,
+            cv2_module=cv2,
+            checkpoint=ckpt,
+            video_path=video_path,
+            file_md5=claim_md5,
+            pipeline_id=pipeline,
+        )
+    except RecoverableProcessingError:
+        cap.release()
+        raise
     if frame_video.requires_full_rebuild:
         print(
             '检查点缺少完整检测帧分段，将从头重建，'

@@ -275,8 +275,8 @@ EARLY_EOF_RETRY_DEFAULT_SECONDS = 21600
 EARLY_EOF_RETRY_MAX_DEFAULT_SECONDS = 86400
 # 合并分段会额外生成一份临时 MP4；预留固定空间避免合并过程把磁盘写满。
 MERGE_DISK_RESERVE_BYTES = 64 * 1024 * 1024
-# 可恢复故障默认每 30 秒探测一次目标目录；测试或运维可通过环境变量覆盖。
-RECOVERY_RETRY_DEFAULT_SECONDS = 30.0
+# 可恢复故障默认每 5 分钟探测一次目标目录；测试或运维可通过环境变量覆盖。
+RECOVERY_RETRY_DEFAULT_SECONDS = 300.0
 RECOVERY_CLAIM_NOT_ACQUIRED = object()
 RECOVERY_ALREADY_COMPLETED = object()
 
@@ -420,7 +420,7 @@ def get_early_eof_retry_delay_seconds(retry_count):
 
 
 def get_recovery_retry_seconds():
-    """读取可恢复故障的探测间隔，默认 30 秒。"""
+    """读取可恢复故障的探测间隔，默认 5 分钟。"""
     try:
         configured = float(os.environ.get(
             'FINDINVIDEO_RECOVERY_RETRY_SECONDS',
@@ -1194,7 +1194,7 @@ def _make_recoverable_error(
         pipeline_id=pipeline_id,
         **extra,
     )
-    return RecoverableProcessingError(
+    failure = RecoverableProcessingError(
         message,
         failure_id=failure_id,
         stage=stage,
@@ -1202,8 +1202,11 @@ def _make_recoverable_error(
         artifact_path=artifact_path,
     )
 
+    failure.required_bytes = extra.get('required_bytes', MERGE_DISK_RESERVE_BYTES)
+    return failure
 
-def probe_recovery_target(target_dir):
+
+def probe_recovery_target(target_dir, required_bytes=MERGE_DISK_RESERVE_BYTES):
     """探测目标目录、可用空间以及临时文件读写链路。"""
     temp_path = None
     file_handle = None
@@ -1216,8 +1219,12 @@ def probe_recovery_target(target_dir):
                 target_dir,
             )
         usage = shutil.disk_usage(target_dir)
-        if int(usage.free) <= 0:
-            raise OSError(errno.ENOSPC, f'恢复目标目录没有可用空间: {target_dir}')
+        if int(usage.free) < required_bytes:
+            raise OSError(
+                errno.ENOSPC,
+                f'目标目录空间不足：可用 {int(usage.free)} 字节，'
+                f'至少需要 {required_bytes} 字节；继续等待: {target_dir}',
+            )
         fd, temp_path = tempfile.mkstemp(
             prefix='.findinvideo-recovery-', suffix='.tmp', dir=target_dir,
         )
@@ -1297,6 +1304,8 @@ def wait_for_recovery(
     target = target or os.getcwd()
     interval = get_recovery_retry_seconds()
     sleeper = sleep_fn or time.sleep
+    required_bytes = max(MERGE_DISK_RESERVE_BYTES, getattr(failure, 'required_bytes', 0))
+    print(f'处理已暂停，等待存储恢复；每 {interval:g} 秒检查一次: {target}', flush=True)
     while True:
         if _pause_during_recovery(pause_checker):
             record_recovery_event(
@@ -1332,8 +1341,9 @@ def wait_for_recovery(
                 sleeper(delay)
                 elapsed = max(delay, time.monotonic() - started)
                 remaining -= elapsed
-        probe_ok, probe_result = probe_recovery_target(target)
+        probe_ok, probe_result = probe_recovery_target(target, required_bytes=required_bytes)
         if probe_ok:
+            print(f'存储探测通过，继续断点恢复: {target}', flush=True)
             record_recovery_event(
                 'recovery_probe_succeeded',
                 failure_id=failure_id,
@@ -1343,6 +1353,7 @@ def wait_for_recovery(
                 probe=probe_result,
             )
             return True
+        print(f'存储仍未恢复，{interval:g} 秒后再检查: {probe_result}', flush=True)
         probe_snapshot = build_recovery_failure_snapshot(
             'recovery_probe',
             error=probe_result,
@@ -1827,6 +1838,8 @@ class ResumableFrameVideo:
         self.active_start_frame = None
         self.requires_full_rebuild = False
         self._last_segment_validation = {}
+        self._next_disk_check = 0.0
+        self._check_disk_space()
         self._load_checkpoint_segments()
 
     def _raise_recoverable(self, message, stage, error=None, artifact_path=None, **details):
@@ -1841,6 +1854,19 @@ class ResumableFrameVideo:
             pipeline_id=self.pipeline_id,
             **details,
         )
+
+    def _check_disk_space(self):
+        """在调用原生视频读写前保留空间，避免满盘后反复打开损坏分段。"""
+        try:
+            free_bytes = int(shutil.disk_usage(self.video_dir).free)
+            if free_bytes < MERGE_DISK_RESERVE_BYTES:
+                raise OSError(errno.ENOSPC, '检测帧视频目录可用空间不足')
+        except OSError as exc:
+            raise self._raise_recoverable(
+                '存储空间不足或不可访问，暂停写入并等待恢复',
+                'segment_disk_check', error=exc,
+                required_bytes=MERGE_DISK_RESERVE_BYTES,
+            ) from exc
 
     def _segment_validation_details(self):
         """返回完整的 OpenCV 分段校验字段，便于区分失败阶段。"""
@@ -1952,6 +1978,9 @@ class ResumableFrameVideo:
 
     def write(self, frame, frame_number):
         """写入一个检测帧；需要时创建当前可覆盖的工作分段。"""
+        if self.active_writer is None or time.monotonic() >= self._next_disk_check:
+            self._check_disk_space()
+            self._next_disk_check = time.monotonic() + 1.0
         if self.active_writer is None:
             self.active_start_frame = max(0, int(frame_number))
             self.active_path = self._segment_path(self.active_start_frame)
