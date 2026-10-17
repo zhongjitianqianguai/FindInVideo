@@ -1,3 +1,12 @@
+from runtime_diagnostics import (
+    install_runtime_diagnostics, process_diagnostics, record_video_started,
+    record_video_failure, record_process_event, set_exit_reason,
+)
+
+# 依赖导入前安装诊断，导入失败和原生崩溃也能留下本机记录。
+if __name__ == '__main__':
+    install_runtime_diagnostics(__file__)
+
 from ultralytics import YOLO
 import cv2
 import numpy as np
@@ -336,6 +345,7 @@ def detect_objects_in_video(
     save_timestamps=False,
 ):
     # 如果不开启全量检测，则保证 target_class 为列表
+    record_video_started(video_path, file_md5=claim_md5, pipeline_id=_resolve_pipeline_id())
     if not all_objects and isinstance(target_class, str):
         target_class = [target_class]
 
@@ -1462,6 +1472,10 @@ def process_directory_videos(
                     save_timestamps=save_timestamps_switch,
                 )
                 if not _mark_video_completed(video_file, detections, file_md5=md5):
+                    record_video_failure(
+                        video_file, message='视频完成状态写入失败', file_md5=md5,
+                        pipeline_id=_resolve_pipeline_id(), stage='completion_commit',
+                    )
                     return False, None
                 if _pause_requested():
                     raise PauseRequested()
@@ -1491,7 +1505,8 @@ def process_directory_videos(
             raise
         except RecoverableProcessingError:
             raise
-        except Exception:
+        except Exception as exc:
+            record_video_failure(video_file, error=exc, file_md5=md5, pipeline_id=_resolve_pipeline_id())
             _LOGGER.error("Video failed: %s\n%s", video_file, traceback.format_exc())
             failed_videos.append(video_file)
             continue
@@ -1707,7 +1722,8 @@ def _run_main():
                             raise
                         except RecoverableProcessingError:
                             raise
-                        except Exception:
+                        except Exception as exc:
+                            record_video_failure(file_path, error=exc, file_md5=md5, pipeline_id=_resolve_pipeline_id())
                             _LOGGER.error(
                                 "Video failed: %s\n%s",
                                 file_path,
@@ -1760,7 +1776,8 @@ def _run_main():
                         raise
                     except RecoverableProcessingError:
                         raise
-                    except Exception:
+                    except Exception as exc:
+                        record_video_failure(video_path, error=exc, file_md5=md5, pipeline_id=_resolve_pipeline_id())
                         _LOGGER.error(
                             "Video failed: %s\n%s",
                             video_path,
@@ -1773,23 +1790,26 @@ def _run_main():
 
 
 if __name__ == "__main__":
-    try:
-        while True:
-            try:
-                _run_main()
-                break
-            except RecoverableProcessingError as e:
-                print(f"\n检测到可恢复故障，等待恢复探测: {e}")
-                wait_for_recovery(
-                    e,
-                    target_dir=_PROCESSING_ROOT_DIR,
-                    video_path=getattr(e, 'video_path', None),
-                    artifact_path=getattr(e, 'artifact_path', None),
-                    pause_checker=_pause_requested,
-                )
-    except PauseRequested:
-        print("\n已按请求暂停，本轮处理已停止。")
-        raise SystemExit(0)
-    except KeyboardInterrupt:
-        print("\n已按请求停止，本轮处理已终止。")
-        raise SystemExit(130)
+    with process_diagnostics(__file__):
+        try:
+            while True:
+                try:
+                    _run_main()
+                    break
+                except RecoverableProcessingError as e:
+                    print(f"\n检测到可恢复故障，等待恢复探测: {e}")
+                    wait_for_recovery(
+                        e,
+                        target_dir=_PROCESSING_ROOT_DIR,
+                        video_path=getattr(e, 'video_path', None),
+                        artifact_path=getattr(e, 'artifact_path', None),
+                        pause_checker=_pause_requested,
+                    )
+        except PauseRequested:
+            print("\n已按请求暂停，本轮处理已停止。")
+            set_exit_reason('pause_requested')
+            raise SystemExit(0)
+        except KeyboardInterrupt:
+            print("\n已按请求停止，本轮处理已终止。")
+            set_exit_reason('keyboard_interrupt')
+            raise SystemExit(130)

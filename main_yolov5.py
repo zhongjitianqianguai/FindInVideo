@@ -1,3 +1,12 @@
+from runtime_diagnostics import (
+    install_runtime_diagnostics, process_diagnostics, record_video_started,
+    record_video_failure, record_process_event, set_exit_reason,
+)
+
+# 依赖导入前安装诊断，导入失败和原生崩溃也能留下本机记录。
+if __name__ == '__main__':
+    install_runtime_diagnostics(__file__)
+
 import sys
 import os
 import shutil
@@ -72,7 +81,12 @@ class VideoProcessingResult:
         return cls(True, list(detections or []), None)
 
     @classmethod
-    def failed(cls, error):
+    def failed(cls, error, video_path=None, file_md5=None, pipeline_id=None, **details):
+        if video_path is not None:
+            record_video_failure(
+                video_path, error=error if isinstance(error, BaseException) else None,
+                message=str(error), file_md5=file_md5, pipeline_id=pipeline_id, **details,
+            )
         return cls(False, [], str(error))
 
 
@@ -119,7 +133,7 @@ def _call_directory_index(method_name, *args, pipeline_id=None, **kwargs):
 
 
 def _setup_diagnostics():
-    """Best-effort logging and crash diagnostics."""
+    """配置运行文本日志，并复用公共异常与崩溃诊断。"""
     global _CRASH_LOG_FH
     try:
         base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -142,18 +156,7 @@ def _setup_diagnostics():
             stream_handler.setFormatter(fmt)
             _LOGGER.addHandler(stream_handler)
 
-        if _CRASH_LOG_FH is None:
-            _CRASH_LOG_FH = open(crash_log_path, 'a', encoding='utf-8', errors='ignore')
-            faulthandler.enable(file=_CRASH_LOG_FH, all_threads=True)
-
-        def _excepthook(exc_type, exc_value, exc_tb):
-            try:
-                _LOGGER.error("Uncaught exception:\n%s", ''.join(traceback.format_exception(exc_type, exc_value, exc_tb)))
-            except Exception:
-                pass
-            sys.__excepthook__(exc_type, exc_value, exc_tb)
-
-        sys.excepthook = _excepthook
+        install_runtime_diagnostics(__file__)
         _LOGGER.info("Diagnostics enabled. Logs: %s", run_log_path)
     except Exception:
         pass
@@ -525,7 +528,7 @@ def _detect_objects_in_video_yolov5_impl(
         print(f"成功加载YOLOv5模型: {model_path}")
     except Exception as e:
         print(f"加载模型失败: {e}")
-        return VideoProcessingResult.failed(f"加载模型失败: {e}")
+        return VideoProcessingResult.failed(f"加载模型失败: {e}", video_path=video_path, file_md5=claim_md5, pipeline_id=pipeline)
 
     if claim_md5 and not _call_directory_index(
         'refresh_claim', claim_md5, pipeline_id=pipeline
@@ -581,7 +584,7 @@ def _detect_objects_in_video_yolov5_impl(
         _resources['cap'] = cap
     if not cap.isOpened():
         print(f"警告: 无法打开视频: {video_path}")
-        return VideoProcessingResult.failed(f"无法打开视频: {video_path}")
+        return VideoProcessingResult.failed(f"无法打开视频: {video_path}", video_path=video_path, file_md5=claim_md5, pipeline_id=pipeline)
     fps = cap.get(cv2.CAP_PROP_FPS)
     fps_safe = fps if fps and fps > 0 else 25
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
@@ -596,7 +599,10 @@ def _detect_objects_in_video_yolov5_impl(
             )
             cap.release()
             return VideoProcessingResult.failed(
-                f"无法恢复视频断点到第 {start_frame} 帧: {exc}"
+                f"无法恢复视频断点到第 {start_frame} 帧: {exc}",
+                video_path=video_path,
+                file_md5=claim_md5,
+                pipeline_id=pipeline,
             )
         if not seek_ok:
             record_resume_seek(
@@ -605,7 +611,10 @@ def _detect_objects_in_video_yolov5_impl(
             )
             cap.release()
             return VideoProcessingResult.failed(
-                f"无法恢复视频断点到第 {start_frame} 帧"
+                f"无法恢复视频断点到第 {start_frame} 帧",
+                video_path=video_path,
+                file_md5=claim_md5,
+                pipeline_id=pipeline,
             )
         record_resume_seek(
             video_path, start_frame, True, reported_frame=reported_frame,
@@ -789,6 +798,10 @@ def _detect_objects_in_video_yolov5_impl(
             raise
         except Exception as e:
             print(f"处理帧 {frame_count} 时出错: {e}")
+            record_video_failure(
+                video_path, error=e, file_md5=claim_md5, pipeline_id=pipeline,
+                stage='frame_processing', frame_number=frame_count,
+            )
             if not _save_checkpoint(
                     video_path,
                     next_frame=frame_count,
@@ -873,7 +886,10 @@ def _detect_objects_in_video_yolov5_impl(
                 ),
             )
             return VideoProcessingResult.failed(
-                f'视频读取提前结束: 已处理 {frame_count}/{total_frames} 帧'
+                f'视频读取提前结束: 已处理 {frame_count}/{total_frames} 帧',
+                video_path=video_path,
+                file_md5=claim_md5,
+                pipeline_id=pipeline,
             )
         print(
             f'提示: 视频尾部元数据比实际可读帧多 '
@@ -946,6 +962,7 @@ def detect_objects_in_video_yolov5(
     model_path='models/breast.pt',
 ):
     """使用 YOLOv5 检测，并确保所有退出路径都释放视频资源。"""
+    record_video_started(video_path, file_md5=claim_md5, pipeline_id=_resolve_pipeline_id(pipeline_id))
     resources = {}
     try:
         return _detect_objects_in_video_yolov5_impl(
@@ -1153,7 +1170,13 @@ def _detect_objects_with_frame_analysis_impl(
         if result.returncode != 0:
             print(f"detect.py运行失败: {result.stderr}")
             return VideoProcessingResult.failed(
-                f"detect.py运行失败: {result.stderr or result.returncode}"
+                f"detect.py运行失败: {result.stderr or result.returncode}",
+                video_path=video_path,
+                file_md5=claim_md5,
+                pipeline_id=pipeline,
+                subprocess_returncode=result.returncode,
+                subprocess_stdout=result.stdout,
+                subprocess_stderr=result.stderr,
             )
 
         if claim_md5 and not _call_directory_index(
@@ -1180,7 +1203,7 @@ def _detect_objects_with_frame_analysis_impl(
             _resources['cap'] = cap
         if not cap.isOpened():
             print(f"警告: 无法打开视频: {video_path}")
-            return VideoProcessingResult.failed(f"无法打开视频: {video_path}")
+            return VideoProcessingResult.failed(f"无法打开视频: {video_path}", video_path=video_path, file_md5=claim_md5, pipeline_id=pipeline)
         fps = cap.get(cv2.CAP_PROP_FPS)
         fps_safe = fps if fps and fps > 0 else 25
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
@@ -1195,7 +1218,10 @@ def _detect_objects_with_frame_analysis_impl(
                 )
                 cap.release()
                 return VideoProcessingResult.failed(
-                    f"无法恢复视频断点到第 {start_frame} 帧: {exc}"
+                    f"无法恢复视频断点到第 {start_frame} 帧: {exc}",
+                    video_path=video_path,
+                    file_md5=claim_md5,
+                    pipeline_id=pipeline,
                 )
             if not seek_ok:
                 record_resume_seek(
@@ -1204,7 +1230,10 @@ def _detect_objects_with_frame_analysis_impl(
                 )
                 cap.release()
                 return VideoProcessingResult.failed(
-                    f"无法恢复视频断点到第 {start_frame} 帧"
+                    f"无法恢复视频断点到第 {start_frame} 帧",
+                    video_path=video_path,
+                    file_md5=claim_md5,
+                    pipeline_id=pipeline,
                 )
             record_resume_seek(
                 video_path, start_frame, True, reported_frame=reported_frame,
@@ -1332,7 +1361,10 @@ def _detect_objects_with_frame_analysis_impl(
                     ),
                 )
                 return VideoProcessingResult.failed(
-                    f'视频读取提前结束: 已处理 {frame_count}/{total_frames} 帧'
+                    f'视频读取提前结束: 已处理 {frame_count}/{total_frames} 帧',
+                    video_path=video_path,
+                    file_md5=claim_md5,
+                    pipeline_id=pipeline,
                 )
             print(
                 f'提示: 视频尾部元数据比实际可读帧多 '
@@ -1390,7 +1422,7 @@ def _detect_objects_with_frame_analysis_impl(
         raise
     except Exception as e:
         print(f"检测失败: {e}")
-        return VideoProcessingResult.failed(f"检测失败: {e}")
+        return VideoProcessingResult.failed(f"检测失败: {e}", video_path=video_path, file_md5=claim_md5, pipeline_id=pipeline)
 
 
 def detect_objects_with_frame_analysis(
@@ -1405,6 +1437,7 @@ def detect_objects_with_frame_analysis(
     model_path='models/breast.pt',
 ):
     """运行 detect.py 并确保所有退出路径都释放视频资源。"""
+    record_video_started(video_path, file_md5=claim_md5, pipeline_id=_resolve_pipeline_id(pipeline_id))
     resources = {}
     try:
         return _detect_objects_with_frame_analysis_impl(
@@ -1611,7 +1644,7 @@ def process_directory_videos(
                 if not result.success:
                     print(f"处理视频失败: {video_file}, 错误: {result.error}")
                     return False
-                return _mark_video_completed(
+                completed = _mark_video_completed(
                     video_file,
                     result,
                     file_md5=md5,
@@ -1619,6 +1652,12 @@ def process_directory_videos(
                     pipeline_id=pipeline,
                     source_snapshot=source_snapshot,
                 )
+                if not completed:
+                    record_video_failure(
+                        video_file, message='视频完成状态写入失败', file_md5=md5,
+                        pipeline_id=pipeline, stage='completion_commit',
+                    )
+                return completed
 
             outcome = retry_with_recovery(
                 _process_claimed_video_once,
@@ -1653,6 +1692,7 @@ def process_directory_videos(
         except RecoverableProcessingError:
             raise
         except Exception as exc:
+            record_video_failure(video_file, error=exc, file_md5=md5, pipeline_id=pipeline)
             print(f"处理视频失败: {video_file}, 错误: {exc}")
             _LOGGER.error("Video failed: %s\n%s", video_file, traceback.format_exc())
         finally:
@@ -1766,89 +1806,90 @@ def get_file_md5(file_path):
     return None
 
 if __name__ == "__main__":
-    _setup_diagnostics()
-    _install_pause_signal_handler()
-    video_path = r"C:\Users\f1094\Desktop\DouyinLiveRecorder\download\邹邹大王"  # 可设置为视频文件或目录
-    processing_root = video_path if os.path.isdir(video_path) else os.path.dirname(video_path)
-    _init_processing_root(processing_root)
-    if os.path.isdir(video_path):
-        cleanup_orphan_artifacts(
-            video_path,
-            exclusions=EXCLUDE_PATHS,
-            directory_index=DIRECTORY_INDEX,
-        )
-    # 如要检测所有模型内对象，则将 target_item 设置为任意值并启用全量检测开关
-    target_item = "breast"  # 当 all_objects 为 True 时，该值不再限制检测
-    all_objects_switch = True  # 设置为 True 表示显示所有检测对象
+    with process_diagnostics(__file__):
+        _setup_diagnostics()
+        _install_pause_signal_handler()
+        video_path = r"C:\Users\f1094\Desktop\DouyinLiveRecorder\download\邹邹大王"  # 可设置为视频文件或目录
+        processing_root = video_path if os.path.isdir(video_path) else os.path.dirname(video_path)
+        _init_processing_root(processing_root)
+        if os.path.isdir(video_path):
+            cleanup_orphan_artifacts(
+                video_path,
+                exclusions=EXCLUDE_PATHS,
+                directory_index=DIRECTORY_INDEX,
+            )
+        # 如要检测所有模型内对象，则将 target_item 设置为任意值并启用全量检测开关
+        target_item = "breast"  # 当 all_objects 为 True 时，该值不再限制检测
+        all_objects_switch = True  # 设置为 True 表示显示所有检测对象
     
-    # YOLOv5模型路径 - 使用相对路径
-    yolov5_model_path = "models/breast.pt"  # 您可以根据需要修改模型路径
+        # YOLOv5模型路径 - 使用相对路径
+        yolov5_model_path = "models/breast.pt"  # 您可以根据需要修改模型路径
     
-    # 新增选项：是否使用detect.py进行推理
-    use_detectpy = True  # 设置为 True 使用detect.py，False 使用原有方法
+        # 新增选项：是否使用detect.py进行推理
+        use_detectpy = True  # 设置为 True 使用detect.py，False 使用原有方法
 
-    PIPELINE_ID = build_pipeline_id(
-        engine='yolov5-detectpy' if use_detectpy else 'yolov5-inline',
-        model_path=yolov5_model_path,
-        target_class=target_item,
-        all_objects=all_objects_switch,
-        confidence=0.5,
-        image_size=640,
-    )
+        PIPELINE_ID = build_pipeline_id(
+            engine='yolov5-detectpy' if use_detectpy else 'yolov5-inline',
+            model_path=yolov5_model_path,
+            target_class=target_item,
+            all_objects=all_objects_switch,
+            confidence=0.5,
+            image_size=640,
+        )
     
-    # 新增功能：按叶子节点视频数量排序处理
-    use_leaf_node_processing = True  # 设置为 True 启用叶子节点处理模式
+        # 新增功能：按叶子节点视频数量排序处理
+        use_leaf_node_processing = True  # 设置为 True 启用叶子节点处理模式
     
-    if use_leaf_node_processing and os.path.isdir(video_path):
-        print(f"启用叶子节点处理模式，正在扫描目录: {video_path}")
-        print("正在查找包含视频文件的叶子节点目录...")
+        if use_leaf_node_processing and os.path.isdir(video_path):
+            print(f"启用叶子节点处理模式，正在扫描目录: {video_path}")
+            print("正在查找包含视频文件的叶子节点目录...")
         
-        # 查找所有叶子目录
-        leaf_dirs = find_leaf_directories_with_videos(video_path, EXCLUDE_PATHS)
+            # 查找所有叶子目录
+            leaf_dirs = find_leaf_directories_with_videos(video_path, EXCLUDE_PATHS)
         
-        if not leaf_dirs:
-            print(f"未找到包含视频文件的叶子节点目录")
-        else:
-            print(f"\n找到 {len(leaf_dirs)} 个包含视频文件的叶子节点目录:")
-            for i, (dir_path, video_count) in enumerate(leaf_dirs, 1):
-                relative_path = os.path.relpath(dir_path, video_path)
-                print(f"{i:3d}. {relative_path} ({video_count} 个视频文件)")
+            if not leaf_dirs:
+                print(f"未找到包含视频文件的叶子节点目录")
+            else:
+                print(f"\n找到 {len(leaf_dirs)} 个包含视频文件的叶子节点目录:")
+                for i, (dir_path, video_count) in enumerate(leaf_dirs, 1):
+                    relative_path = os.path.relpath(dir_path, video_path)
+                    print(f"{i:3d}. {relative_path} ({video_count} 个视频文件)")
             
-            print(f"\n开始按视频数量从多到少的顺序处理叶子节点目录...")
+                print(f"\n开始按视频数量从多到少的顺序处理叶子节点目录...")
             
-            # 按顺序处理每个叶子目录
-            for i, (dir_path, video_count) in enumerate(leaf_dirs, 1):
-                relative_path = os.path.relpath(dir_path, video_path)
-                print(f"\n=== 处理第 {i}/{len(leaf_dirs)} 个目录: {relative_path} ({video_count} 个视频) ===")
-                process_directory_videos(dir_path, target_item, all_objects_switch, yolov5_model_path, use_detectpy)
+                # 按顺序处理每个叶子目录
+                for i, (dir_path, video_count) in enumerate(leaf_dirs, 1):
+                    relative_path = os.path.relpath(dir_path, video_path)
+                    print(f"\n=== 处理第 {i}/{len(leaf_dirs)} 个目录: {relative_path} ({video_count} 个视频) ===")
+                    process_directory_videos(dir_path, target_item, all_objects_switch, yolov5_model_path, use_detectpy)
     
-    # 原有的处理逻辑（当 use_leaf_node_processing 为 False 时使用）
-    elif os.path.isdir(video_path):
-        video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv']
-        for root, dirs, files in os.walk(video_path):
-            for file in files:
-                ext = os.path.splitext(file)[1].lower()
-                if ext in video_extensions:
-                    file_path = os.path.join(root, file)
-                    if should_process(file_path):
-                        print(f"开始处理视频文件: {file_path}")
-                        detect_objects_in_video_yolov5(file_path, target_item,
-                                                      show_window=False,
-                                                      save_crops=True,
-                                                      save_training_data=False,
-                                                      all_objects=all_objects_switch,
-                                                      model_path=yolov5_model_path)
-                    else:
-                        print(f"已存在拼接图片，跳过处理: {file_path}")
-    else:
-        # 处理单个视频文件
-        if should_process(video_path):
-            print(f'开始处理视频文件: {video_path}')
-            detect_objects_in_video_yolov5(video_path, target_item,
-                                          show_window=False,
-                                          save_crops=True,
-                                          save_training_data=False,
-                                          all_objects=all_objects_switch,
-                                          model_path=yolov5_model_path)
+        # 原有的处理逻辑（当 use_leaf_node_processing 为 False 时使用）
+        elif os.path.isdir(video_path):
+            video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv']
+            for root, dirs, files in os.walk(video_path):
+                for file in files:
+                    ext = os.path.splitext(file)[1].lower()
+                    if ext in video_extensions:
+                        file_path = os.path.join(root, file)
+                        if should_process(file_path):
+                            print(f"开始处理视频文件: {file_path}")
+                            detect_objects_in_video_yolov5(file_path, target_item,
+                                                          show_window=False,
+                                                          save_crops=True,
+                                                          save_training_data=False,
+                                                          all_objects=all_objects_switch,
+                                                          model_path=yolov5_model_path)
+                        else:
+                            print(f"已存在拼接图片，跳过处理: {file_path}")
         else:
-            print(f"已存在拼接图片，跳过处理: {video_path}")
+            # 处理单个视频文件
+            if should_process(video_path):
+                print(f'开始处理视频文件: {video_path}')
+                detect_objects_in_video_yolov5(video_path, target_item,
+                                              show_window=False,
+                                              save_crops=True,
+                                              save_training_data=False,
+                                              all_objects=all_objects_switch,
+                                              model_path=yolov5_model_path)
+            else:
+                print(f"已存在拼接图片，跳过处理: {video_path}")

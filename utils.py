@@ -21,6 +21,9 @@ import re
 from ctypes import wintypes
 import atexit
 import uuid
+import traceback
+
+from runtime_diagnostics import record_process_event
 
 
 def _get_process_started_at(pid):
@@ -1028,6 +1031,7 @@ def build_recovery_failure_snapshot(
         'artifact_path': str(artifact_path) if artifact_path else None,
         'exception_class': type(error).__name__ if error is not None else None,
         'exception_message': str(error) if error is not None else None,
+        'traceback': ''.join(traceback.format_exception(type(error), error, error.__traceback__)) if isinstance(error, BaseException) else '',
         'exception_type': type(error).__name__ if error is not None else None,
         'error_message': str(error) if error is not None else None,
         'errno': error_errno,
@@ -2732,7 +2736,7 @@ def _pause_requested(pause_file_path=None):
     global _PAUSE_EVENT_RECORDED
     if _STOP_REQUESTED:
         if not _PAUSE_EVENT_RECORDED:
-            record_processing_event(
+            record_process_event(
                 'pause_requested', source='sigint', pause_file=None,
             )
             _PAUSE_EVENT_RECORDED = True
@@ -2743,7 +2747,7 @@ def _pause_requested(pause_file_path=None):
     except Exception:
         return False
     if requested and not _PAUSE_EVENT_RECORDED:
-        record_processing_event(
+        record_process_event(
             'pause_requested', source='pause_file', pause_file=path,
         )
         _PAUSE_EVENT_RECORDED = True

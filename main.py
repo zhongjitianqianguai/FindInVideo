@@ -1,3 +1,12 @@
+from runtime_diagnostics import (
+    install_runtime_diagnostics, process_diagnostics, record_video_started,
+    record_video_failure, record_process_event, set_exit_reason,
+)
+
+# 依赖导入前安装诊断，导入失败和原生崩溃也能留下本机记录。
+if __name__ == '__main__':
+    install_runtime_diagnostics(__file__)
+
 from ultralytics import YOLO
 import cv2
 import numpy as np
@@ -490,6 +499,7 @@ def detect_objects_in_video(
     model=None,
 ):
     # 如果不开启全量检测，则保证 target_class 为列表
+    record_video_started(video_path, file_md5=claim_md5, pipeline_id=_resolve_pipeline_id())
     if not all_objects and isinstance(target_class, str):
         target_class = [target_class]
 
@@ -1713,6 +1723,10 @@ def process_directory_videos(
                     save_timestamps=save_timestamps_switch,
                 )
                 if not _mark_video_completed(video_file, detections, file_md5=md5):
+                    record_video_failure(
+                        video_file, message='视频完成状态写入失败', file_md5=md5,
+                        pipeline_id=_resolve_pipeline_id(), stage='completion_commit',
+                    )
                     return False, None
                 if _pause_requested():
                     raise PauseRequested()
@@ -1742,7 +1756,8 @@ def process_directory_videos(
             raise
         except RecoverableProcessingError:
             raise
-        except Exception:
+        except Exception as exc:
+            record_video_failure(video_file, error=exc, file_md5=md5, pipeline_id=_resolve_pipeline_id())
             _LOGGER.error("Video failed: %s\n%s", video_file, traceback.format_exc())
             failed_videos.append(video_file)
             continue
@@ -1780,364 +1795,373 @@ def process_directory_videos(
 
 
 if __name__ == "__main__":
-    try:
-        utils._STOP_REQUESTED = False
-        _install_pause_signal_handler()
-        video_path = r"G:\z"  # 可设置为视频文件或目录
+    with process_diagnostics(__file__):
+        try:
+            utils._STOP_REQUESTED = False
+            _install_pause_signal_handler()
+            video_path = r"G:\z"  # 可设置为视频文件或目录
 
-        # 检查路径是否存在
-        if not os.path.exists(video_path):
-            print(f"错误: 路径不存在: {video_path}")
-            exit(1)
-
-        # 如果传入的是目录但目录为空或无视频文件，给出提示
-        if os.path.isdir(video_path):
-            try:
-                files = os.listdir(video_path)
-                if not files:
-                    print(f"错误: 目录为空: {video_path}")
-                    exit(1)
-            except PermissionError:
-                print(f"错误: 无权限访问目录: {video_path}")
+            # 检查路径是否存在
+            if not os.path.exists(video_path):
+                print(f"错误: 路径不存在: {video_path}")
+                set_exit_reason('input_path_missing')
                 exit(1)
-        # 如要检测所有模型内对象，则将 target_item 设置为任意值并启用全量检测开关
-        target_item = "face"  # 当 all_objects 为 True 时，该值不再限制检测
-        all_objects_switch = False  # 设置为 True 表示显示所有检测对象
-        save_mosaic_switch = False  # 设置为 True 启用拼接图片保存
-        save_timestamps_switch = False  # 设置为 True 启用检测时间戳txt保存
-        model_path = os.environ.get('FINDINVIDEO_FACE_MODEL', MODEL_PATH)
-        _activate_pipeline(
-            model_path,
-            target_item,
-            all_objects=all_objects_switch,
-        )
-        print(f"加载模型: {model_path}")
-        _ACTIVE_MODEL = YOLO(model_path)
 
-        # 初始化处理根目录，数据库和yoloed.txt都放在 <video_path>/md5_list/ 下
-        _root = video_path if os.path.isdir(video_path) else os.path.dirname(video_path)
-        _init_processing_root(_root)
-        if os.path.isdir(video_path):
-            utils.cleanup_orphan_artifacts(
-                video_path,
-                exclusions=EXCLUDE_PATHS,
-                directory_index=DIRECTORY_INDEX,
+            # 如果传入的是目录但目录为空或无视频文件，给出提示
+            if os.path.isdir(video_path):
+                try:
+                    files = os.listdir(video_path)
+                    if not files:
+                        print(f"错误: 目录为空: {video_path}")
+                        set_exit_reason('input_directory_empty')
+                        exit(1)
+                except PermissionError:
+                    print(f"错误: 无权限访问目录: {video_path}")
+                    set_exit_reason('input_access_denied')
+                    exit(1)
+            # 如要检测所有模型内对象，则将 target_item 设置为任意值并启用全量检测开关
+            target_item = "face"  # 当 all_objects 为 True 时，该值不再限制检测
+            all_objects_switch = False  # 设置为 True 表示显示所有检测对象
+            save_mosaic_switch = False  # 设置为 True 启用拼接图片保存
+            save_timestamps_switch = False  # 设置为 True 启用检测时间戳txt保存
+            model_path = os.environ.get('FINDINVIDEO_FACE_MODEL', MODEL_PATH)
+            _activate_pipeline(
+                model_path,
+                target_item,
+                all_objects=all_objects_switch,
             )
+            print(f"加载模型: {model_path}")
+            _ACTIVE_MODEL = YOLO(model_path)
 
-        # 新增功能：按叶子节点视频数量排序处理
-        use_leaf_node_processing = True  # 设置为 True 启用叶子节点处理模式
-
-        if use_leaf_node_processing and os.path.isdir(video_path):
-            print(f"启用叶子节点处理模式，正在扫描目录: {video_path}")
-            print("正在查找包含视频文件的叶子节点目录...")
-
-            if _pause_requested():
-                raise PauseRequested()
-            root_video_count = count_videos_in_directory(video_path)
-            if root_video_count > 0:
-                print(f"\n=== 处理根目录: {video_path} ({root_video_count} 个视频) ===")
-                process_directory_videos(video_path, target_item, all_objects_switch)
-
-            leaf_dirs = find_leaf_directories_with_videos(
-                video_path, EXCLUDE_PATHS, refresh_index=True
-            )
-
-            if not leaf_dirs:
-                print(f"未找到包含视频文件的叶子节点目录")
-            else:
-                # 旧流水线才使用共享 yoloed 缓存；新流水线只认 profile marker。
-                if _resolve_pipeline_id() is None:
-                    load_yoloed_md5(reload=True)
-
-                print(f"\n找到 {len(leaf_dirs)} 个包含视频文件的叶子节点目录:")
-                for i, (dir_path, video_count, all_processed) in enumerate(leaf_dirs, 1):
-                    relative_path = _safe_relpath(dir_path, video_path)
-                    status = " [已处理]" if all_processed else ""
-                    print(f"{i:3d}. {relative_path} ({video_count} 个视频文件){status}")
-
-                print(f"\n开始按视频数量从多到少的顺序处理叶子节点目录...")
-
-                # 先筛出本轮未处理队列，避免增量处理时继续显示原始排序位置/总目录数
-                db_skipped = 0
-                fs_skipped = 0
-                yoloed_skipped = 0
-                pending_leaf_dirs = []
-                _diag_count = 0  # 诊断计数器：只对前几个未跳过的目录输出详细信息
-                _yoloed_path_count = len(_YOLOED_PATH_CACHE) if _YOLOED_PATH_CACHE else 0
-                _yoloed_basename_count = (
-                    len(_YOLOED_BASENAME_CACHE) if _YOLOED_BASENAME_CACHE else 0
+            # 初始化处理根目录，数据库和yoloed.txt都放在 <video_path>/md5_list/ 下
+            _root = video_path if os.path.isdir(video_path) else os.path.dirname(video_path)
+            _init_processing_root(_root)
+            if os.path.isdir(video_path):
+                utils.cleanup_orphan_artifacts(
+                    video_path,
+                    exclusions=EXCLUDE_PATHS,
+                    directory_index=DIRECTORY_INDEX,
                 )
-                print(
-                    f"[诊断] yoloed.txt 缓存状态: {len(_YOLOED_MD5_CACHE or set())} 条MD5, "
-                    f"{_yoloed_path_count} 条路径, {_yoloed_basename_count} 个文件名索引"
-                )
-                for i, (dir_path, video_count, all_processed) in enumerate(leaf_dirs, 1):
-                    if _pause_requested():
-                        raise PauseRequested()
-                    relative_path = _safe_relpath(dir_path, video_path)
 
-                    # 第1层跳过：数据库快速跳过（has_artifact=True 且目录 mtime 未变 → 无需任何I/O）
-                    dir_info = (
-                        DIRECTORY_INDEX.get_directory_info(dir_path)
-                        if _resolve_pipeline_id() is None
-                        else None
-                    )
-                    if dir_info:
-                        db_has_artifact, db_mtime = dir_info
-                        if db_has_artifact and db_mtime is not None:
-                            try:
-                                current_mtime = os.stat(dir_path).st_mtime
-                                if current_mtime == db_mtime:
-                                    db_skipped += 1
-                                    continue  # 目录未变且已全部处理，完全跳过
-                            except (PermissionError, FileNotFoundError, OSError):
-                                pass  # 无法获取mtime，退回到正常处理流程
-                    elif all_processed:
-                        # 数据库为空（如刚重建后），但文件系统检查确认所有视频都已有衍生文件
-                        fs_skipped += 1
-                        continue
+            # 新增功能：按叶子节点视频数量排序处理
+            use_leaf_node_processing = True  # 设置为 True 启用叶子节点处理模式
 
-                    # 第2层跳过：yoloed.txt 路径+basename 索引比对（仅需一次 listdir + 内存比对，无 MD5 计算）
-                    if _check_all_videos_done(dir_path):
-                        yoloed_skipped += 1
-                        continue
+            if use_leaf_node_processing and os.path.isdir(video_path):
+                print(f"启用叶子节点处理模式，正在扫描目录: {video_path}")
+                print("正在查找包含视频文件的叶子节点目录...")
 
-                    pending_leaf_dirs.append(
-                        (dir_path, video_count, all_processed, relative_path, dir_info)
-                    )
-
-                pending_count = len(pending_leaf_dirs)
-                if pending_count == 0:
-                    print("\n所有目录均已处理完成，无需继续处理")
-
-                for queue_index, (
-                    dir_path,
-                    video_count,
-                    all_processed,
-                    relative_path,
-                    dir_info,
-                ) in enumerate(pending_leaf_dirs, 1):
-                    if _pause_requested():
-                        raise PauseRequested()
-
-                    # 诊断输出：前3个未跳过的目录打印详细原因
-                    if _diag_count < 3:
-                        _diag_count += 1
-                        _diag_dir_info = (
-                            f"dir_info={dir_info}, all_processed={all_processed}"
-                        )
-                        print(f"[诊断 {_diag_count}/3] 未跳过: {relative_path}")
-                        print(f"  DB层: {_diag_dir_info}")
-                        try:
-                            _diag_files = os.listdir(dir_path)
-                            _diag_videos = [f for f in _diag_files if is_video_file(f)]
-                            _diag_dir_bn = os.path.basename(
-                                dir_path.rstrip(os.sep + "/")
-                            ).lower()
-                            print(
-                                f"  目录basename: {_diag_dir_bn}, 视频数: {len(_diag_videos)}"
-                            )
-                            for _dv in _diag_videos[:3]:  # 最多显示3个视频的匹配情况
-                                _dv_path = os.path.join(dir_path, _dv)
-                                _dv_lower = _dv.lower()
-                                _in_path_cache = str(_dv_path) in (
-                                    _YOLOED_PATH_CACHE or set()
-                                ) or os.path.normpath(str(_dv_path)) in (
-                                    _YOLOED_PATH_CACHE or set()
-                                )
-                                _bn_parents = (_YOLOED_BASENAME_CACHE or {}).get(_dv_lower)
-                                _bn_match = _bn_parents and _diag_dir_bn in _bn_parents
-                                print(
-                                    f"  视频 {_dv}: 路径缓存={_in_path_cache}, "
-                                    f"basename索引={_bn_parents is not None}(父目录匹配={_bn_match})"
-                                )
-                                if _bn_parents and not _bn_match:
-                                    # 显示实际存储的父目录名与当前目录名的差异
-                                    _sample_parents = list(_bn_parents)[:3]
-                                    print(
-                                        f"    yoloed中的父目录: {_sample_parents}, 当前目录: {_diag_dir_bn}"
-                                    )
-                        except Exception as _de:
-                            print(f"  诊断读取失败: {_de}")
-
-                    print(
-                        f"\n=== [未处理队列 {queue_index}/{pending_count}] {relative_path} ({video_count} 个视频) ==="
-                    )
-                    actually_processed = process_directory_videos(
-                        dir_path, target_item, all_objects_switch
-                    )
-                    if actually_processed == 0:
-                        yoloed_skipped += 1
-
-                    # 每处理完一个目录后强制垃圾回收
-                    gc.collect()
-                    # 让系统有时间释放资源
-                    time.sleep(2)
-
-                total_skipped = db_skipped + fs_skipped + yoloed_skipped
-                if total_skipped > 0:
-                    parts = []
-                    if db_skipped > 0:
-                        parts.append(f"数据库快速跳过 {db_skipped} 个")
-                    if fs_skipped > 0:
-                        parts.append(f"衍生文件跳过 {fs_skipped} 个")
-                    if yoloed_skipped > 0:
-                        parts.append(f"yoloed/MD5跳过 {yoloed_skipped} 个")
-                    print(
-                        f"\n共跳过 {total_skipped}/{len(leaf_dirs)} 个目录（{', '.join(parts)}）"
-                    )
-
-        # 原有的处理逻辑（当 use_leaf_node_processing 为 False 时使用）
-        elif os.path.isdir(video_path):
-            video_extensions = [".mp4", ".avi", ".mov", ".mkv", ".wmv"]
-            for root, dirs, files in os.walk(video_path):
                 if _pause_requested():
                     raise PauseRequested()
-                for file in files:
+                root_video_count = count_videos_in_directory(video_path)
+                if root_video_count > 0:
+                    print(f"\n=== 处理根目录: {video_path} ({root_video_count} 个视频) ===")
+                    process_directory_videos(video_path, target_item, all_objects_switch)
+
+                leaf_dirs = find_leaf_directories_with_videos(
+                    video_path, EXCLUDE_PATHS, refresh_index=True
+                )
+
+                if not leaf_dirs:
+                    print(f"未找到包含视频文件的叶子节点目录")
+                else:
+                    # 旧流水线才使用共享 yoloed 缓存；新流水线只认 profile marker。
+                    if _resolve_pipeline_id() is None:
+                        load_yoloed_md5(reload=True)
+
+                    print(f"\n找到 {len(leaf_dirs)} 个包含视频文件的叶子节点目录:")
+                    for i, (dir_path, video_count, all_processed) in enumerate(leaf_dirs, 1):
+                        relative_path = _safe_relpath(dir_path, video_path)
+                        status = " [已处理]" if all_processed else ""
+                        print(f"{i:3d}. {relative_path} ({video_count} 个视频文件){status}")
+
+                    print(f"\n开始按视频数量从多到少的顺序处理叶子节点目录...")
+
+                    # 先筛出本轮未处理队列，避免增量处理时继续显示原始排序位置/总目录数
+                    db_skipped = 0
+                    fs_skipped = 0
+                    yoloed_skipped = 0
+                    pending_leaf_dirs = []
+                    _diag_count = 0  # 诊断计数器：只对前几个未跳过的目录输出详细信息
+                    _yoloed_path_count = len(_YOLOED_PATH_CACHE) if _YOLOED_PATH_CACHE else 0
+                    _yoloed_basename_count = (
+                        len(_YOLOED_BASENAME_CACHE) if _YOLOED_BASENAME_CACHE else 0
+                    )
+                    print(
+                        f"[诊断] yoloed.txt 缓存状态: {len(_YOLOED_MD5_CACHE or set())} 条MD5, "
+                        f"{_yoloed_path_count} 条路径, {_yoloed_basename_count} 个文件名索引"
+                    )
+                    for i, (dir_path, video_count, all_processed) in enumerate(leaf_dirs, 1):
+                        if _pause_requested():
+                            raise PauseRequested()
+                        relative_path = _safe_relpath(dir_path, video_path)
+
+                        # 第1层跳过：数据库快速跳过（has_artifact=True 且目录 mtime 未变 → 无需任何I/O）
+                        dir_info = (
+                            DIRECTORY_INDEX.get_directory_info(dir_path)
+                            if _resolve_pipeline_id() is None
+                            else None
+                        )
+                        if dir_info:
+                            db_has_artifact, db_mtime = dir_info
+                            if db_has_artifact and db_mtime is not None:
+                                try:
+                                    current_mtime = os.stat(dir_path).st_mtime
+                                    if current_mtime == db_mtime:
+                                        db_skipped += 1
+                                        continue  # 目录未变且已全部处理，完全跳过
+                                except (PermissionError, FileNotFoundError, OSError):
+                                    pass  # 无法获取mtime，退回到正常处理流程
+                        elif all_processed:
+                            # 数据库为空（如刚重建后），但文件系统检查确认所有视频都已有衍生文件
+                            fs_skipped += 1
+                            continue
+
+                        # 第2层跳过：yoloed.txt 路径+basename 索引比对（仅需一次 listdir + 内存比对，无 MD5 计算）
+                        if _check_all_videos_done(dir_path):
+                            yoloed_skipped += 1
+                            continue
+
+                        pending_leaf_dirs.append(
+                            (dir_path, video_count, all_processed, relative_path, dir_info)
+                        )
+
+                    pending_count = len(pending_leaf_dirs)
+                    if pending_count == 0:
+                        print("\n所有目录均已处理完成，无需继续处理")
+
+                    for queue_index, (
+                        dir_path,
+                        video_count,
+                        all_processed,
+                        relative_path,
+                        dir_info,
+                    ) in enumerate(pending_leaf_dirs, 1):
+                        if _pause_requested():
+                            raise PauseRequested()
+
+                        # 诊断输出：前3个未跳过的目录打印详细原因
+                        if _diag_count < 3:
+                            _diag_count += 1
+                            _diag_dir_info = (
+                                f"dir_info={dir_info}, all_processed={all_processed}"
+                            )
+                            print(f"[诊断 {_diag_count}/3] 未跳过: {relative_path}")
+                            print(f"  DB层: {_diag_dir_info}")
+                            try:
+                                _diag_files = os.listdir(dir_path)
+                                _diag_videos = [f for f in _diag_files if is_video_file(f)]
+                                _diag_dir_bn = os.path.basename(
+                                    dir_path.rstrip(os.sep + "/")
+                                ).lower()
+                                print(
+                                    f"  目录basename: {_diag_dir_bn}, 视频数: {len(_diag_videos)}"
+                                )
+                                for _dv in _diag_videos[:3]:  # 最多显示3个视频的匹配情况
+                                    _dv_path = os.path.join(dir_path, _dv)
+                                    _dv_lower = _dv.lower()
+                                    _in_path_cache = str(_dv_path) in (
+                                        _YOLOED_PATH_CACHE or set()
+                                    ) or os.path.normpath(str(_dv_path)) in (
+                                        _YOLOED_PATH_CACHE or set()
+                                    )
+                                    _bn_parents = (_YOLOED_BASENAME_CACHE or {}).get(_dv_lower)
+                                    _bn_match = _bn_parents and _diag_dir_bn in _bn_parents
+                                    print(
+                                        f"  视频 {_dv}: 路径缓存={_in_path_cache}, "
+                                        f"basename索引={_bn_parents is not None}(父目录匹配={_bn_match})"
+                                    )
+                                    if _bn_parents and not _bn_match:
+                                        # 显示实际存储的父目录名与当前目录名的差异
+                                        _sample_parents = list(_bn_parents)[:3]
+                                        print(
+                                            f"    yoloed中的父目录: {_sample_parents}, 当前目录: {_diag_dir_bn}"
+                                        )
+                            except Exception as _de:
+                                print(f"  诊断读取失败: {_de}")
+
+                        print(
+                            f"\n=== [未处理队列 {queue_index}/{pending_count}] {relative_path} ({video_count} 个视频) ==="
+                        )
+                        actually_processed = process_directory_videos(
+                            dir_path, target_item, all_objects_switch
+                        )
+                        if actually_processed == 0:
+                            yoloed_skipped += 1
+
+                        # 每处理完一个目录后强制垃圾回收
+                        gc.collect()
+                        # 让系统有时间释放资源
+                        time.sleep(2)
+
+                    total_skipped = db_skipped + fs_skipped + yoloed_skipped
+                    if total_skipped > 0:
+                        parts = []
+                        if db_skipped > 0:
+                            parts.append(f"数据库快速跳过 {db_skipped} 个")
+                        if fs_skipped > 0:
+                            parts.append(f"衍生文件跳过 {fs_skipped} 个")
+                        if yoloed_skipped > 0:
+                            parts.append(f"yoloed/MD5跳过 {yoloed_skipped} 个")
+                        print(
+                            f"\n共跳过 {total_skipped}/{len(leaf_dirs)} 个目录（{', '.join(parts)}）"
+                        )
+
+            # 原有的处理逻辑（当 use_leaf_node_processing 为 False 时使用）
+            elif os.path.isdir(video_path):
+                video_extensions = [".mp4", ".avi", ".mov", ".mkv", ".wmv"]
+                for root, dirs, files in os.walk(video_path):
                     if _pause_requested():
                         raise PauseRequested()
-                    ext = os.path.splitext(file)[1].lower()
-                    if ext in video_extensions:
-                        file_path = os.path.join(root, file)
-                        md5 = should_process(file_path, acquire_claim=False)
-                        if md5:
-                            # 获取视频时长
-                            cap = cv2.VideoCapture(file_path)
-                            if not cap.isOpened():
-                                print(f"无法打开视频: {file_path}")
-                                continue
+                    for file in files:
+                        if _pause_requested():
+                            raise PauseRequested()
+                        ext = os.path.splitext(file)[1].lower()
+                        if ext in video_extensions:
+                            file_path = os.path.join(root, file)
+                            md5 = should_process(file_path, acquire_claim=False)
+                            if md5:
+                                # 获取视频时长
+                                cap = cv2.VideoCapture(file_path)
+                                if not cap.isOpened():
+                                    print(f"无法打开视频: {file_path}")
+                                    continue
 
-                            fps = cap.get(cv2.CAP_PROP_FPS)
-                            frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-                            cap.release()
-                            duration = frame_count / fps if fps > 0 else float("inf")
-                            if duration > 3600:
-                                print(
-                                    f"视频时长 {duration:.2f}秒超过一小时，跳过处理: {file_path}"
-                                )
-                                continue
-
-                            if not _try_claim_video(md5, file_path):
-                                print(f"视频已被其他实例抢先声明，跳过: {file_path}")
-                                continue
-                            try:
-                                print(f"开始处理视频文件: {file_path}")
-                                detections = detect_objects_in_video(
-                                    file_path,
-                                    target_item,
-                                    claim_md5=md5,
-                                    show_window=False,
-                                    save_crops=save_mosaic_switch,
-                                    save_training_data=False,
-                                    all_objects=all_objects_switch,
-                                    save_mosaic=save_mosaic_switch,
-                                    save_timestamps=save_timestamps_switch,
-                                )
-                                if not _mark_video_completed(
-                                    file_path, detections, file_md5=md5
-                                ):
-                                    raise ClaimLostError(
-                                        f"视频完成状态写入失败: {file_path}"
+                                fps = cap.get(cv2.CAP_PROP_FPS)
+                                frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                                cap.release()
+                                duration = frame_count / fps if fps > 0 else float("inf")
+                                if duration > 3600:
+                                    print(
+                                        f"视频时长 {duration:.2f}秒超过一小时，跳过处理: {file_path}"
                                     )
-                                if _pause_requested():
-                                    raise PauseRequested()
-                            except (PauseRequested, KeyboardInterrupt):
-                                raise
-                            except RecoverableProcessingError:
-                                raise
-                            except Exception:
-                                _LOGGER.error(
-                                    "Video failed: %s\n%s",
-                                    file_path,
-                                    traceback.format_exc(),
-                                )
-                                continue
-                            finally:
-                                _release_claim_safely(md5)
+                                    continue
 
-                            # 强制垃圾回收
-                            gc.collect()
-                            time.sleep(1)
-                        else:
-                            print(f"视频无需处理或已被占用，跳过: {file_path}")
-        else:
-            # 处理单个视频文件前检查视频时长
-            cap = cv2.VideoCapture(video_path)
-            if not cap.isOpened():
-                print(f"无法打开视频: {video_path}")
+                                if not _try_claim_video(md5, file_path):
+                                    print(f"视频已被其他实例抢先声明，跳过: {file_path}")
+                                    continue
+                                try:
+                                    print(f"开始处理视频文件: {file_path}")
+                                    detections = detect_objects_in_video(
+                                        file_path,
+                                        target_item,
+                                        claim_md5=md5,
+                                        show_window=False,
+                                        save_crops=save_mosaic_switch,
+                                        save_training_data=False,
+                                        all_objects=all_objects_switch,
+                                        save_mosaic=save_mosaic_switch,
+                                        save_timestamps=save_timestamps_switch,
+                                    )
+                                    if not _mark_video_completed(
+                                        file_path, detections, file_md5=md5
+                                    ):
+                                        raise ClaimLostError(
+                                            f"视频完成状态写入失败: {file_path}"
+                                        )
+                                    if _pause_requested():
+                                        raise PauseRequested()
+                                except (PauseRequested, KeyboardInterrupt):
+                                    raise
+                                except RecoverableProcessingError:
+                                    raise
+                                except Exception as exc:
+                                    record_video_failure(file_path, error=exc, file_md5=md5, pipeline_id=_resolve_pipeline_id())
+                                    _LOGGER.error(
+                                        "Video failed: %s\n%s",
+                                        file_path,
+                                        traceback.format_exc(),
+                                    )
+                                    continue
+                                finally:
+                                    _release_claim_safely(md5)
+
+                                # 强制垃圾回收
+                                gc.collect()
+                                time.sleep(1)
+                            else:
+                                print(f"视频无需处理或已被占用，跳过: {file_path}")
             else:
-                fps = cap.get(cv2.CAP_PROP_FPS)
-                frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-                cap.release()
-                duration = frame_count / fps if fps > 0 else float("inf")
-                if duration > 3600:
-                    print(f"视频时长 {duration:.2f}秒超过一小时，跳过处理: {video_path}")
+                # 处理单个视频文件前检查视频时长
+                cap = cv2.VideoCapture(video_path)
+                if not cap.isOpened():
+                    print(f"无法打开视频: {video_path}")
                 else:
-                    md5 = should_process(video_path, acquire_claim=False)
-                    if md5:
-                        if not _try_claim_video(md5, video_path):
-                            print(f"视频已被其他实例抢先声明，跳过: {video_path}")
-                        else:
-                            try:
-                                print(f"开始处理视频文件: {video_path}")
-                                detections = detect_objects_in_video(
-                                    video_path,
-                                    target_item,
-                                    claim_md5=md5,
-                                    show_window=False,
-                                    save_crops=save_mosaic_switch,
-                                    save_training_data=False,
-                                    all_objects=all_objects_switch,
-                                    save_mosaic=save_mosaic_switch,
-                                    save_timestamps=save_timestamps_switch,
-                                )
-                                if not _mark_video_completed(
-                                    video_path, detections, file_md5=md5
-                                ):
-                                    raise ClaimLostError(
-                                        f"视频完成状态写入失败: {video_path}"
-                                    )
-                                if _pause_requested():
-                                    raise PauseRequested()
-                            except (PauseRequested, KeyboardInterrupt):
-                                raise
-                            except RecoverableProcessingError:
-                                raise
-                            except Exception:
-                                _LOGGER.error(
-                                    "Video failed: %s\n%s",
-                                    video_path,
-                                    traceback.format_exc(),
-                                )
-                            finally:
-                                _release_claim_safely(md5)
+                    fps = cap.get(cv2.CAP_PROP_FPS)
+                    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                    cap.release()
+                    duration = frame_count / fps if fps > 0 else float("inf")
+                    if duration > 3600:
+                        print(f"视频时长 {duration:.2f}秒超过一小时，跳过处理: {video_path}")
                     else:
-                        print(f"视频无需处理或已被占用，跳过: {video_path}")
-    except RecoverableProcessingError as e:
-        while True:
-            print(f"\n检测到可恢复故障，等待恢复探测: {e}")
-            wait_for_recovery(
-                e,
-                target_dir=_PROCESSING_ROOT_DIR,
-                video_path=getattr(e, 'video_path', None),
-                artifact_path=getattr(e, 'artifact_path', None),
-                pause_checker=_pause_requested,
-            )
-            try:
-                os.execv(
-                    sys.executable,
-                    [sys.executable, os.path.abspath(__file__), *sys.argv[1:]],
+                        md5 = should_process(video_path, acquire_claim=False)
+                        if md5:
+                            if not _try_claim_video(md5, video_path):
+                                print(f"视频已被其他实例抢先声明，跳过: {video_path}")
+                            else:
+                                try:
+                                    print(f"开始处理视频文件: {video_path}")
+                                    detections = detect_objects_in_video(
+                                        video_path,
+                                        target_item,
+                                        claim_md5=md5,
+                                        show_window=False,
+                                        save_crops=save_mosaic_switch,
+                                        save_training_data=False,
+                                        all_objects=all_objects_switch,
+                                        save_mosaic=save_mosaic_switch,
+                                        save_timestamps=save_timestamps_switch,
+                                    )
+                                    if not _mark_video_completed(
+                                        video_path, detections, file_md5=md5
+                                    ):
+                                        raise ClaimLostError(
+                                            f"视频完成状态写入失败: {video_path}"
+                                        )
+                                    if _pause_requested():
+                                        raise PauseRequested()
+                                except (PauseRequested, KeyboardInterrupt):
+                                    raise
+                                except RecoverableProcessingError:
+                                    raise
+                                except Exception as exc:
+                                    record_video_failure(video_path, error=exc, file_md5=md5, pipeline_id=_resolve_pipeline_id())
+                                    _LOGGER.error(
+                                        "Video failed: %s\n%s",
+                                        video_path,
+                                        traceback.format_exc(),
+                                    )
+                                finally:
+                                    _release_claim_safely(md5)
+                        else:
+                            print(f"视频无需处理或已被占用，跳过: {video_path}")
+        except RecoverableProcessingError as e:
+            while True:
+                print(f"\n检测到可恢复故障，等待恢复探测: {e}")
+                wait_for_recovery(
+                    e,
+                    target_dir=_PROCESSING_ROOT_DIR,
+                    video_path=getattr(e, 'video_path', None),
+                    artifact_path=getattr(e, 'artifact_path', None),
+                    pause_checker=_pause_requested,
                 )
-            except OSError as exc:
-                e = utils._make_recoverable_error(
-                    '恢复后重新启动当前入口失败，等待后重试',
-                    'entrypoint_restart',
-                    error=exc,
-                    artifact_path=sys.executable,
-                )
-    except PauseRequested:
-        print("\n已按请求暂停，本轮处理已停止。")
-        raise SystemExit(0)
-    except KeyboardInterrupt:
-        print("\n已按请求停止，本轮处理已终止。")
-        raise SystemExit(130)
+                try:
+                    record_process_event('process_restart_requested', reason='storage_recovered')
+                    os.execv(
+                        sys.executable,
+                        [sys.executable, os.path.abspath(__file__), *sys.argv[1:]],
+                    )
+                except OSError as exc:
+                    e = utils._make_recoverable_error(
+                        '恢复后重新启动当前入口失败，等待后重试',
+                        'entrypoint_restart',
+                        error=exc,
+                        artifact_path=sys.executable,
+                    )
+        except PauseRequested:
+            print("\n已按请求暂停，本轮处理已停止。")
+            set_exit_reason('pause_requested')
+            raise SystemExit(0)
+        except KeyboardInterrupt:
+            print("\n已按请求停止，本轮处理已终止。")
+            set_exit_reason('keyboard_interrupt')
+            raise SystemExit(130)

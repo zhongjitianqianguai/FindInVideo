@@ -33,6 +33,7 @@ class RuntimeDiagnosticsTests(unittest.TestCase):
     def run_child(self, code, runtime_log=None):
         """在临时日志路径运行隔离子进程。"""
         environment = os.environ.copy()
+        environment['PYTHONIOENCODING'] = 'utf-8'
         environment['FINDINVIDEO_RUNTIME_LOG_PATH'] = str(runtime_log or self.runtime_log)
         environment['FINDINVIDEO_CRASH_LOG_PATH'] = str(self.crash_log)
         return subprocess.run(
@@ -41,6 +42,7 @@ class RuntimeDiagnosticsTests(unittest.TestCase):
             env=environment,
             capture_output=True,
             text=True,
+            encoding='utf-8',
             timeout=30,
         )
 
@@ -235,6 +237,38 @@ class RuntimeDiagnosticsTests(unittest.TestCase):
         ])
         fake_utils.record_processing_event.assert_not_called()
         self.assertFalse(any(event['event_type'] == 'process_exit' for event in events))
+
+    def test_keyboard_interrupt_records_platform_exit_code(self):
+        result = self.run_child("""
+            import runtime_diagnostics as diagnostics
+            with diagnostics.process_diagnostics('main.py'):
+                raise KeyboardInterrupt('keyboard-marker')
+        """)
+        exits = [event for event in self.read_events() if event['event_type'] == 'process_exit']
+        self.assertEqual(len(exits), 1)
+        self.assertEqual(exits[0]['reason'], 'keyboard_interrupt')
+        self.assertEqual(exits[0]['exit_code'], result.returncode)
+        self.assertIn('keyboard-marker', exits[0]['traceback'])
+
+    def test_thread_failure_keeps_traceback_without_claiming_process_exit(self):
+        result = self.run_child("""
+            import threading
+            import runtime_diagnostics as diagnostics
+            def fail_thread():
+                raise RuntimeError('thread-marker')
+            with diagnostics.process_diagnostics('main.py'):
+                worker = threading.Thread(target=fail_thread, name='diagnostic-worker')
+                worker.start()
+                worker.join()
+        """)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = self.read_events()
+        failures = [event for event in events if event['event_type'] == 'thread_exception']
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]['thread_name'], 'diagnostic-worker')
+        self.assertIn('fail_thread', failures[0]['traceback'])
+        self.assertIn('thread-marker', failures[0]['traceback'])
+        self.assertEqual([event for event in events if event['event_type'] == 'process_exit'][0]['reason'], 'queue_exhausted')
 
 
 def result_pid(events):

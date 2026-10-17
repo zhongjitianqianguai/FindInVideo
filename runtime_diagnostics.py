@@ -242,7 +242,14 @@ def _exit_code_for_system_exit(error):
     if code is None:
         return 0
     if isinstance(code, int):
-        return code
+        return code & (0xffffffff if os.name == 'nt' else 0xff)
+    return 1
+
+
+def _unhandled_exit_code(error):
+    """保持解释器退出行为，并记录当前平台实际报告的退出码。"""
+    if isinstance(error, KeyboardInterrupt):
+        return 0xc000013a if os.name == 'nt' else 130
     return 1
 
 
@@ -282,7 +289,7 @@ def _sys_excepthook(exc_type, exc_value, exc_traceback):
     if id(exc_value) not in _HANDLED_EXCEPTION_IDS:
         _record_process_exit(
             _EXIT_REASON or 'uncaught_exception',
-            exit_code=1,
+            exit_code=_unhandled_exit_code(exc_value),
             error=exc_value,
             exc_traceback=exc_traceback,
         )
@@ -325,9 +332,13 @@ def _install_console_handler():
     if os.name != 'nt' or _CONSOLE_HANDLER is not None:
         return
     try:
-        callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_uint)
+        # Windows BOOL 是 32 位，不能使用 8 位 c_bool 作为回调返回值。
+        callback_type = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint)
         _CONSOLE_HANDLER = callback_type(_console_control_handler)
-        if not ctypes.windll.kernel32.SetConsoleCtrlHandler(_CONSOLE_HANDLER, True):
+        register = ctypes.windll.kernel32.SetConsoleCtrlHandler
+        register.argtypes = [callback_type, ctypes.c_int]
+        register.restype = ctypes.c_int
+        if not register(_CONSOLE_HANDLER, True):
             _CONSOLE_HANDLER = None
     except Exception as error:
         _CONSOLE_HANDLER = None
@@ -442,14 +453,16 @@ def process_diagnostics(entrypoint):
     except KeyboardInterrupt as error:
         _record_process_exit(
             _EXIT_REASON or 'keyboard_interrupt',
-            exit_code=130,
+            exit_code=_unhandled_exit_code(error),
             error=error,
         )
         raise
     except BaseException as error:
+        pause_type = getattr(sys.modules.get('utils'), 'PauseRequested', None)
+        reason = 'pause_requested' if pause_type is not None and isinstance(error, pause_type) else 'uncaught_exception'
         _record_process_exit(
-            _EXIT_REASON or 'uncaught_exception',
-            exit_code=1,
+            _EXIT_REASON or reason,
+            exit_code=_unhandled_exit_code(error),
             error=error,
         )
         raise
