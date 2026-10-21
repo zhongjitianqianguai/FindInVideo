@@ -7,6 +7,7 @@ import queue
 import subprocess
 import sys
 import threading
+import traceback
 from typing import Any
 
 
@@ -156,7 +157,8 @@ class BoundedVideoCapture:
             raise TimeoutError(f'{operation}超过 {timeout:g} 秒仍未完成') from exc
 
         if item is _PIPE_CLOSED:
-            raise OSError('视频读取进程的通信管道已关闭')
+            code = self._process.poll() if self._process is not None else None
+            raise OSError(f'视频读取进程的通信管道已关闭，退出码: {code}')
         if isinstance(item, _ReaderFailure):
             raise OSError(f'读取视频响应失败: {item.message}')
         if not isinstance(item, dict):
@@ -250,12 +252,25 @@ class BoundedVideoCapture:
 def _worker_main(path: str) -> int:
     """运行只持有 OpenCV 对象的子进程协议循环。"""
     capture = None
+    crash_stream = None
 
     def send(message: dict[str, Any]) -> None:
         pickle.dump(message, sys.stdout.buffer, protocol=pickle.HIGHEST_PROTOCOL)
         sys.stdout.buffer.flush()
 
     try:
+        import faulthandler
+        crash_path = os.environ.get('FINDINVIDEO_CRASH_LOG_PATH') or os.path.join(os.path.dirname(__file__), 'logs', 'crash.log')
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(crash_path)), exist_ok=True)
+            crash_stream = open(crash_path, 'a', encoding='utf-8')
+            crash_stream.write(f'视频读取进程 pid={os.getpid()} parent_pid={os.getppid()} path={path}\n')
+            crash_stream.flush()
+            os.dup2(crash_stream.fileno(), 2)
+            faulthandler.enable(file=crash_stream, all_threads=True)
+        except OSError:
+            # 主进程仍会记录真实退出状态，诊断路径不可写不应改变视频处理。
+            pass
         import cv2
         import numpy as np  # noqa: F401
 
@@ -284,10 +299,10 @@ def _worker_main(path: str) -> int:
                     raise ValueError(f'未知视频操作: {command}')
                 send({'ok': True, 'value': value})
             except Exception as exc:
-                send({'ok': False, 'error': f'{type(exc).__name__}: {exc}'})
+                send({'ok': False, 'error': traceback.format_exc()})
     except BaseException as exc:
         try:
-            send({'ok': False, 'error': f'{type(exc).__name__}: {exc}'})
+            send({'ok': False, 'error': traceback.format_exc()})
         except Exception:
             pass
     finally:
@@ -296,6 +311,9 @@ def _worker_main(path: str) -> int:
                 capture.release()
             except Exception:
                 pass
+        if crash_stream is not None:
+            faulthandler.disable()
+            crash_stream.close()
     return 0
 
 

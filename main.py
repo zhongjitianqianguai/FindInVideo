@@ -23,6 +23,7 @@ import ntpath
 import sys
 import stat
 import sqlite3
+import errno
 
 import utils
 from utils import (
@@ -149,6 +150,91 @@ def _resolve_pipeline_id(pipeline_id=None):
     return pipeline_id if pipeline_id is not None else _ACTIVE_PIPELINE_ID
 
 
+def _raise_if_storage_offline(path, error=None, stage='directory_scan', directory=False, verify_source=False, position=0.0):
+    """仅把实际存储离线识别为可恢复故障，单个坏文件不阻塞队列。"""
+    root = _PROCESSING_ROOT_DIR or (path if directory else os.path.dirname(path) or '.')
+    network_codes = {21, 53, 54, 55, 59, 64, 67, 121, 1231, 1232, 2250}
+    network_errnos = {errno.EIO, errno.ENODEV, errno.ENETDOWN, errno.ENETUNREACH,
+                      errno.ECONNRESET, errno.ETIMEDOUT, errno.EHOSTUNREACH}
+    cause = error if (
+        getattr(error, 'winerror', None) in network_codes
+        or getattr(error, 'errno', None) in network_errnos
+    ) else None
+    try:
+        os.stat(root)
+        with os.scandir(root) as entries:
+            next(entries, None)
+    except OSError as exc:
+        cause = exc
+    if cause is None and verify_source:
+        try:
+            with open(path, 'rb') as handle:
+                size = os.fstat(handle.fileno()).st_size
+                handle.seek(min(max(0, int(size * position)), max(0, size - 4096)))
+                handle.read(4096)
+        except OSError as exc:
+            # 文件被删除、权限不足仍按单文件失败处理；明确网络/I/O 错误才等待。
+            if getattr(exc, 'winerror', None) in network_codes or getattr(exc, 'errno', None) in network_errnos:
+                cause = exc
+    if cause is not None:
+        failure = utils._make_recoverable_error(
+            f'共享存储暂时不可访问，保留断点并等待恢复: {root}', stage,
+            error=cause, video_path=None if directory else path,
+            artifact_path=root, processing_root=root,
+        )
+        failure.recovery_target_dir = root
+        raise failure from cause
+
+
+def _on_scan_error(error, path):
+    """目录索引或回退遍历出错时先识别共享盘离线。"""
+    _raise_if_storage_offline(path, error, directory=True)
+
+
+def _open_video_capture(path):
+    """共享视频使用可终止的读取进程，本地视频保持原 OpenCV 后端。"""
+    try:
+        if str(path).startswith('\\\\') or windows_path_to_unc(path):
+            from bounded_capture import BoundedVideoCapture
+            return BoundedVideoCapture(path)
+        return cv2.VideoCapture(path)
+    except OSError as exc:
+        _raise_if_storage_offline(path, exc, stage='source_read', verify_source=True)
+        raise
+
+
+class _StorageVideoIO:
+    """让断点分段校验和合并也使用有界读取，写入仍沿用原后端。"""
+
+    def VideoCapture(self, path):
+        return _open_video_capture(path)
+
+    def __getattr__(self, name):
+        return getattr(cv2, name)
+
+
+def _video_duration(path):
+    """读取时长；存储离线不跳过视频，坏视频保持原有未解决状态。"""
+    cap = None
+    try:
+        cap = _open_video_capture(path)
+        if not cap.isOpened():
+            _raise_if_storage_offline(path, stage='source_read', verify_source=True)
+            return None
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        return frame_count / fps if fps > 0 else float('inf')
+    except RecoverableProcessingError:
+        raise
+    except Exception as exc:
+        _raise_if_storage_offline(path, exc, stage='source_read', verify_source=True)
+        record_video_failure(path, error=exc, pipeline_id=_resolve_pipeline_id(), stage='source_metadata')
+        return None
+    finally:
+        if cap is not None:
+            cap.release()
+
+
 def _get_image_size():
     """读取模型输入尺寸，非法配置回退到入口默认值。"""
     try:
@@ -226,17 +312,20 @@ def _hash_stable_source(video_path):
     """在 MD5 前后核对源文件，拒绝刚写入或处理中变化的视频。"""
     try:
         before = _source_snapshot(video_path)
-    except OSError:
+    except OSError as exc:
+        _raise_if_storage_offline(video_path, exc)
         return None, None, 'source_unstable'
     age_seconds = time.time() - before['mtime_ns'] / 1_000_000_000
     if age_seconds < _minimum_source_age_seconds():
         return None, None, 'source_unstable'
     md5 = get_file_md5_cached(video_path)
     if not md5:
+        _raise_if_storage_offline(video_path, verify_source=True)
         return None, None, 'md5_unavailable'
     try:
         after = _source_snapshot(video_path)
-    except OSError:
+    except OSError as exc:
+        _raise_if_storage_offline(video_path, exc)
         return None, None, 'source_unstable'
     if before != after:
         return None, None, 'source_unstable'
@@ -291,7 +380,8 @@ def directory_has_artifact_outputs(dir_path):
             lower = name.lower()
             if lower.endswith(DIR_ARTIFACT_SKIP_SUFFIXES):
                 return True
-    except (PermissionError, FileNotFoundError, OSError):
+    except OSError as exc:
+        _on_scan_error(exc, dir_path)
         return False
     return False
 
@@ -306,7 +396,8 @@ def is_leaf_directory(dir_path):
             if os.path.isdir(item_path):
                 return False
         return True
-    except (PermissionError, FileNotFoundError):
+    except OSError as exc:
+        _on_scan_error(exc, dir_path)
         return False
 
 
@@ -321,7 +412,8 @@ def count_videos_in_directory(dir_path):
             file_path = os.path.join(dir_path, file)
             if os.path.isfile(file_path) and is_video_file(file_path):
                 count += 1
-    except (PermissionError, FileNotFoundError):
+    except OSError as exc:
+        _on_scan_error(exc, dir_path)
         pass
     return count
 
@@ -333,7 +425,8 @@ def _check_all_videos_have_artifacts(dir_path, file_list=None):
     if file_list is None:
         try:
             file_list = os.listdir(dir_path)
-        except (PermissionError, FileNotFoundError, OSError):
+        except OSError as exc:
+            _on_scan_error(exc, dir_path)
             return False
     video_names = [f for f in file_list if is_video_file(f)]
     if not video_names:
@@ -357,7 +450,8 @@ def _check_all_videos_in_yoloed(dir_path, file_list=None):
     if file_list is None:
         try:
             file_list = os.listdir(dir_path)
-        except (PermissionError, FileNotFoundError, OSError):
+        except OSError as exc:
+            _on_scan_error(exc, dir_path)
             return False
     video_names = [f for f in file_list if is_video_file(f)]
     if not video_names:
@@ -393,7 +487,8 @@ def _check_all_videos_done(dir_path, file_list=None):
     if file_list is None:
         try:
             file_list = os.listdir(dir_path)
-        except (PermissionError, FileNotFoundError, OSError):
+        except OSError as exc:
+            _on_scan_error(exc, dir_path)
             return False
     video_names = [f for f in file_list if is_video_file(f)]
     if not video_names:
@@ -444,17 +539,20 @@ def find_leaf_directories_with_videos(root_path, exclusions=None, refresh_index=
         exclusions = EXCLUDE_PATHS
     try:
         if refresh_index:
-            DIRECTORY_INDEX.refresh(root_path, exclusions)
+            DIRECTORY_INDEX.refresh(root_path, exclusions, on_error=_on_scan_error)
         leaf_dirs = DIRECTORY_INDEX.get_leaf_directories(root_path)
         if _resolve_pipeline_id() is not None:
             leaf_dirs = [(path, count, False) for path, count, _done in leaf_dirs]
+    except RecoverableProcessingError:
+        raise
     except Exception as exc:
+        _on_scan_error(exc, root_path)
         print(f"索引查找叶子目录失败，退回遍历模式: {exc}")
         leaf_dirs = []
     if not leaf_dirs:
         # 兼容性回退
         try:
-            for root, dirs, files in os.walk(root_path):
+            for root, dirs, files in os.walk(root_path, onerror=lambda exc: _on_scan_error(exc, root_path)):
                 is_excluded = any(root.startswith(ex_path) for ex_path in exclusions)
                 if is_excluded:
                     continue
@@ -472,8 +570,10 @@ def find_leaf_directories_with_videos(root_path, exclusions=None, refresh_index=
                         # 检查目录中所有视频是否都已有衍生文件（纯内存比对，零额外I/O）
                         all_done = _check_all_videos_have_artifacts(root, files)
                         leaf_dirs.append((root, video_count, all_done))
-        except (PermissionError, FileNotFoundError) as e:
+        except OSError as e:
+            _on_scan_error(e, root_path)
             print(f"警告: 无法访问目录 '{root_path}': {e}")
+    _on_scan_error(None, root_path)
     leaf_dirs.sort(key=lambda x: x[1], reverse=True)
     return leaf_dirs
 
@@ -599,6 +699,7 @@ def detect_objects_in_video(
                     for cls in target_class:
                         f.write(cls + "\n")
 
+    _raise_if_storage_offline(video_path, stage='source_read')
     ckpt = _load_pipeline_checkpoint(video_path) if resume_enabled else None
     start_frame = int(ckpt.get("next_frame", 0)) if ckpt else 0
     detections = list(ckpt.get("detections", [])) if ckpt else []
@@ -609,69 +710,77 @@ def detect_objects_in_video(
     )
 
     # 视频处理初始化
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"无法打开视频: {video_path}")
-
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    fps_safe = fps if fps and fps > 0 else 25
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    cap = _open_video_capture(video_path)
     try:
-        frame_video = ResumableFrameVideo(
-            video_save_path,
-            fps=fps_safe,
-            cv2_module=cv2,
-            checkpoint=ckpt,
-            video_path=video_path,
-            file_md5=claim_md5,
-            pipeline_id=_resolve_pipeline_id(),
-        )
-    except RecoverableProcessingError:
-        cap.release()
-        raise
-    if frame_video.requires_full_rebuild:
-        print(
-            "检查点缺少完整检测帧分段，将从头重建，"
-            f"避免生成不完整产物: {video_path}"
-        )
-        ckpt = None
-        start_frame = 0
-        detections = []
-        last_detected = -5
-        frame_video.reset_for_full_rebuild()
-    checkpoint_created = bool(ckpt)
-    checkpoint_interval = get_checkpoint_interval_seconds()
-    last_periodic_checkpoint = time.time()
-    if start_frame > 0:
+        if not cap.isOpened():
+            _raise_if_storage_offline(video_path, stage='source_read', verify_source=True)
+            raise RuntimeError(f"无法打开视频: {video_path}")
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        fps_safe = fps if fps and fps > 0 else 25
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         try:
-            seek_ok = cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-            reported_frame = cap.get(cv2.CAP_PROP_POS_FRAMES)
-        except Exception as exc:
-            record_resume_seek(
-                video_path, start_frame, False, error=exc,
-                file_md5=claim_md5, pipeline_id=_resolve_pipeline_id(),
-            )
-            cap.release()
-            raise RuntimeError(f"无法恢复视频断点到第 {start_frame} 帧") from exc
-        if not seek_ok:
-            record_resume_seek(
-                video_path, start_frame, False, file_md5=claim_md5,
+            frame_video = ResumableFrameVideo(
+                video_save_path,
+                fps=fps_safe,
+                cv2_module=_StorageVideoIO(),
+                checkpoint=ckpt,
+                video_path=video_path,
+                file_md5=claim_md5,
                 pipeline_id=_resolve_pipeline_id(),
             )
-            cap.release()
-            raise RuntimeError(f"无法恢复视频断点到第 {start_frame} 帧")
-        record_resume_seek(
-            video_path, start_frame, True, reported_frame=reported_frame,
-            file_md5=claim_md5, pipeline_id=_resolve_pipeline_id(),
+        except RecoverableProcessingError:
+            raise
+        if frame_video.requires_full_rebuild:
+            _raise_if_storage_offline(video_path, stage='source_read', verify_source=True)
+            print(
+                "检查点缺少完整检测帧分段，将从头重建，"
+                f"避免生成不完整产物: {video_path}"
+            )
+            ckpt = None
+            start_frame = 0
+            detections = []
+            last_detected = -5
+            frame_video.reset_for_full_rebuild()
+        checkpoint_created = bool(ckpt)
+        checkpoint_interval = get_checkpoint_interval_seconds()
+        last_periodic_checkpoint = time.time()
+        if start_frame > 0:
+            try:
+                seek_ok = cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+                reported_frame = cap.get(cv2.CAP_PROP_POS_FRAMES)
+            except Exception as exc:
+                _raise_if_storage_offline(video_path, exc, stage='source_read', verify_source=True)
+                record_resume_seek(
+                    video_path, start_frame, False, error=exc,
+                    file_md5=claim_md5, pipeline_id=_resolve_pipeline_id(),
+                )
+                raise RuntimeError(f"无法恢复视频断点到第 {start_frame} 帧") from exc
+            if not seek_ok:
+                _raise_if_storage_offline(video_path, stage='source_read', verify_source=True)
+                record_resume_seek(
+                    video_path, start_frame, False, file_md5=claim_md5,
+                    pipeline_id=_resolve_pipeline_id(),
+                )
+                raise RuntimeError(f"无法恢复视频断点到第 {start_frame} 帧")
+            record_resume_seek(
+                video_path, start_frame, True, reported_frame=reported_frame,
+                file_md5=claim_md5, pipeline_id=_resolve_pipeline_id(),
+            )
+
+        # 文件名已在上一行完整输出；进度条使用短描述，避免长文件名挤掉进度信息
+        pbar = tqdm(
+            total=total_frames,
+            initial=min(start_frame, total_frames),
+            desc="处理视频",
+            dynamic_ncols=True,
         )
 
-    # 文件名已在上一行完整输出；进度条使用短描述，避免长文件名挤掉进度信息
-    pbar = tqdm(
-        total=total_frames,
-        initial=min(start_frame, total_frames),
-        desc="处理视频",
-        dynamic_ncols=True,
-    )
+    except BaseException as exc:
+        cap.release()
+        if isinstance(exc, OSError):
+            _raise_if_storage_offline(video_path, exc, stage='source_read', verify_source=True)
+        raise
 
     frame_count = start_frame
 
@@ -709,8 +818,19 @@ def detect_objects_in_video(
                     frame_video_segments=frame_video.checkpoint_segments(),
                 )
                 raise PauseRequested()
-            success, frame = cap.read()
+            try:
+                success, frame = cap.read()
+            except OSError as exc:
+                _raise_if_storage_offline(
+                    video_path, exc, stage='source_read', verify_source=True,
+                    position=frame_count / total_frames if total_frames > 0 else 0,
+                )
+                raise
             if not success:
+                _raise_if_storage_offline(
+                    video_path, stage='source_read', verify_source=True,
+                    position=frame_count / total_frames if total_frames > 0 else 0,
+                )
                 if total_frames <= 0 or frame_count >= total_frames:
                     reached_eof = True
                 frame_video.seal_segment()
@@ -1651,7 +1771,8 @@ def process_directory_videos(
     # 一次 listdir 获取所有文件，后续判断全部在内存中完成
     try:
         all_files = os.listdir(dir_path)
-    except (PermissionError, FileNotFoundError) as e:
+    except OSError as e:
+        _on_scan_error(e, dir_path)
         print(f"警告: 无法访问目录 '{dir_path}': {e}")
         return 0
 
@@ -1697,16 +1818,11 @@ def process_directory_videos(
         )
         if md5:
             # 检查视频时长
-            cap = cv2.VideoCapture(file_path)
-            if not cap.isOpened():
+            duration = _video_duration(file_path)
+            if duration is None:
                 print(f"无法打开视频: {file_path}")
                 unresolved_videos.append(file_path)
                 continue
-
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-            cap.release()
-            duration = frame_count / fps if fps > 0 else float("inf")
 
             if not skip_long_videos or duration <= 3600:  # 小于等于1小时的视频
                 video_files.append((file_path, duration, md5))
@@ -1887,6 +2003,7 @@ if __name__ == "__main__":
                     video_path,
                     exclusions=EXCLUDE_PATHS,
                     directory_index=DIRECTORY_INDEX,
+                    check_storage=lambda: _on_scan_error(None, video_path),
                 )
 
             # 新增功能：按叶子节点视频数量排序处理
@@ -2067,15 +2184,10 @@ if __name__ == "__main__":
                             md5 = should_process(file_path, acquire_claim=False)
                             if md5:
                                 # 获取视频时长
-                                cap = cv2.VideoCapture(file_path)
-                                if not cap.isOpened():
+                                duration = _video_duration(file_path)
+                                if duration is None:
                                     print(f"无法打开视频: {file_path}")
                                     continue
-
-                                fps = cap.get(cv2.CAP_PROP_FPS)
-                                frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-                                cap.release()
-                                duration = frame_count / fps if fps > 0 else float("inf")
                                 if duration > 3600:
                                     print(
                                         f"视频时长 {duration:.2f}秒超过一小时，跳过处理: {file_path}"
@@ -2128,14 +2240,10 @@ if __name__ == "__main__":
                                 print(f"视频无需处理或已被占用，跳过: {file_path}")
             else:
                 # 处理单个视频文件前检查视频时长
-                cap = cv2.VideoCapture(video_path)
-                if not cap.isOpened():
+                duration = _video_duration(video_path)
+                if duration is None:
                     print(f"无法打开视频: {video_path}")
                 else:
-                    fps = cap.get(cv2.CAP_PROP_FPS)
-                    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-                    cap.release()
-                    duration = frame_count / fps if fps > 0 else float("inf")
                     if duration > 3600:
                         print(f"视频时长 {duration:.2f}秒超过一小时，跳过处理: {video_path}")
                     else:
@@ -2180,6 +2288,7 @@ if __name__ == "__main__":
                                     _release_claim_safely(md5)
                         else:
                             print(f"视频无需处理或已被占用，跳过: {video_path}")
+            _on_scan_error(None, video_path if readiness['is_directory'] else _root)
         except RecoverableProcessingError as e:
             while True:
                 print(f"\n检测到可恢复故障，等待恢复探测: {e}")

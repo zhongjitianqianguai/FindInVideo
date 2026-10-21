@@ -730,7 +730,7 @@ def _cleanup_summary(result):
     )
 
 
-def cleanup_orphan_artifacts(root_path, exclusions=None, directory_index=None):
+def cleanup_orphan_artifacts(root_path, exclusions=None, directory_index=None, check_storage=None):
     """清理当前目录树中源视频已不存在的安全命名识别产物。"""
     result = {
         'removed_files': 0,
@@ -765,9 +765,14 @@ def cleanup_orphan_artifacts(root_path, exclusions=None, directory_index=None):
         _cleanup_summary(result)
         return result
 
+    if check_storage:
+        check_storage()
     groups = {}
     try:
-        walker = os.walk(root_path, topdown=True, followlinks=False)
+        def on_scan_error(error):
+            if check_storage:
+                check_storage()
+        walker = os.walk(root_path, topdown=True, followlinks=False, onerror=on_scan_error)
         for current_root, dirs, files in walker:
             if _cleanup_path_is_excluded(current_root, exclusion_roots):
                 dirs[:] = []
@@ -822,6 +827,8 @@ def cleanup_orphan_artifacts(root_path, exclusions=None, directory_index=None):
     index = directory_index if directory_index is not None else globals().get('DIRECTORY_INDEX')
     claim_checker = getattr(index, 'has_active_claims_for_paths', None)
     for source_path, artifact_paths in groups.values():
+        if check_storage:
+            check_storage()
         if not callable(claim_checker):
             result['skipped_active_sources'] += 1
             continue
@@ -834,6 +841,8 @@ def cleanup_orphan_artifacts(root_path, exclusions=None, directory_index=None):
             continue
 
         for artifact_path in artifact_paths:
+            if check_storage:
+                check_storage()
             try:
                 if os.path.exists(source_path):
                     break
@@ -1298,10 +1307,10 @@ def wait_for_recovery(
             video_path=video_path,
             artifact_path=artifact_path,
         )
-    target = target_dir
+    target = getattr(failure, 'recovery_target_dir', None) or target_dir
     if stage == 'coordination_database' and artifact_path:
         target = os.path.dirname(os.path.abspath(str(artifact_path))) or '.'
-    target_is_explicit = bool(target_dir)
+    target_is_explicit = bool(target)
     if not target:
         target = artifact_path or video_path
     if target and not target_is_explicit and not os.path.isdir(str(target)):
@@ -1940,6 +1949,8 @@ class ResumableFrameVideo:
             details['frame_size'] = int(frame_size or 0)
             self._last_segment_validation = details
             return bool(success and frame is not None and frame_size > 0)
+        except RecoverableProcessingError:
+            raise
         except Exception as exc:
             details['validation_error_class'] = type(exc).__name__
             details['validation_error_message'] = str(exc)
@@ -3579,14 +3590,18 @@ class DirectoryIndex:
                 return True
         return False
 
-    def refresh(self, root_path, exclusions=None):
+    def refresh(self, root_path, exclusions=None, on_error=None):
         normalized_root = self._normalize_path(root_path)
-        if not normalized_root or not os.path.isdir(normalized_root):
+        if not normalized_root:
+            return
+        if not os.path.isdir(normalized_root):
+            if on_error:
+                on_error(FileNotFoundError(normalized_root), normalized_root)
             return
         exclusion_set = self._build_exclusion_set(exclusions)
-        self._refresh_directory(normalized_root, exclusion_set, parent_path=None)
+        self._refresh_directory(normalized_root, exclusion_set, parent_path=None, on_error=on_error)
 
-    def _refresh_directory(self, dir_path, exclusions, parent_path):
+    def _refresh_directory(self, dir_path, exclusions, parent_path, on_error=None):
         normalized = self._normalize_path(dir_path)
         if not normalized:
             return
@@ -3594,11 +3609,15 @@ class DirectoryIndex:
             self._mark_excluded(normalized, parent_path)
             return
         if not os.path.isdir(normalized):
+            if on_error:
+                on_error(FileNotFoundError(normalized), normalized)
             self._remove_directory_recursive(normalized)
             return
         try:
             current_mtime = os.stat(normalized).st_mtime
-        except (PermissionError, FileNotFoundError, OSError):
+        except (PermissionError, FileNotFoundError, OSError) as exc:
+            if on_error:
+                on_error(exc, normalized)
             self._remove_directory_recursive(normalized)
             return
 
@@ -3618,13 +3637,17 @@ class DirectoryIndex:
                                 if entry.name not in _IGNORED_SUBDIRS:
                                     entry_path = self._normalize_path(entry.path)
                                     if entry_path and entry_path not in stored_children:
-                                        self._refresh_directory(entry_path, exclusions, normalized)
-                        except (PermissionError, FileNotFoundError, OSError):
+                                        self._refresh_directory(entry_path, exclusions, normalized, on_error=on_error)
+                        except (PermissionError, FileNotFoundError, OSError) as exc:
+                            if on_error:
+                                on_error(exc, normalized)
                             continue
-            except (PermissionError, FileNotFoundError, OSError):
+            except (PermissionError, FileNotFoundError, OSError) as exc:
+                if on_error:
+                    on_error(exc, normalized)
                 pass
             for child in self._get_child_paths(normalized):
-                self._refresh_directory(child, exclusions, normalized)
+                self._refresh_directory(child, exclusions, normalized, on_error=on_error)
             return
 
         stored_children = set(self._get_child_paths(normalized))
@@ -3647,14 +3670,22 @@ class DirectoryIndex:
                                 try:
                                     stat_info = entry.stat(follow_symlinks=False)
                                     video_records.append((entry.name, stat_info.st_mtime, stat_info.st_size))
-                                except OSError:
+                                except OSError as exc:
+                                    if on_error:
+                                        on_error(exc, normalized)
                                     continue
-                    except (PermissionError, FileNotFoundError, OSError):
+                    except (PermissionError, FileNotFoundError, OSError) as exc:
+                        if on_error:
+                            on_error(exc, normalized)
                         continue
-        except (PermissionError, FileNotFoundError, OSError):
+        except (PermissionError, FileNotFoundError, OSError) as exc:
+            if on_error:
+                on_error(exc, normalized)
             self._remove_directory_recursive(normalized)
             return
 
+        if on_error:
+            on_error(None, normalized)
         if video_records:
             processed_count = 0
             video_paths = []
@@ -3703,7 +3734,7 @@ class DirectoryIndex:
                     (normalized, name, mtime, size))
 
         for child_path in child_dirs:
-            self._refresh_directory(child_path, exclusions, normalized)
+            self._refresh_directory(child_path, exclusions, normalized, on_error=on_error)
 
     def _get_directory(self, path):
         try:

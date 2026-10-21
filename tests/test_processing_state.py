@@ -1625,12 +1625,16 @@ class ProcessingStateTests(unittest.TestCase):
             with self.subTest(entrypoint=module_path.name):
                 entrypoint = load_main_module(module_path)
                 entrypoint.utils._STOP_REQUESTED = False
+                entrypoint._PROCESSING_ROOT_DIR = str(ROOT)
                 claims = []
                 marked_dirs = []
 
                 class FakeCapture:
                     def isOpened(self):
                         return False
+
+                    def release(self):
+                        return None
 
                 class FakeDirectoryIndex:
                     def try_claim_video(self, md5, path):
