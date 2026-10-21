@@ -21,6 +21,8 @@ import logging
 import traceback
 import ntpath
 import sys
+import stat
+import sqlite3
 
 import utils
 from utils import (
@@ -77,16 +79,70 @@ for _ep in _EXCLUDE_PATHS_RAW:
 
 
 
+def _wait_for_startup_input(video_path):
+    """启动输入不可读时等待恢复，成功后返回真实的目录或文件状态。"""
+    readiness = {}
+
+    def probe(path, required_bytes=None):
+        """探测实际输入的读取权限，不以父目录可写代替输入可读。"""
+        nonlocal readiness
+        try:
+            is_directory = stat.S_ISDIR(os.stat(path).st_mode)
+            if is_directory:
+                empty = not os.listdir(path)
+            else:
+                with open(path, 'rb') as handle:
+                    handle.read(1)
+                empty = False
+            readiness = {
+                'target_dir': str(path), 'is_directory': is_directory, 'empty': empty,
+            }
+            return True, readiness
+        except OSError as exc:
+            return False, exc
+
+    if _pause_requested():
+        raise PauseRequested()
+    ready, result = probe(video_path)
+    if not ready:
+        failure = utils._make_recoverable_error(
+            f'启动输入暂时不可访问，等待恢复: {video_path}',
+            'startup_input', error=result, video_path=video_path,
+        )
+        wait_for_recovery(
+            failure, target_dir=video_path, video_path=video_path,
+            pause_checker=_pause_requested, probe_fn=probe,
+        )
+    return readiness
+
+
 def _init_processing_root(root_dir):
     """设置处理根目录，并将数据库迁移到 <root_dir>/md5_list/directory_index.db。"""
     global _PROCESSING_ROOT_DIR
-    if not root_dir or not os.path.isdir(root_dir):
+    if not root_dir:
         return
     _PROCESSING_ROOT_DIR = root_dir
     db_dir = os.path.join(root_dir, "md5_list")
-    os.makedirs(db_dir, exist_ok=True)
     db_path = os.path.join(db_dir, "directory_index.db")
-    DIRECTORY_INDEX.reopen(db_path)
+    try:
+        # 输入根目录必须已存在，不能因共享盘掉线而静默跳过或创建空输入目录。
+        os.stat(root_dir)
+        os.makedirs(db_dir, exist_ok=True)
+        DIRECTORY_INDEX.reopen(db_path)
+    except (OSError, sqlite3.Error, RuntimeError) as exc:
+        # 创建表结构的重试耗尽会包装成 RuntimeError，按真实原因判断是否可恢复。
+        cause = exc.__cause__ if isinstance(exc, RuntimeError) else exc
+        if not isinstance(cause, (OSError, sqlite3.Error)):
+            raise
+        if isinstance(cause, sqlite3.Error) and not (
+            utils.DirectoryIndex._is_lock_error(cause)
+            or utils.DirectoryIndex._is_claim_connection_error(cause)
+        ):
+            raise
+        raise utils._make_recoverable_error(
+            f'启动共享状态库暂时不可访问，等待恢复: {db_path}',
+            'startup_database', error=exc, artifact_path=db_path,
+        ) from exc
 
 
 def _resolve_pipeline_id(pipeline_id=None):
@@ -1801,24 +1857,11 @@ if __name__ == "__main__":
             _install_pause_signal_handler()
             video_path = r"G:\z"  # 可设置为视频文件或目录
 
-            # 检查路径是否存在
-            if not os.path.exists(video_path):
-                print(f"错误: 路径不存在: {video_path}")
-                set_exit_reason('input_path_missing')
+            readiness = _wait_for_startup_input(video_path)
+            if readiness['empty']:
+                print(f"错误: 目录为空: {video_path}")
+                set_exit_reason('input_directory_empty')
                 exit(1)
-
-            # 如果传入的是目录但目录为空或无视频文件，给出提示
-            if os.path.isdir(video_path):
-                try:
-                    files = os.listdir(video_path)
-                    if not files:
-                        print(f"错误: 目录为空: {video_path}")
-                        set_exit_reason('input_directory_empty')
-                        exit(1)
-                except PermissionError:
-                    print(f"错误: 无权限访问目录: {video_path}")
-                    set_exit_reason('input_access_denied')
-                    exit(1)
             # 如要检测所有模型内对象，则将 target_item 设置为任意值并启用全量检测开关
             target_item = "face"  # 当 all_objects 为 True 时，该值不再限制检测
             all_objects_switch = False  # 设置为 True 表示显示所有检测对象
@@ -1834,8 +1877,11 @@ if __name__ == "__main__":
             _ACTIVE_MODEL = YOLO(model_path)
 
             # 初始化处理根目录，数据库和yoloed.txt都放在 <video_path>/md5_list/ 下
-            _root = video_path if os.path.isdir(video_path) else os.path.dirname(video_path)
-            _init_processing_root(_root)
+            _root = video_path if readiness['is_directory'] else os.path.dirname(video_path)
+            retry_with_recovery(
+                lambda: _init_processing_root(_root), target_dir=_root,
+                pause_checker=_pause_requested, wait_fn=wait_for_recovery,
+            )
             if os.path.isdir(video_path):
                 utils.cleanup_orphan_artifacts(
                     video_path,

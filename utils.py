@@ -1282,8 +1282,9 @@ def wait_for_recovery(
     artifact_path=None,
     pause_checker=None,
     sleep_fn=None,
+    probe_fn=None,
 ):
-    """等待目标目录恢复；只响应明确的可恢复异常，不吞掉普通错误。"""
+    """等待存储恢复；可指定实际输入探测，默认仍校验目录读写和空间。"""
     failure_id = getattr(failure, 'failure_id', None) if failure is not None else None
     stage = getattr(failure, 'stage', None) if failure is not None else None
     if video_path is None and failure is not None:
@@ -1345,7 +1346,8 @@ def wait_for_recovery(
                 sleeper(delay)
                 elapsed = max(delay, time.monotonic() - started)
                 remaining -= elapsed
-        probe_ok, probe_result = probe_recovery_target(target, required_bytes=required_bytes)
+        probe = probe_fn or probe_recovery_target
+        probe_ok, probe_result = probe(target, required_bytes=required_bytes)
         if probe_ok:
             print(f'存储探测通过，继续断点恢复: {target}', flush=True)
             record_recovery_event(
