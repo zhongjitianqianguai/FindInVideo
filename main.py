@@ -24,6 +24,7 @@ import sys
 import stat
 import sqlite3
 import errno
+from independent_launcher import restart_main
 
 import utils
 from utils import (
@@ -2301,10 +2302,7 @@ if __name__ == "__main__":
                 )
                 try:
                     record_process_event('process_restart_requested', reason='storage_recovered')
-                    os.execv(
-                        sys.executable,
-                        [sys.executable, os.path.abspath(__file__), *sys.argv[1:]],
-                    )
+                    restart_main(__file__, sys.argv[1:])
                 except OSError as exc:
                     e = utils._make_recoverable_error(
                         '恢复后重新启动当前入口失败，等待后重试',

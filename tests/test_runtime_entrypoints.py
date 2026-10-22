@@ -177,20 +177,18 @@ class RuntimeEntrypointTests(unittest.TestCase):
         self.assertEqual(exit_event['exit_code'], 0)
 
     @unittest.skipUnless(os.name == 'nt', '仅 Windows 有 BAT 启动入口')
-    def test_launcher_persists_exit_code_even_without_python_cleanup(self):
+    def test_bat_preserves_failed_launch_request_exit_code(self):
         script = (ROOT / 'run_main.bat').read_text(encoding='utf-8')
         script = script.replace('".venv\\Scripts\\python.exe"', '"' + sys.executable + '"')
         launcher = self.root / 'run_main.bat'
         launcher.write_bytes(script.replace('\r\n', '\n').replace('\n', '\r\n').encode('utf-8'))
-        (self.root / 'main.py').write_text('import os\nos._exit(7)\n', encoding='utf-8')
+        # main.py 的真实退出码由独立启动的原生回归验证；这里验证 BAT 请求失败码。
+        (self.root / 'independent_launcher.py').write_text('import os\nos._exit(7)\n', encoding='utf-8')
         result = subprocess.run(
             ['cmd.exe', '/d', '/c', str(launcher)], cwd=self.root,
             capture_output=True, timeout=30,
         )
         self.assertEqual(result.returncode, 7, result.stderr)
-        log = (self.root / 'logs' / 'launcher_events.log').read_text(encoding='utf-8')
-        self.assertIn('event=launcher_started', log)
-        self.assertIn('event=launcher_exit entrypoint=main.py exit_code=7', log)
 
 
 if __name__ == '__main__':

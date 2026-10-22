@@ -19,8 +19,17 @@ Face Model come from https://github.com/akanametov/yolo-face
 
 - `logs/runtime_events.jsonl`：每次运行的 `run_id`、入口、PID、时间、当前视频，单视频失败的类型、消息、系统错误码和完整异常链，以及程序退出原因。先在本机 flush/fsync，再尽力镜像到 `directory_index.db` 的 `processing_events`；共享盘不可用时仍可查本机记录。
 - `logs/crash.log`：原生访问冲突等致命错误发生时，faulthandler 尽力保存各线程 Python 堆栈，并记录运行及视频关联信息。
-- `logs/launcher_events.log`：通过 `run_main*.bat` 视频启动脚本运行时，追加启动时间和 Python 返回的真实退出码，即使 Python 未能写退出摘要也能留痕。
+- `logs/launcher_events.log`：通过 `run_main*.bat` 视频启动脚本运行时，追加启动时间和 `main.py` 的真实退出码，即使 Python 未能写退出摘要也能留痕。
+- `logs/launcher_startup_<token>.json`：保存随机 token、supervisor 与实际 `main.py` 进程的 PID、映像、创建时间、Windows 会话、控制台和 Job 校验结果；运行结束后追加真实退出码。
 
 `process_exit.reason` 区分 `queue_exhausted`（本轮遍历结束，不保证全部视频成功）、`queue_exhausted_with_video_failures`（带单视频失败结束）、`pause_requested`、`keyboard_interrupt`、`system_exit` 和 `uncaught_exception`；摘要带失败次数及最后一次失败。主动关闭窗口、注销或关机的 Windows 控制通知记录为 `process_termination_requested`；恢复导致的入口重启会先记录 `process_restart_requested`。主动暂停源（SIGINT 或暂停文件）也会写入本机日志。
 
 原有继续队列、失败退避、存储恢复、完成态及退出码语义保持不变。可用 `FINDINVIDEO_RUNTIME_LOG_PATH`、`FINDINVIDEO_CRASH_LOG_PATH` 覆盖两类诊断日志路径；无需新增配置，下次启动生效。没有真实异常的失败只记原因，不伪造堆栈。断电、强制杀进程等无法执行记录代码的情形，需结合最后运行事件、启动脚本退出码（若可获得）和 Windows 系统事件判断，不能保证生成退出摘要。
+
+### 独立控制台启动
+
+默认运行 `run_main.bat` 时，会由 `.venv\Scripts\python.exe` 调用 `independent_launcher.py`。启动器通过隐藏的 Windows PowerShell CIM broker 创建可见的新控制台 supervisor；supervisor 再以基础 Python 解释器启动固定的 `main.py`。随机 token 握手会核对 supervisor 和实际处理进程的 PID、映像、创建时间、Windows 会话、可见控制台及 Job 状态。任一检查失败或握手超时都会返回非零码，不会退回到附着启动。
+
+BAT 返回 `0` 表示独立进程验收成功，视频处理在新控制台异步运行；`main.py` 的实际退出码随后写入 `logs/launcher_events.log` 和对应的启动结果 JSON。启动需要 Windows PowerShell CIM 与现有 `.venv`，不需要修改 `main.py` 或设置新环境变量。
+
+存储恢复触发入口重启时，旧处理进程退出并释放模型、显存等资源，监护进程重新验证并启动处理进程，最终退出时再记录真实退出码。按 Ctrl+C 时由实际处理进程保存断点，监护进程等待其退出后再记录结果。
